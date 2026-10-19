@@ -3233,14 +3233,6 @@ bool FrameBuffer::Impl::onSave(Stream* stream,
                                const ITextureSaverPtr& textureSaver) NO_THREAD_SAFETY_ANALYSIS {
     waitForProcessCleanup();
 
-    // Things we do not need to snapshot:
-    //     m_eglSurface
-    //     m_eglContext
-    //     m_pbufSurface
-    //     m_pbufContext
-    //     m_prevContext
-    //     m_prevReadSurf
-    //     m_prevDrawSurf
     AutoLock mutex(m_lock);
 
     GFXSTREAM_DEBUG("snapshot save: save framebuffer");
@@ -3574,7 +3566,8 @@ bool FrameBuffer::Impl::onLoad(Stream* stream,
         m_guestManagedColorBufferLifetime = stream->getByte();
         bool colorBuffersLoaded = tryLoadCollection(
             stream, &m_colorbuffers, kNumMaxColorBuffers,
-            [this, now](Stream* stream) -> std::optional<std::pair<HandleType, ReferenceCountedColorBuffer>> {
+            [this, now](Stream* stream)
+                -> std::optional<std::pair<HandleType, ReferenceCountedColorBuffer>> {
                 ColorBufferPtr cb =
                     ColorBuffer::onLoad(m_emulationGl.get(), m_emulationVk.get(), stream);
                 if (!cb) {
@@ -3589,7 +3582,8 @@ bool FrameBuffer::Impl::onLoad(Stream* stream,
                     m_colorBufferDelayedCloseList.push_back({closedTs, handle});
                 }
                 return std::make_optional(std::make_pair(
-                    handle, ReferenceCountedColorBuffer{std::move(cb), refCount, opened, closedTs}));
+                    handle,
+                    ReferenceCountedColorBuffer{std::move(cb), refCount, opened, closedTs}));
             });
 
         if (!colorBuffersLoaded) {
