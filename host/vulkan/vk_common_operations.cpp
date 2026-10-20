@@ -2293,19 +2293,21 @@ bool VkEmulation::allocExternalMemory(VulkanDispatch* vk, VkEmulation::ExternalM
 
                 // Check that there is a memoryType that covers both the VkImage and the
                 // screenBuffer memory requirements
-                const uint32_t combinedMemoryTypeBits =
+                uint32_t combinedMemoryTypeBits =
                     screenBufferProps.memoryTypeBits & cbInfoPtr->imageMemReqs.memoryTypeBits;
                 if (!combinedMemoryTypeBits) {
-                    GFXSTREAM_ERROR(
-                        "There is no common memory type for both screenBuffer requirements (0x%x) "
-                        "and VkImage requirements (0x%x) for ColorBuffer: %d",
+                    GFXSTREAM_WARNING(
+                        "WARNING -- There is no common memory type for both screenBuffer "
+                        "requirements (0x%x) "
+                        "and VkImage requirements (0x%x) for ColorBuffer: %d. Defaulting to "
+                        "selection based of the Screen Buffer's memoryTypeBits on their own.",
                         screenBufferProps.memoryTypeBits, cbInfoPtr->imageMemReqs.memoryTypeBits,
                         cbInfoPtr->handle);
-                    return false;
+                    combinedMemoryTypeBits = screenBufferProps.memoryTypeBits;
                 }
                 // Update the memory type:
-                info->typeIndex = getValidMemoryTypeIndex(screenBufferProps.memoryTypeBits,
-                                                          cbInfoPtr->memoryProperty);
+                info->typeIndex =
+                    getValidMemoryTypeIndex(combinedMemoryTypeBits, cbInfoPtr->memoryProperty);
                 allocInfo.memoryTypeIndex = info->typeIndex;
 
                 info->qnxScreenStreamHandle = screenStreamBuffer->first;
@@ -3132,7 +3134,12 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
         VkImageMemoryRequirementsInfo2 info{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
                                             nullptr, infoPtr->image};
         vk->vkGetImageMemoryRequirements2KHR(mDevice, &info, &reqs);
-        useDedicated = dedicated_reqs.requiresDedicatedAllocation;
+        // Also honor prefersDedicatedAllocation: ColorBuffer memory is exported and bound again
+        // in the guests' VkDevices. On NVIDIA (Windows) a few percent of non-dedicated
+        // ColorBuffers read back as all zero through this VkDevice while other guest devices
+        // see the rendered content.
+        useDedicated = dedicated_reqs.requiresDedicatedAllocation ||
+                       dedicated_reqs.prefersDedicatedAllocation;
         infoPtr->imageMemReqs = reqs.memoryRequirements;
     } else {
         vk->vkGetImageMemoryRequirements(mDevice, infoPtr->image, &infoPtr->imageMemReqs);
