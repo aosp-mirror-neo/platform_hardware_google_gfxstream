@@ -428,48 +428,29 @@ void VkEmulation::appendExternalMemoryModeDeviceExtensions(
     }
 }
 
-// Return true if format requires sampler YCBCR conversion for VK_IMAGE_ASPECT_COLOR_BIT image
-// views. Table found in spec
-static bool formatRequiresYcbcrConversion(VkFormat format) {
-    switch (format) {
-        case VK_FORMAT_G8B8G8R8_422_UNORM:
-        case VK_FORMAT_B8G8R8G8_422_UNORM:
-        case VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM:
-        case VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:
-        case VK_FORMAT_G8_B8_R8_3PLANE_422_UNORM:
-        case VK_FORMAT_G8_B8R8_2PLANE_422_UNORM:
-        case VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:
-        case VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16:
-        case VK_FORMAT_G10X6B10X6G10X6R10X6_422_UNORM_4PACK16:
-        case VK_FORMAT_B10X6G10X6R10X6G10X6_422_UNORM_4PACK16:
-        case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16:
-        case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
-        case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16:
-        case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16:
-        case VK_FORMAT_G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16:
-        case VK_FORMAT_R12X4G12X4B12X4A12X4_UNORM_4PACK16:
-        case VK_FORMAT_G12X4B12X4G12X4R12X4_422_UNORM_4PACK16:
-        case VK_FORMAT_B12X4G12X4R12X4G12X4_422_UNORM_4PACK16:
-        case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16:
-        case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16:
-        case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16:
-        case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16:
-        case VK_FORMAT_G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16:
-        case VK_FORMAT_G16B16G16R16_422_UNORM:
-        case VK_FORMAT_B16G16R16G16_422_UNORM:
-        case VK_FORMAT_G16_B16_R16_3PLANE_420_UNORM:
-        case VK_FORMAT_G16_B16R16_2PLANE_420_UNORM:
-        case VK_FORMAT_G16_B16_R16_3PLANE_422_UNORM:
-        case VK_FORMAT_G16_B16R16_2PLANE_422_UNORM:
-        case VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:
-        case VK_FORMAT_G8_B8R8_2PLANE_444_UNORM:
-        case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16:
-        case VK_FORMAT_G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16:
-        case VK_FORMAT_G16_B16R16_2PLANE_444_UNORM:
-            return true;
-        default:
-            return false;
+static VkImageUsageFlags getSupportedImageUsageFlags(const VkFormatProperties& formatProperties,
+                                                     VkImageTiling tiling) {
+    constexpr std::pair<VkFormatFeatureFlags, VkImageUsageFlags> kFormatUsagePairs[] = {
+        {VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT,
+         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT},
+        {VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT,
+         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT},
+        {VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT, VK_IMAGE_USAGE_SAMPLED_BIT},
+        {VK_FORMAT_FEATURE_TRANSFER_SRC_BIT, VK_IMAGE_USAGE_TRANSFER_SRC_BIT},
+        {VK_FORMAT_FEATURE_TRANSFER_DST_BIT, VK_IMAGE_USAGE_TRANSFER_DST_BIT},
+        {VK_FORMAT_FEATURE_BLIT_SRC_BIT, VK_IMAGE_USAGE_TRANSFER_SRC_BIT},
+    };
+    const VkFormatFeatureFlags tilingFeatures = (tiling == VK_IMAGE_TILING_OPTIMAL)
+                                                    ? formatProperties.optimalTilingFeatures
+                                                    : formatProperties.linearTilingFeatures;
+
+    VkImageUsageFlags usage = 0;
+    for (const auto& [featureFlags, usageFlags] : kFormatUsagePairs) {
+        if (tilingFeatures & featureFlags) {
+            usage |= usageFlags;
+        }
     }
+    return usage;
 }
 
 bool VkEmulation::populateImageFormatExternalMemorySupportInfo(VulkanDispatch* vk,
@@ -483,14 +464,17 @@ bool VkEmulation::populateImageFormatExternalMemorySupportInfo(VulkanDispatch* v
 
     info->formatProps2 = {
         VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
-        0,
+        nullptr,
         outFormatProps,
     };
 
-    if (!mInstanceSupportsExternalMemoryCapabilities) {
-        info->supportsExternalMemory = false;
-        info->requiresDedicatedAllocation = false;
+    info->usageFlags = getSupportedImageUsageFlags(outFormatProps, info->tiling);
+    if (info->usageFlags == 0) {
+        info->supported = false;
+        return true;
+    }
 
+    if (!mInstanceSupportsExternalMemoryCapabilities) {
         VkImageFormatProperties outImageFormatProps;
         VkResult res = vk->vkGetPhysicalDeviceImageFormatProperties(
             physdev, info->format, info->type, info->tiling, info->usageFlags, info->createFlags,
@@ -503,7 +487,7 @@ bool VkEmulation::populateImageFormatExternalMemorySupportInfo(VulkanDispatch* v
             } else {
                 GFXSTREAM_ERROR(
                     "vkGetPhysicalDeviceImageFormatProperties query "
-                    "failed with %s"
+                    "failed with %s "
                     "for format 0x%x type 0x%x usage 0x%x flags 0x%x",
                     string_VkResult(res), info->format, info->type, info->usageFlags,
                     info->createFlags);
@@ -513,19 +497,12 @@ bool VkEmulation::populateImageFormatExternalMemorySupportInfo(VulkanDispatch* v
 
         info->supported = true;
 
-        info->imageFormatProps2 = {
-            VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
-            0,
-            outImageFormatProps,
-        };
-
         GFXSTREAM_DEBUG("Supported (not externally): %s %s %s %s", string_VkFormat(info->format),
                         string_VkImageType(info->type), string_VkImageTiling(info->tiling),
-                        string_VkImageUsageFlagBits((VkImageUsageFlagBits)info->usageFlags));
+                        string_VkImageUsageFlags(info->usageFlags).c_str());
 
         return true;
     }
-
 
     VkPhysicalDeviceImageFormatInfo2 formatInfo2 = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
@@ -537,35 +514,28 @@ bool VkEmulation::populateImageFormatExternalMemorySupportInfo(VulkanDispatch* v
         info->createFlags,
     };
 
-    VkImageFormatProperties2 outProps2 = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
-                                          nullptr,
-                                          {
-                                              {0, 0, 0},
-                                              0,
-                                              0,
-                                              1,
-                                              0,
-                                          }};
+    VkImageFormatProperties2 outProps2 = {
+        VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+        nullptr,
+        {},
+    };
 
     VkPhysicalDeviceExternalImageFormatInfo extInfo = {
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+        nullptr,
+        static_cast<VkExternalMemoryHandleTypeFlagBits>(0),
     };
 
     VkExternalImageFormatProperties outExternalProps = {
         VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
-        0,
-        {
-            (VkExternalMemoryFeatureFlags)0,
-            (VkExternalMemoryHandleTypeFlags)0,
-            (VkExternalMemoryHandleTypeFlags)0,
-        },
+        nullptr,
+        {},
     };
 
     if (supportsExternalMemory()) {
         extInfo.handleType = getDefaultExternalMemoryHandleType();
-
         formatInfo2.pNext = &extInfo;
-        outProps2.pNext= &outExternalProps;
+        outProps2.pNext = &outExternalProps;
     }
 
     VkResult res = mGetImageFormatProperties2Func(physdev, &formatInfo2, &outProps2);
@@ -574,7 +544,7 @@ bool VkEmulation::populateImageFormatExternalMemorySupportInfo(VulkanDispatch* v
         if (res == VK_ERROR_FORMAT_NOT_SUPPORTED) {
             GFXSTREAM_DEBUG("Not Supported: %s %s %s %s", string_VkFormat(info->format),
                             string_VkImageType(info->type), string_VkImageTiling(info->tiling),
-                            string_VkImageUsageFlagBits((VkImageUsageFlagBits)info->usageFlags));
+                            string_VkImageUsageFlags(info->usageFlags).c_str());
 
             info->supported = false;
             return true;
@@ -594,32 +564,22 @@ bool VkEmulation::populateImageFormatExternalMemorySupportInfo(VulkanDispatch* v
     VkExternalMemoryFeatureFlags featureFlags =
         outExternalProps.externalMemoryProperties.externalMemoryFeatures;
 
-    VkExternalMemoryHandleTypeFlags exportImportedFlags =
-        outExternalProps.externalMemoryProperties.exportFromImportedHandleTypes;
-
-    // Don't really care about export form imported handle types yet
-    (void)exportImportedFlags;
-
     VkExternalMemoryHandleTypeFlags compatibleHandleTypes =
         outExternalProps.externalMemoryProperties.compatibleHandleTypes;
 
-    info->supportsExternalMemory = supportsExternalMemory() &&
-                                (getDefaultExternalMemoryHandleType() & compatibleHandleTypes) &&
-                                (VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT & featureFlags) &&
-                                (VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT & featureFlags);
+    bool externalMemorySupported = supportsExternalMemory() &&
+                                   (getDefaultExternalMemoryHandleType() & compatibleHandleTypes) &&
+                                   (VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT & featureFlags) &&
+                                   (VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT & featureFlags);
 
-    info->requiresDedicatedAllocation =
+    bool requiresDedicatedAllocation =
         (VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT & featureFlags);
-
-    info->imageFormatProps2 = outProps2;
-    info->extFormatProps = outExternalProps;
-    info->imageFormatProps2.pNext = &info->extFormatProps;
 
     GFXSTREAM_DEBUG("Supported: %s %s %s %s, supportsExternalMemory? %d, requiresDedicated? %d",
                     string_VkFormat(info->format), string_VkImageType(info->type),
                     string_VkImageTiling(info->tiling),
-                    string_VkImageUsageFlagBits((VkImageUsageFlagBits)info->usageFlags),
-                    info->supportsExternalMemory, info->requiresDedicatedAllocation);
+                    string_VkImageUsageFlags(info->usageFlags).c_str(),
+                    externalMemorySupported, requiresDedicatedAllocation);
 
     return true;
 }
@@ -2157,19 +2117,6 @@ void VkEmulation::stashPendingDeferredLayoutAhb(const VkImageCreateInfo* imageCr
     mPendingDeferredLayoutAhbs.emplace(ComputeAhbShapeKey(imageCreateInfo), ahb);
 }
 
-void VkEmulation::unstashPendingDeferredLayoutAhb(const VkImageCreateInfo* imageCreateInfo,
-                                                  AHardwareBuffer* ahb) {
-    std::lock_guard<std::mutex> lock(mMutex);
-    auto range = mPendingDeferredLayoutAhbs.equal_range(ComputeAhbShapeKey(imageCreateInfo));
-    for (auto it = range.first; it != range.second; ++it) {
-        if (it->second == ahb) {
-            mPendingDeferredLayoutAhbs.erase(it);
-            AHardwareBuffer_release(ahb);
-            return;
-        }
-    }
-}
-
 AHardwareBuffer* VkEmulation::takePendingDeferredLayoutAhbLocked(
     const VkImageCreateInfo* imageCreateInfo) {
     auto it = mPendingDeferredLayoutAhbs.find(ComputeAhbShapeKey(imageCreateInfo));
@@ -3000,26 +2947,8 @@ std::unique_ptr<VkImageCreateInfo> VkEmulation::generateColorBufferVkImageCreate
     }
     const ImageSupportInfo& imageSupportInfo = *maybeImageSupportInfo;
 
-    const VkFormatProperties& formatProperties = imageSupportInfo.formatProps2.formatProperties;
-
-    constexpr std::pair<VkFormatFeatureFlags, VkImageUsageFlags> formatUsagePairs[] = {
-        {VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT,
-         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT},
-        {VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT,
-         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT},
-        {VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT, VK_IMAGE_USAGE_SAMPLED_BIT},
-        {VK_FORMAT_FEATURE_TRANSFER_SRC_BIT, VK_IMAGE_USAGE_TRANSFER_SRC_BIT},
-        {VK_FORMAT_FEATURE_TRANSFER_DST_BIT, VK_IMAGE_USAGE_TRANSFER_DST_BIT},
-        {VK_FORMAT_FEATURE_BLIT_SRC_BIT, VK_IMAGE_USAGE_TRANSFER_SRC_BIT},
-    };
-    VkFormatFeatureFlags tilingFeatures = (tiling == VK_IMAGE_TILING_OPTIMAL)
-                                              ? formatProperties.optimalTilingFeatures
-                                              : formatProperties.linearTilingFeatures;
-
-    VkImageUsageFlags usage = 0;
-    for (const auto& formatUsage : formatUsagePairs) {
-        usage |= (tilingFeatures & formatUsage.first) ? formatUsage.second : 0u;
-    }
+    const VkImageUsageFlags usage =
+        getSupportedImageUsageFlags(imageSupportInfo.formatProps2.formatProperties, tiling);
 
     return std::make_unique<VkImageCreateInfo>(VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -3266,7 +3195,7 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
         .pNext = nullptr,
         .conversion = VK_NULL_HANDLE,
     };
-    bool addConversion = formatRequiresYcbcrConversion(imageVkFormat);
+    bool addConversion = formatRequiresSamplerYcbcrConversion(imageVkFormat);
     if (addConversion) {
         ycbcrInfo.conversion = mYcbcrSamplerPool.getConversion(format);
         if (ycbcrInfo.conversion == VK_NULL_HANDLE) {
