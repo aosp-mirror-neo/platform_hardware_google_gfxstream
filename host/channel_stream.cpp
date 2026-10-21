@@ -28,18 +28,21 @@ using IoResult = RenderChannel::IoResult;
 
 ChannelStream::ChannelStream(RenderChannelImpl* channel, size_t bufSize)
     : IOStream(bufSize), mChannel(channel) {
-    mWriteBuffer.resize_noinit(bufSize);
+    mWriteBuffer.resize(bufSize);
 }
 
 void* ChannelStream::allocBuffer(size_t minSize) {
     if (mWriteBuffer.size() < minSize) {
-        mWriteBuffer.resize_noinit(minSize);
+        mWriteBuffer.resize(minSize);
     }
     return mWriteBuffer.data();
 }
 
 int ChannelStream::commitBuffer(size_t size) {
     assert(size <= mWriteBuffer.size());
+    if (size > mWriteBuffer.size()) {
+        size = mWriteBuffer.size();
+    }
     if (mWriteBuffer.isAllocated()) {
         mWriteBuffer.resize(size);
         mChannel->writeToGuest(std::move(mWriteBuffer));
@@ -119,6 +122,12 @@ unsigned char* ChannelStream::onLoad(gfxstream::Stream* stream) {
     gfxstream::host::loadBuffer(stream, &mReadBuffer);
     mReadBufferLeft = mReadBuffer.size();
     gfxstream::host::loadBuffer(stream, &mWriteBuffer);
+    if (m_bufsize > mWriteBuffer.size()) {
+        m_bufsize = mWriteBuffer.size();
+    }
+    if (m_free > m_bufsize) {
+        m_free = m_bufsize;
+    }
     return reinterpret_cast<unsigned char*>(mWriteBuffer.data());
 }
 

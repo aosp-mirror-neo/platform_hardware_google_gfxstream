@@ -56,10 +56,10 @@ public:
         }
 
         if (!m_buf || len > m_bufsize) {
-            int allocLen = m_bufsize < len ? len : m_bufsize;
+            size_t allocLen = m_bufsize < len ? len : m_bufsize;
             m_buf = (unsigned char *)allocBuffer(allocLen);
             if (!m_buf) {
-                GFXSTREAM_ERROR("Alloc (%u bytes) failed\n", allocLen);
+                GFXSTREAM_ERROR("Alloc (%zu bytes) failed\n", allocLen);
                 return NULL;
             }
             m_bufsize = m_free = allocLen;
@@ -95,8 +95,14 @@ public:
     void load(gfxstream::Stream* stream) {
         m_bufsize = stream->getBe32();
         m_free = stream->getBe32();
+        if (m_free > m_bufsize) {
+            m_free = m_bufsize;
+        }
         const bool haveBuf = stream->getByte();
         const auto buf = onLoad(stream);
+        if (m_free > m_bufsize) {
+            m_free = m_bufsize;
+        }
         m_buf = haveBuf ? buf : nullptr;
     }
 
