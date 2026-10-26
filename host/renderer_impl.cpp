@@ -173,7 +173,7 @@ void RendererImpl::cleanupRenderThreads() {
 
 bool RendererImpl::waitForProcessCleanup() {
     if (auto* fb = FrameBuffer::getFB()) {
-        return fb->waitForProcessCleanup(kCleanupTimeout);
+        return fb->waitForAllPendingCleanups(kCleanupTimeout);
     }
     return true;
 }
