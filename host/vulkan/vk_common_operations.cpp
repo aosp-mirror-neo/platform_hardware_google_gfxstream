@@ -2576,11 +2576,13 @@ bool VkEmulation::allocExternalMemory(VulkanDispatch* vk, VkEmulation::ExternalM
     bool validHandle = false;
 
     switch (mDeviceInfo.externalMemoryMode) {
-        case ExternalMemory::Mode::OpaqueFd: {
+        case ExternalMemory::Mode::OpaqueFd:
+        case ExternalMemory::Mode::DmaBuf: {
             streamHandleType = STREAM_HANDLE_TYPE_MEM_OPAQUE_FD;
             VkExternalMemoryHandleTypeFlagBits vkHandleType =
                 VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
-            if (mDeviceInfo.supportsDmaBuf) {
+            if (mDeviceInfo.supportsDmaBuf ||
+                mDeviceInfo.externalMemoryMode == ExternalMemory::Mode::DmaBuf) {
                 vkHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
                 streamHandleType = STREAM_HANDLE_TYPE_MEM_DMABUF;
             }
@@ -2783,7 +2785,8 @@ bool VkEmulation::importExternalMemory(VulkanDispatch* vk, VkDevice targetDevice
     const void* importInfoPtr = nullptr;
     switch (mDeviceInfo.externalMemoryMode) {
         case ExternalMemory::Mode::AndroidAHB:
-        case ExternalMemory::Mode::OpaqueFd: {
+        case ExternalMemory::Mode::OpaqueFd:
+        case ExternalMemory::Mode::DmaBuf: {
             auto dupHandle = dupExternalMemory(handleInfo);
             if (!dupHandle) {
                 GFXSTREAM_ERROR(
@@ -2795,7 +2798,9 @@ bool VkEmulation::importExternalMemory(VulkanDispatch* vk, VkDevice targetDevice
             importInfoFd = {
                 VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
                 dedicatedAllocInfoPtr,
-                VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+                (dupHandle->streamHandleType == STREAM_HANDLE_TYPE_MEM_DMABUF)
+                    ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+                    : VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
                 static_cast<int>(dupHandle->handle),
             };
             importInfoPtr = &importInfoFd;
@@ -3176,7 +3181,6 @@ bool VkEmulation::createVkColorBufferLocked(uint32_t width, uint32_t height,
         // VkExternalMemoryImageCreateInfo unconditionally, as it may be backed by external memory.
         extImageCi.handleTypes =
             static_cast<VkExternalMemoryHandleTypeFlags>(getDefaultExternalMemoryHandleType());
-
         imageCi->pNext = &extImageCi;
     }
 
