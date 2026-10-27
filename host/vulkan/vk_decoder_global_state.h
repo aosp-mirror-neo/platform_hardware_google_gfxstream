@@ -80,6 +80,8 @@ class VkDecoderGlobalState {
     // Snapshot save/load
     bool snapshotsEnabled() const;
     bool isSnapshotCurrentlyLoading() const;
+    void setSnapshotLoadError();
+    bool hasSnapshotLoadError() const;
 
     bool batchedDescriptorSetUpdateEnabled() const;
 
@@ -1058,6 +1060,7 @@ class VkDecoderGlobalState {
     LIST_TRANSFORMED_TYPES(DEFINE_TRANSFORMED_TYPE_PROTOTYPE)
 
    private:
+    friend struct VkDecoderGlobalStateTestPeer;
     class Impl;
     std::unique_ptr<Impl> mImpl;
 };
