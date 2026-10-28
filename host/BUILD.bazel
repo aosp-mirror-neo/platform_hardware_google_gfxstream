@@ -279,6 +279,7 @@ cc_test(
     copts = GFXSTREAM_HOST_COPTS,
     local_defines = GFXSTREAM_HOST_DEFINES,
     deps = [
+        ":gfxstream_backend_headers",
         ":gfxstream_backend_static",
         "@com_google_googletest//:gtest",
         "@com_google_googletest//:gtest_main",
