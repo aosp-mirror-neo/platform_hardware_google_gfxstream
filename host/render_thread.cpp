@@ -369,6 +369,13 @@ intptr_t RenderThread::main() {
         tInfo->m_vkInfo.emplace();
     }
 
+    std::shared_ptr<const ProcessResources> processResources;
+    if (mContextId && mContextId != INVALID_CONTEXT_ID) {
+        tInfo->setPuid(mContextId);
+        processResources = FrameBuffer::getFB()->getProcessResources(mContextId);
+        tInfo->setProcessResources(processResources);
+    }
+
     // This is the only place where we try loading from snapshot.
     // But the context bind / restoration will be delayed after receiving
     // the first GL command.
@@ -401,7 +408,6 @@ intptr_t RenderThread::main() {
 
     GfxApiLogger gfxLogger;
 
-    const ProcessResources* processResources = nullptr;
     bool anyProgress = false;
     while (true) {
         // Let's make sure we read enough data for at least some processing.
@@ -443,6 +449,7 @@ intptr_t RenderThread::main() {
             }
             if (mNeedReloadProcessResources) {
                 processResources = nullptr;
+                tInfo->setProcessResources(nullptr);
                 mNeedReloadProcessResources = false;
             }
         }
@@ -480,6 +487,7 @@ intptr_t RenderThread::main() {
 
             if (!processResources && tInfo->m_puid && tInfo->m_puid != INVALID_CONTEXT_ID) {
                 processResources = FrameBuffer::getFB()->getProcessResources(tInfo->m_puid);
+                tInfo->setProcessResources(processResources);
             }
 
             progress = false;
@@ -498,7 +506,7 @@ intptr_t RenderThread::main() {
                     .shouldExit = &mDecodersShouldStop,
                 };
                 last = tInfo->m_vkInfo->m_vkDec.decode(readBuf.buf(), readBuf.validData(), ioStream,
-                                                      processResources, context);
+                                                      processResources.get(), context);
                 if (last > 0) {
                     if (!processResources) {
                         GFXSTREAM_ERROR(
@@ -576,6 +584,10 @@ intptr_t RenderThread::main() {
             }
 #endif
         } while (progress);
+
+        if (processResources && processResources->isGuestProcessDead()) {
+            break;
+        }
     }
 
 #if GFXSTREAM_ENABLE_HOST_GLES
