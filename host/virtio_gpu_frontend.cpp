@@ -40,7 +40,6 @@
 #include "gfxstream/host/file_stream.h"
 #include "gfxstream/host/tracing.h"
 #include "gfxstream/memory/SharedMemory.h"
-#include "gfxstream/threads/WorkerThread.h"
 #include "virtgpu_gfxstream_protocol.h"
 #include "virtio_gpu_timelines.h"
 
@@ -54,8 +53,6 @@ using gfxstream::base::SharedMemory;
 using gfxstream::host::snapshot::VirtioGpuContextSnapshot;
 using gfxstream::host::snapshot::VirtioGpuFrontendSnapshot;
 using gfxstream::host::snapshot::VirtioGpuResourceSnapshot;
-
-static constexpr auto kCleanupTimeout = std::chrono::milliseconds(15000);
 #endif  // ifdef GFXSTREAM_BUILD_WITH_SNAPSHOT_FRONTEND_SUPPORT
 
 // Helper for printing very detailed debug logs
@@ -77,55 +74,6 @@ static uint64_t convert32to64(uint32_t lo, uint32_t hi) {
 }
 
 }  // namespace
-
-class CleanupThread {
-   public:
-    using GenericCleanup = std::function<void()>;
-
-    CleanupThread()
-        : mWorker(
-              []() { GFXSTREAM_TRACE_NAME_THREAD("Gfxstream Virtio Gpu Frontend Cleanup Thread"); },
-              [](CleanupTask task) {
-                  return std::visit(
-                      [](auto&& work) {
-                          using T = std::decay_t<decltype(work)>;
-                          if constexpr (std::is_same_v<T, GenericCleanup>) {
-                              work();
-                              return gfxstream::base::WorkerProcessingResult::Continue;
-                          } else if constexpr (std::is_same_v<T, Exit>) {
-                              return gfxstream::base::WorkerProcessingResult::Stop;
-                          }
-                      },
-                      std::move(task));
-              }) {
-        mWorker.start();
-    }
-
-    ~CleanupThread() { stop(); }
-
-    // CleanupThread is neither copyable nor movable.
-    CleanupThread(const CleanupThread& other) = delete;
-    CleanupThread& operator=(const CleanupThread& other) = delete;
-    CleanupThread(CleanupThread&& other) = delete;
-    CleanupThread& operator=(CleanupThread&& other) = delete;
-
-    void enqueueCleanup(GenericCleanup command) { mWorker.enqueue(std::move(command)); }
-
-    bool waitForPendingCleanups(
-        std::optional<std::chrono::milliseconds> timeout = std::nullopt) {
-        return mWorker.waitQueuedItems(timeout);
-    }
-
-    void stop() {
-        mWorker.enqueue(Exit{});
-        mWorker.join();
-    }
-
-   private:
-    struct Exit {};
-    using CleanupTask = std::variant<GenericCleanup, Exit>;
-    gfxstream::base::WorkerThread<CleanupTask> mWorker;
-};
 
 VirtioGpuFrontend::VirtioGpuFrontend() {
 #ifdef CONFIG_AEMU
@@ -150,15 +98,11 @@ int VirtioGpuFrontend::init(RendererPtr renderer, void* cookie,
     mPageSize = getpagesize();
 #endif
 
-    mCleanupThread.reset(new CleanupThread());
-
     return 0;
 }
 
 void VirtioGpuFrontend::teardown() {
     destroyVirtioGpuObjects();
-
-    mCleanupThread.reset();
 
     if (mRenderer) {
         mRenderer->finish();
@@ -729,6 +673,7 @@ void VirtioGpuFrontend::fillCaps(uint32_t set, void* caps) {
 
             capset->hasTraceAsyncCommand = 1;
             capset->hasSetMetadataCommand = 1;
+            capset->hasGuestCapabilities = 1;
 
             break;
         }
@@ -800,7 +745,7 @@ void VirtioGpuFrontend::detachResource(uint32_t contextId, uint32_t resourceId) 
 
     auto resourceAsgOpt = context.TakeAddressSpaceGraphicsHandle(resourceId);
     if (resourceAsgOpt) {
-        mCleanupThread->enqueueCleanup(
+        FrameBuffer::getFB()->enqueueAsyncCleanup(
             [asgBlob = resource.ShareRingBlob(), asgHandle = *resourceAsgOpt]() {
                 get_gfxstream_address_space_ops().destroy_handle(asgHandle);
             });
@@ -1005,8 +950,8 @@ int VirtioGpuFrontend::destroyVirtioGpuObjects() {
         mContexts.clear();
     }
 
-    if (mCleanupThread) {
-        mCleanupThread->waitForPendingCleanups();
+    if (auto* fb = FrameBuffer::getFB()) {
+        fb->waitForAllPendingCleanups();
     }
 
     return 0;
@@ -1141,11 +1086,6 @@ int VirtioGpuFrontend::snapshot(const char* directory) {
     if (!mRenderer) {
         GFXSTREAM_ERROR("Failed to restore renderer: renderer not available.");
         return -EINVAL;
-    }
-    if (mCleanupThread &&
-        !mCleanupThread->waitForPendingCleanups(kCleanupTimeout)) {
-        GFXSTREAM_ERROR("Failed to save snapshot: timed out waiting for frontend cleanups.");
-        return -ETIMEDOUT;
     }
     if (!mRenderer->pauseAllPreSave()) {
         GFXSTREAM_ERROR("Failed to save snapshot: failed to pause renderer pre-save.");
