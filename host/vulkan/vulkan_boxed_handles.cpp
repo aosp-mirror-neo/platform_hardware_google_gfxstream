@@ -20,35 +20,6 @@
 namespace gfxstream {
 namespace host {
 namespace vk {
-namespace {
-
-struct ReadStreamRegistry {
-    gfxstream::base::Lock mLock;
-
-    std::vector<VulkanMemReadingStream*> freeStreams;
-
-    ReadStreamRegistry() { freeStreams.reserve(100); };
-
-    VulkanMemReadingStream* pop(const gfxstream::host::FeatureSet& features) {
-        gfxstream::base::AutoLock lock(mLock);
-        if (freeStreams.empty()) {
-            return new VulkanMemReadingStream(nullptr, features);
-        } else {
-            VulkanMemReadingStream* res = freeStreams.back();
-            freeStreams.pop_back();
-            return res;
-        }
-    }
-
-    void push(VulkanMemReadingStream* stream) {
-        gfxstream::base::AutoLock lock(mLock);
-        freeStreams.push_back(stream);
-    }
-};
-
-static ReadStreamRegistry sReadStreamRegistry;
-
-}  // namespace
 
 void BoxedHandleManager::replayHandles(std::vector<BoxedHandle> handles) {
     mHandleReplayQueue.clear();
@@ -69,42 +40,92 @@ uint64_t BoxedHandleManager::getHandlesCount() const {
     return mReverseMap.size();
 }
 
-BoxedHandle BoxedHandleManager::add(const BoxedHandleInfo& item, BoxedHandleTypeTag tag) {
+BoxedHandle BoxedHandleManager::add(BoxedHandleInfo item, BoxedHandleTypeTag tag) {
     BoxedHandle handle;
+    UnboxedHandle underlying = item.underlying;
 
     if (mHandleReplay) {
         handle = mHandleReplayQueue.front();
         mHandleReplayQueue.pop_front();
         mHandleReplay = !mHandleReplayQueue.empty();
 
-        handle = (BoxedHandle)mStore.addFixed(handle, item, (size_t)tag);
+        handle = (BoxedHandle)mStore.addFixed(handle, std::move(item), (size_t)tag);
     } else {
-        handle = (BoxedHandle)mStore.add(item, (size_t)tag);
+        handle = (BoxedHandle)mStore.add(std::move(item), (size_t)tag);
     }
 
-    std::lock_guard<std::mutex> lock(mMutex);
-    mReverseMap[(BoxedHandle)(item.underlying)] = handle;
+    // VK_NULL_HANDLE is never a valid reverse-lookup key (see eraseReverseMappingLocked), so
+    // don't record one that could later be returned for getBoxedFromUnboxed(0).
+    if (underlying) {
+        std::lock_guard<std::mutex> lock(mMutex);
+        mReverseMap[underlying] = handle;
+    }
     return handle;
 }
 
-void BoxedHandleManager::update(BoxedHandle handle, const BoxedHandleInfo& item,
-                                BoxedHandleTypeTag tag) {
-    auto storedItem = mStore.get(handle);
-    UnboxedHandle oldHandle = (UnboxedHandle)storedItem->underlying;
-    *storedItem = item;
-    std::lock_guard<std::mutex> lock(mMutex);
-    if (oldHandle) {
-        mReverseMap.erase(oldHandle);
+void BoxedHandleManager::eraseReverseMappingLocked(UnboxedHandle unboxed, BoxedHandle boxed) {
+    if (!unboxed) {
+        return;
     }
-    mReverseMap[(UnboxedHandle)(item.underlying)] = handle;
+    // Only erase the reverse mapping if it still points at |boxed|. The host driver may reuse
+    // an unboxed handle value as soon as the underlying object is destroyed, and a new boxed
+    // handle may already have been registered for it by another thread before the old boxed
+    // handle is removed (e.g. on_vkDestroyImage releases the global state lock before the decoder
+    // calls delete_VkImage). Unconditionally erasing would drop the new object's reverse mapping
+    // and break unboxed_to_boxed_* lookups (and with them snapshot dependency tracking).
+    auto it = mReverseMap.find(unboxed);
+    if (it != mReverseMap.end() && it->second == boxed) {
+        mReverseMap.erase(it);
+    }
+}
+
+void BoxedHandleManager::update(BoxedHandle handle, BoxedHandleInfo item) {
+    const UnboxedHandle newHandle = (UnboxedHandle)item.underlying;
+    // Declared before the lock so it is destroyed after mMutex is released: its members may run
+    // arbitrary destructors.
+    BoxedHandleInfo previous;
+    // mMutex is held across the store swap and the reverse-map update so that update() and
+    // remove() on the same boxed handle are atomic with respect to each other; otherwise a
+    // remove() interleaved between the two steps could leave mReverseMap pointing at a dead
+    // handle. mMutex is never taken while the store lock is held, so the nesting is safe.
+    std::lock_guard<std::mutex> lock(mMutex);
+    const bool live = mStore.withLocked(handle, [&](BoxedHandleInfo* stored) {
+        if (!stored) {
+            return false;
+        }
+        previous = std::move(*stored);
+        *stored = std::move(item);
+        return true;
+    });
+    if (!live) {
+        return;
+    }
+    eraseReverseMappingLocked((UnboxedHandle)previous.underlying, handle);
+    if (newHandle) {
+        mReverseMap[newHandle] = handle;
+    }
 }
 
 void BoxedHandleManager::remove(BoxedHandle h) {
-    auto item = get(h);
-    if (item) {
-        std::lock_guard<std::mutex> lock(mMutex);
-        mReverseMap.erase((UnboxedHandle)(item->underlying));
+    // As in update(): declared before the lock so its destructors run after mMutex is released.
+    BoxedHandleInfo removed;
+    // mMutex covers the store lookup, the reverse-map erase and the store removal so that no
+    // concurrent update(h) can slip in between and leave a stale reverse mapping. The info is
+    // moved out under the store lock, as get() hands out a raw pointer that a concurrent
+    // remove(h) could otherwise free before it is dereferenced.
+    std::lock_guard<std::mutex> lock(mMutex);
+    const bool live = mStore.withLocked(h, [&](BoxedHandleInfo* stored) {
+        if (!stored) {
+            return false;
+        }
+        removed = std::move(*stored);
+        *stored = {};
+        return true;
+    });
+    if (!live) {
+        return;
     }
+    eraseReverseMappingLocked((UnboxedHandle)removed.underlying, h);
     mStore.remove(h);
 }
 
@@ -135,12 +156,23 @@ void BoxedHandleManager::processDelayedRemoves(VkDevice device) {
             r.callback();
         }
 
-        mStore.remove(h);
+        remove(h);
     }
 }
 
 BoxedHandleInfo* BoxedHandleManager::get(BoxedHandle handle) {
     return (BoxedHandleInfo*)mStore.get_const(handle);
+}
+
+std::shared_ptr<OrderMaintenanceInfo> BoxedHandleManager::getOrderMaintenanceInfo(
+    BoxedHandle handle) {
+    return mStore.withLocked(
+        handle, [](BoxedHandleInfo* info) -> std::shared_ptr<OrderMaintenanceInfo> {
+            if (info == nullptr) {
+                return nullptr;
+            }
+            return info->ordMaintInfo;
+        });
 }
 
 BoxedHandle BoxedHandleManager::getBoxedFromUnboxed(UnboxedHandle unboxed) {
@@ -343,15 +375,13 @@ VkObjectT new_boxed_VkType(VkObjectT underlying, bool dispatchable = false, Vulk
     if (dispatchable) {
         if (dispatch != nullptr) {
             info.dispatch = dispatch;
-            info.ownDispatch = false;
         } else {
-            info.dispatch = new VulkanDispatch();
-            info.ownDispatch = true;
+            info.ownedDispatch = std::make_unique<VulkanDispatch>();
+            info.dispatch = info.ownedDispatch.get();
         }
-        info.ordMaintInfo = new OrderMaintenanceInfo();
-        info.readStream = nullptr;
+        info.ordMaintInfo = std::make_shared<OrderMaintenanceInfo>();
     }
-    return (VkObjectT)sBoxedHandleManager.add(info, GetTag<VkObjectT>());
+    return (VkObjectT)sBoxedHandleManager.add(std::move(info), GetTag<VkObjectT>());
 }
 
 template <typename VkObjectT>
@@ -360,24 +390,7 @@ void delete_VkType(VkObjectT boxed) {
         return;
     }
 
-    BoxedHandleInfo* info = sBoxedHandleManager.get((uint64_t)(uintptr_t)boxed);
-    if (info == nullptr) {
-        return;
-    }
-
-    releaseOrderMaintInfo(info->ordMaintInfo);
-
-    if (info->ownDispatch) {
-        delete info->dispatch;
-        info->dispatch = nullptr;
-    }
-
-    if (info->readStream) {
-        sReadStreamRegistry.push(info->readStream);
-        info->readStream = nullptr;
-    }
-
-    sBoxedHandleManager.remove((uint64_t)boxed);
+    sBoxedHandleManager.remove((uint64_t)(uintptr_t)boxed);
 }
 
 template <typename VkObjectT>
@@ -417,19 +430,30 @@ VkObjectT unbox_VkType(VkObjectT boxed) {
     VkObjectT unboxed = VK_NULL_HANDLE;
 
     if constexpr (std::is_same_v<VkObjectT, VkQueue>) {
+        // Queue handles require special unboxing due to virtual queue support
         unboxed = unbox_VkQueueImpl(boxed);
+        if (unboxed == VK_NULL_HANDLE) {
+            GFXSTREAM_ERROR("Failed to unbox %s %p", GetTypeStr<VkObjectT>(), boxed);
+            if (VkDecoderGlobalState::get()->isSnapshotCurrentlyLoading()) {
+                VkDecoderGlobalState::get()->setSnapshotLoadError();
+            }
+        }
     } else {
         BoxedHandleInfo* info = sBoxedHandleManager.get((uint64_t)(uintptr_t)boxed);
         if (info == nullptr) {
-            if constexpr (std::is_same_v<VkObjectT, VkCommandBuffer> ||
-                          std::is_same_v<VkObjectT, VkDevice> ||
-                          std::is_same_v<VkObjectT, VkInstance> ||
-                          std::is_same_v<VkObjectT, VkPhysicalDevice> ||
-                          std::is_same_v<VkObjectT, VkQueue>) {
+            if (VkDecoderGlobalState::get()->isSnapshotCurrentlyLoading()) {
+                // During snapshot load, do not crash the emulator, just log the error
+                // The caller will handle it and fail snapshot loading.
+                GFXSTREAM_ERROR("Failed to unbox %s %p during snapshot load", GetTypeStr<VkObjectT>(), boxed);
+                VkDecoderGlobalState::get()->setSnapshotLoadError();
+            } else if constexpr (std::is_same_v<VkObjectT, VkCommandBuffer> ||
+                                 std::is_same_v<VkObjectT, VkDevice> ||
+                                 std::is_same_v<VkObjectT, VkInstance> ||
+                                 std::is_same_v<VkObjectT, VkFence> ||
+                                 std::is_same_v<VkObjectT, VkPhysicalDevice>) {
                 GFXSTREAM_ERROR("Failed to unbox %s %p", GetTypeStr<VkObjectT>(), boxed);
-            } else if constexpr (std::is_same_v<VkObjectT, VkFence>) {
-                // TODO: investigate.
             } else {
+                // This should not happen during runtime
                 GFXSTREAM_FATAL("Failed to unbox %s %p", GetTypeStr<VkObjectT>(), boxed);
             }
             unboxed = VK_NULL_HANDLE;
@@ -478,23 +502,12 @@ template <typename VkObjectT>
 void set_boxed_non_dispatchable_VkType(VkObjectT boxed, VkObjectT new_unboxed) {
     BoxedHandleInfo info;
     info.underlying = (uint64_t)new_unboxed;
-    sBoxedHandleManager.update((uint64_t)boxed, info, GetTag<VkObjectT>());
+    sBoxedHandleManager.update((uint64_t)boxed, std::move(info));
 }
 
 template <typename VkObjectT>
-OrderMaintenanceInfo* get_order_maintenance_info_VkType(VkObjectT boxed) {
-    BoxedHandleInfo* info = sBoxedHandleManager.get((uint64_t)(uintptr_t)boxed);
-    if (info == nullptr) {
-        return nullptr;
-    }
-
-    if (info->ordMaintInfo == nullptr) {
-        return nullptr;
-    }
-
-    acquireOrderMaintInfo(info->ordMaintInfo);
-
-    return info->ordMaintInfo;
+std::shared_ptr<OrderMaintenanceInfo> get_order_maintenance_info_VkType(VkObjectT boxed) {
+    return sBoxedHandleManager.getOrderMaintenanceInfo((uint64_t)(uintptr_t)boxed);
 }
 
 template <typename VkObjectT>
@@ -505,10 +518,11 @@ VulkanMemReadingStream* get_read_stream_VkType(VkObjectT boxed) {
     }
 
     if (info->readStream == nullptr) {
-        info->readStream = sReadStreamRegistry.pop(VkDecoderGlobalState::get()->getFeatures());
+        info->readStream = std::make_unique<VulkanMemReadingStream>(
+            nullptr, VkDecoderGlobalState::get()->getFeatures());
     }
 
-    return info->readStream;
+    return info->readStream.get();
 }
 
 template <typename VkObjectT>
@@ -516,6 +530,9 @@ VulkanDispatch* get_dispatch_VkType(VkObjectT boxed) {
     BoxedHandleInfo* info = sBoxedHandleManager.get((uint64_t)(uintptr_t)boxed);
     if (info == nullptr) {
         GFXSTREAM_ERROR("Failed to unbox %s %p", GetTypeStr<VkObjectT>(), boxed);
+        if (VkDecoderGlobalState::get()->isSnapshotCurrentlyLoading()) {
+            VkDecoderGlobalState::get()->setSnapshotLoadError();
+        }
         return nullptr;
     }
     return info->dispatch;
@@ -545,7 +562,7 @@ VkInstance unboxed_to_boxed_VkInstance(VkInstance unboxed) {
     return unboxed_to_boxed_non_dispatchable_VkType<VkInstance>(unboxed);
 }
 
-OrderMaintenanceInfo* ordmaint_VkInstance(VkInstance boxed) {
+std::shared_ptr<OrderMaintenanceInfo> ordmaint_VkInstance(VkInstance boxed) {
     return get_order_maintenance_info_VkType<VkInstance>(boxed);
 }
 
@@ -577,7 +594,7 @@ VkPhysicalDevice unboxed_to_boxed_VkPhysicalDevice(VkPhysicalDevice unboxed) {
     return unboxed_to_boxed_non_dispatchable_VkType<VkPhysicalDevice>(unboxed);
 }
 
-OrderMaintenanceInfo* ordmaint_VkPhysicalDevice(VkPhysicalDevice boxed) {
+std::shared_ptr<OrderMaintenanceInfo> ordmaint_VkPhysicalDevice(VkPhysicalDevice boxed) {
     return get_order_maintenance_info_VkType<VkPhysicalDevice>(boxed);
 }
 
@@ -609,7 +626,7 @@ VkDevice unboxed_to_boxed_VkDevice(VkDevice unboxed) {
     return unboxed_to_boxed_non_dispatchable_VkType<VkDevice>(unboxed);
 }
 
-OrderMaintenanceInfo* ordmaint_VkDevice(VkDevice boxed) {
+std::shared_ptr<OrderMaintenanceInfo> ordmaint_VkDevice(VkDevice boxed) {
     return get_order_maintenance_info_VkType<VkDevice>(boxed);
 }
 
@@ -641,7 +658,7 @@ VkCommandBuffer unboxed_to_boxed_VkCommandBuffer(VkCommandBuffer unboxed) {
     return unboxed_to_boxed_non_dispatchable_VkType<VkCommandBuffer>(unboxed);
 }
 
-OrderMaintenanceInfo* ordmaint_VkCommandBuffer(VkCommandBuffer boxed) {
+std::shared_ptr<OrderMaintenanceInfo> ordmaint_VkCommandBuffer(VkCommandBuffer boxed) {
     return get_order_maintenance_info_VkType<VkCommandBuffer>(boxed);
 }
 
@@ -673,7 +690,7 @@ VkQueue unboxed_to_boxed_VkQueue(VkQueue unboxed) {
     return unboxed_to_boxed_non_dispatchable_VkType<VkQueue>(unboxed);
 }
 
-OrderMaintenanceInfo* ordmaint_VkQueue(VkQueue boxed) {
+std::shared_ptr<OrderMaintenanceInfo> ordmaint_VkQueue(VkQueue boxed) {
     return get_order_maintenance_info_VkType<VkQueue>(boxed);
 }
 

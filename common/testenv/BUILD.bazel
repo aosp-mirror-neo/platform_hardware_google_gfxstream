@@ -12,15 +12,53 @@ string_flag(
     build_setting_default = "host",
     values = [
         "host",
+        "gles_none_vulkan_lavapipe",
         "gles_angle_vulkan_lavapipe",
         "gles_angle_vulkan_swiftshader",
     ],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "default_gles_angle_drivers",
+    srcs = [
+        "//third_party/angle:libEGL_angle_vendor_icd.json",
+        "@angle//:libEGL",
+        "@angle//:libGLESv2",
+    ],
+)
+
+label_flag(
+    name = "gles_angle_drivers",
+    build_setting_default = ":default_gles_angle_drivers",
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "default_vulkan_lavapipe_drivers",
+    srcs = [
+        "//third_party/mesa:vk_lavapipe_icd.json",
+        "@mesa//:vulkan_lvp",
+    ],
+)
+
+label_flag(
+    name = "vulkan_lavapipe_drivers",
+    build_setting_default = ":default_vulkan_lavapipe_drivers",
+    visibility = ["//visibility:public"],
 )
 
 config_setting(
     name = "graphics_test_environment_host",
     flag_values = {
         ":graphics_test_environment": "host",
+    },
+)
+
+config_setting(
+    name = "graphics_test_environment_gles_none_vulkan_lavapipe",
+    flag_values = {
+        ":graphics_test_environment": "gles_none_vulkan_lavapipe",
     },
 )
 
@@ -41,18 +79,16 @@ config_setting(
 copy_to_directory(
     name = "graphics_test_environment_drivers",
     srcs = select({
+        ":graphics_test_environment_gles_none_vulkan_lavapipe": [
+            ":vulkan_lavapipe_drivers",
+        ],
         ":graphics_test_environment_gles_angle_vulkan_lavapipe": [
-            "//third_party/angle:libEGL_angle_vendor_icd.json",
-            "//third_party/mesa:vk_lavapipe_icd.json",
-            "@angle//:libEGL",
-            "@angle//:libGLESv2",
-            "@mesa//:vulkan_lvp",
+            ":gles_angle_drivers",
+            ":vulkan_lavapipe_drivers",
         ],
         ":graphics_test_environment_gles_angle_vulkan_swiftshader": [
-            "//third_party/angle:libEGL_angle_vendor_icd.json",
+            ":gles_angle_drivers",
             "//third_party/swiftshader:vk_swiftshader_icd.json",
-            "@angle//:libEGL",
-            "@angle//:libGLESv2",
             "@swiftshader//:vk_swiftshader",
         ],
         "//conditions:default": [
@@ -62,6 +98,9 @@ copy_to_directory(
     include_external_repositories = ["*"],
     # Effectively, all of the "prefixes" to flatten/strip.
     root_paths = [
+        "**/darwin-aarch64/lib",
+        "**/lib64/vulkan",
+        "**/linux-x86_64/lib",
         "common/testenv",
         "third_party/angle",
         "third_party/mesa",
@@ -79,6 +118,9 @@ cc_library(
         "include/gfxstream/common/testing/graphics_test_environment.h",
     ],
     data = select({
+        ":graphics_test_environment_gles_none_vulkan_lavapipe": [
+            ":graphics_test_environment_drivers",
+        ],
         ":graphics_test_environment_gles_angle_vulkan_lavapipe": [
             ":graphics_test_environment_drivers",
         ],
@@ -88,6 +130,9 @@ cc_library(
         "//conditions:default": [],
     }),
     defines = select({
+        ":graphics_test_environment_gles_none_vulkan_lavapipe": [
+            "GFXSTREAM_TESTING_USE_VULKAN_LAVAPIPE",
+        ],
         ":graphics_test_environment_gles_angle_vulkan_lavapipe": [
             "GFXSTREAM_TESTING_USE_GLES_ANGLE",
             "GFXSTREAM_TESTING_USE_VULKAN_LAVAPIPE",
@@ -100,8 +145,14 @@ cc_library(
             # Default does not change anything and uses host drivers.
         ],
     }),
+    # Linked into the test binary so its sanitizer hooks (e.g.
+    # __tsan_default_suppressions) override the runtime's weak defaults.
+    linkstatic = True,
     strip_include_prefix = "include",
     deps = select({
+        ":graphics_test_environment_gles_none_vulkan_lavapipe": [
+            "@rules_cc//cc/runfiles",
+        ],
         ":graphics_test_environment_gles_angle_vulkan_lavapipe": [
             "@rules_cc//cc/runfiles",
         ],

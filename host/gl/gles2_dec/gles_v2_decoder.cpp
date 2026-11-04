@@ -27,6 +27,7 @@
 #include <GLES3/gl3.h>
 #include <GLES3/gl31.h>
 
+#include "gfxstream/common/logging.h"
 #include "gfxstream/host/address_space_operations.h"
 #include "gfxstream/host/dma_device.h"
 #include "gfxstream/host/vm_operations.h"
@@ -84,6 +85,37 @@ GLESv2Decoder::GLESv2Decoder()
 
 GLESv2Decoder::~GLESv2Decoder()
 {
+}
+
+void GLESv2Decoder::setGLerror(GLenum err) {
+    if (m_pendingError == GL_NO_ERROR) {
+        m_pendingError = err;
+    }
+}
+
+GLenum GLESv2Decoder::getGLerror() {
+    if (m_pendingError != GL_NO_ERROR) {
+        GLenum err = m_pendingError;
+        m_pendingError = GL_NO_ERROR;
+        return err;
+    }
+    return this->glGetError();
+}
+
+void GLESv2Decoder::rejectUnsupportedOpcode(const char* rawOpcode,
+                                            const char* replacementOpcode) {
+    // These raw wire opcodes pass arrays of pointers (e.g. const char**). In the GLES
+    // guest-to-host wire protocol, the guest cannot pass host virtual memory addresses;
+    // legitimate guests always emit the packed AEMU/String variants instead. Calling the raw
+    // opcode over the wire attempts to reinterpret guest bytes as host addresses (b/510366366),
+    // so reject with GL_INVALID_OPERATION without dereferencing the pointer array.
+    GFXSTREAM_ERROR("gles2: unsupported raw %s; use %s", rawOpcode, replacementOpcode);
+    setGLerror(GL_INVALID_OPERATION);
+}
+
+GLenum GLESv2Decoder::s_glGetError(void* self) {
+    GLESv2Decoder* ctx = static_cast<GLESv2Decoder*>(self);
+    return ctx->getGLerror();
 }
 
 void *GLESv2Decoder::s_getProc(const char *name, void *userData)
@@ -164,6 +196,8 @@ int GLESv2Decoder::initGL(get_proc_func_t getProcFunc, void *getProcFuncData)
 
     glBufferDataSyncAEMU = s_glBufferDataSyncAEMU;
 
+    OVERRIDE_DEC(glGetError)
+
     OVERRIDE_DEC(glCreateShader)
     OVERRIDE_DEC(glCreateProgram)
 
@@ -198,6 +232,7 @@ int GLESv2Decoder::initGL(get_proc_func_t getProcFunc, void *getProcFuncData)
     OVERRIDE_DEC(glDeleteProgramPipelines)
 
     // Shaders and programs
+    OVERRIDE_DEC(glShaderSource)
     OVERRIDE_DEC(glCompileShader)
     OVERRIDE_DEC(glAttachShader)
     OVERRIDE_DEC(glDetachShader)
@@ -223,6 +258,7 @@ int GLESv2Decoder::initGL(get_proc_func_t getProcFunc, void *getProcFuncData)
     OVERRIDE_DEC(glProgramBinaryOES)
     OVERRIDE_DEC(glUniformBlockBinding)
     OVERRIDE_DEC(glGetUniformBlockIndex)
+    OVERRIDE_DEC(glGetUniformIndices)
     OVERRIDE_DEC(glGetActiveUniformBlockiv)
     OVERRIDE_DEC(glGetActiveUniformBlockName)
     OVERRIDE_DEC(glGetUniformuiv)
@@ -235,6 +271,7 @@ int GLESv2Decoder::initGL(get_proc_func_t getProcFunc, void *getProcFuncData)
     OVERRIDE_DEC(glGetFragDataLocation)
     OVERRIDE_DEC(glUseProgramStages)
     OVERRIDE_DEC(glActiveShaderProgram)
+    OVERRIDE_DEC(glCreateShaderProgramv)
     OVERRIDE_DEC(glProgramUniform1f)
     OVERRIDE_DEC(glProgramUniform2f)
     OVERRIDE_DEC(glProgramUniform3f)
@@ -336,9 +373,29 @@ void GLESv2Decoder::s_glVertexAttribPointerOffset(void *self, GLuint indx, GLint
 }
 
 
+static size_t sDrawElementsBytesPerIndex(GLenum type) {
+    switch (type) {
+        case GL_UNSIGNED_BYTE:
+            return 1;
+        case GL_UNSIGNED_SHORT:
+            return 2;
+        case GL_UNSIGNED_INT:
+            return 4;
+        default:
+            return 0;
+    }
+}
+
 void GLESv2Decoder::s_glDrawElementsData(void *self, GLenum mode, GLsizei count, GLenum type, void * data, GLuint datalen)
 {
     GLESv2Decoder *ctx = (GLESv2Decoder *)self;
+    size_t bpv = sDrawElementsBytesPerIndex(type);
+    if (count > 0 && bpv > 0 &&
+        (static_cast<uint64_t>(count) * bpv > static_cast<uint64_t>(datalen) || data == nullptr)) {
+        fprintf(stderr, "%s: dropping draw call: count=%d, bpv=%zu exceeds datalen=%u or data is null\n",
+                __func__, count, bpv, datalen);
+        return;
+    }
     ctx->glDrawElements(mode, count, type, data);
 }
 
@@ -352,6 +409,13 @@ void GLESv2Decoder::s_glDrawElementsOffset(void *self, GLenum mode, GLsizei coun
 void GLESv2Decoder::s_glDrawElementsDataNullAEMU(void *self, GLenum mode, GLsizei count, GLenum type, void * data, GLuint datalen)
 {
     GLESv2Decoder *ctx = (GLESv2Decoder *)self;
+    size_t bpv = sDrawElementsBytesPerIndex(type);
+    if (count > 0 && bpv > 0 &&
+        (static_cast<uint64_t>(count) * bpv > static_cast<uint64_t>(datalen) || data == nullptr)) {
+        fprintf(stderr, "%s: dropping draw call: count=%d, bpv=%zu exceeds datalen=%u or data is null\n",
+                __func__, count, bpv, datalen);
+        return;
+    }
     ctx->glDrawElementsNullAEMU(mode, count, type, data);
 }
 
@@ -451,52 +515,40 @@ void GLESv2Decoder::s_glUnmapBufferDMA(void* self, GLenum target, GLintptr offse
     }
 }
 
-static std::pair<void*, GLsizeiptr> align_pointer_size(void* ptr, GLsizeiptr length)
-{
-    const size_t page_size = gfxstream::host::get_gfxstream_guest_page_size();
-    const size_t page_offset_mask = page_size - 1;
-
-    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);
-    uintptr_t page_offset = addr & page_offset_mask;
-
-    return { reinterpret_cast<void*>(addr - page_offset),
-             (GLsizeiptr)((length + page_offset + page_size - 1) & ~page_offset_mask)
-           };
-}
-
 uint64_t GLESv2Decoder::s_glMapBufferRangeDirect(void* self, GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access, uint64_t paddr)
 {
     GLESv2Decoder *ctx = (GLESv2Decoder *)self;
-    // Check if this is a read or write request and not an invalidate one.
-    if (access & (GL_MAP_READ_BIT | GL_MAP_WRITE_BIT)) {
-        void* gpu_ptr = ctx->glMapBufferRange(target, offset, length, access);
-
-        if (gpu_ptr) {
-            std::pair<void*, GLsizeiptr> aligned = align_pointer_size(gpu_ptr, length);
-            get_gfxstream_vm_operations().map_user_memory(paddr, aligned.first, aligned.second);
-            return reinterpret_cast<uint64_t>(gpu_ptr);
-        } else {
-            fprintf(stderr, "%s: error: could not map host gpu buffer\n", __func__);
-            return 0;
-        }
-    } else {
-        // if writing while not wanting to preserve previous contents,
-        // let |mapped| stay as garbage.
-        return 0;
-    }
+    (void)target;
+    (void)offset;
+    (void)length;
+    (void)access;
+    (void)paddr;
+    // Guest encoders (GL2Encoder) exclusively use OP_glMapBufferRangeAEMU and never emit
+    // OP_glMapBufferRangeDirect. Mapping host GL driver buffer pointers directly into guest
+    // physical memory without lifetime tracking or page isolation causes host UAF, heap page
+    // over-mapping, and ASLR leaks (b/509610756).
+    GFXSTREAM_ERROR("%s: unsupported OP_glMapBufferRangeDirect; use OP_glMapBufferRangeAEMU",
+                    __func__);
+    ctx->setGLerror(GL_INVALID_OPERATION);
+    return 0;
 }
 
 void GLESv2Decoder::s_glUnmapBufferDirect(void* self, GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access, uint64_t paddr, uint64_t gpu_ptr, GLboolean* out_res)
 {
     GLESv2Decoder *ctx = (GLESv2Decoder *)self;
-    GLboolean res = GL_TRUE;
-
-    if (access & (GL_MAP_READ_BIT | GL_MAP_WRITE_BIT)) {
-        get_gfxstream_vm_operations().unmap_user_memory(paddr, align_pointer_size(reinterpret_cast<void*>(gpu_ptr), length).second);
-        res = ctx->glUnmapBuffer(target);
+    (void)target;
+    (void)offset;
+    (void)length;
+    (void)access;
+    (void)paddr;
+    (void)gpu_ptr;
+    // Guest encoders exclusively use OP_glUnmapBufferAEMU / OP_glUnmapBufferAsyncAEMU and never
+    // emit OP_glUnmapBufferDirect (b/509610756).
+    GFXSTREAM_ERROR("%s: unsupported OP_glUnmapBufferDirect; use OP_glUnmapBufferAEMU", __func__);
+    ctx->setGLerror(GL_INVALID_OPERATION);
+    if (out_res) {
+        *out_res = GL_FALSE;
     }
-
-    *out_res = res;
 }
 
 void GLESv2Decoder::s_glFlushMappedBufferRangeAEMU(void* self, GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access, void* guest_buffer) {
@@ -521,7 +573,16 @@ void GLESv2Decoder::s_glFlushMappedBufferRangeAEMU(void* self, GLenum target, GL
 
 void GLESv2Decoder::s_glFlushMappedBufferRangeDirect(void* self, GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
     GLESv2Decoder *ctx = (GLESv2Decoder *)self;
-    ctx->glFlushMappedBufferRange(target, offset, length);
+    (void)target;
+    (void)offset;
+    (void)length;
+    (void)access;
+    // Guest encoders exclusively use OP_glFlushMappedBufferRangeAEMU /
+    // OP_glFlushMappedBufferRangeAEMU2 and never emit OP_glFlushMappedBufferRangeDirect
+    // (b/509610756).
+    GFXSTREAM_ERROR("%s: unsupported OP_glFlushMappedBufferRangeDirect; use OP_glFlushMappedBufferRangeAEMU",
+                    __func__);
+    ctx->setGLerror(GL_INVALID_OPERATION);
 }
 
 void GLESv2Decoder::s_glCompressedTexImage2DOffsetAEMU(void* self, GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, GLuint offset) {
@@ -643,6 +704,13 @@ void GLESv2Decoder::s_glDrawElementsInstancedOffsetAEMU(void* self, GLenum mode,
 
 void GLESv2Decoder::s_glDrawElementsInstancedDataAEMU(void* self, GLenum mode, GLsizei count, GLenum type, const void* indices, GLsizei primcount, GLsizei datalen) {
     GLESv2Decoder *ctx = (GLESv2Decoder *)self;
+    size_t bpv = sDrawElementsBytesPerIndex(type);
+    if (count > 0 && bpv > 0 &&
+        (datalen < 0 || static_cast<uint64_t>(count) * bpv > static_cast<uint64_t>(datalen) || indices == nullptr)) {
+        fprintf(stderr, "%s: dropping draw call: count=%d, bpv=%zu exceeds datalen=%d or indices is null\n",
+                __func__, count, bpv, datalen);
+        return;
+    }
     ctx->glDrawElementsInstanced(mode, count, type, indices, primcount);
 }
 
@@ -1022,7 +1090,49 @@ SNAPSHOT_PROGRAM_CALL(glGetActiveUniformBlockiv, (void* self,  GLuint program, G
 SNAPSHOT_PROGRAM_CALL(glGetActiveUniformBlockName, (void* self,  GLuint program, GLuint uniformBlockIndex, GLsizei bufSize, GLsizei* length, GLchar* uniformBlockName), (program, uniformBlockIndex, bufSize, length, uniformBlockName))
 SNAPSHOT_PROGRAM_CALL(glGetUniformuiv, (void* self,  GLuint program, GLint location, GLuint* params), (program, location, params))
 SNAPSHOT_PROGRAM_CALL(glGetActiveUniformsiv, (void* self,  GLuint program, GLsizei uniformCount, const GLuint* uniformIndices, GLenum pname, GLint* params), (program, uniformCount, uniformIndices, pname, params))
-SNAPSHOT_PROGRAM_CALL(glTransformFeedbackVaryings, (void* self,  GLuint program, GLsizei count, const char** varyings, GLenum bufferMode), (program, count, varyings, bufferMode))
+
+void GLESv2Decoder::s_glShaderSource(void* self, GLuint shader, GLsizei count,
+                                     const GLchar* const* string, const GLint* length) {
+    GLESv2Decoder* ctx = static_cast<GLESv2Decoder*>(self);
+    (void)shader;
+    (void)count;
+    (void)string;
+    (void)length;
+    ctx->rejectUnsupportedOpcode("OP_glShaderSource", "OP_glShaderString");
+}
+
+void GLESv2Decoder::s_glGetUniformIndices(void* self, GLuint program, GLsizei uniformCount,
+                                          const GLchar** uniformNames, GLuint* uniformIndices) {
+    GLESv2Decoder* ctx = static_cast<GLESv2Decoder*>(self);
+    (void)program;
+    (void)uniformCount;
+    (void)uniformNames;
+    (void)uniformIndices;
+    ctx->rejectUnsupportedOpcode("OP_glGetUniformIndices", "OP_glGetUniformIndicesAEMU");
+}
+
+void GLESv2Decoder::s_glTransformFeedbackVaryings(void* self, GLuint program, GLsizei count,
+                                                  const char** varyings, GLenum bufferMode) {
+    GLESv2Decoder* ctx = static_cast<GLESv2Decoder*>(self);
+    (void)program;
+    (void)count;
+    (void)varyings;
+    (void)bufferMode;
+    ctx->rejectUnsupportedOpcode("OP_glTransformFeedbackVaryings",
+                                 "OP_glTransformFeedbackVaryingsAEMU");
+}
+
+GLuint GLESv2Decoder::s_glCreateShaderProgramv(void* self, GLenum type, GLsizei count,
+                                               const char** strings) {
+    GLESv2Decoder* ctx = static_cast<GLESv2Decoder*>(self);
+    (void)type;
+    (void)count;
+    (void)strings;
+    ctx->rejectUnsupportedOpcode("OP_glCreateShaderProgramv",
+                                 "OP_glCreateShaderProgramvAEMU");
+    return 0;
+}
+
 SNAPSHOT_PROGRAM_CALL(glGetTransformFeedbackVarying, (void* self,  GLuint program, GLuint index, GLsizei bufSize, GLsizei* length, GLsizei* size, GLenum* type, char* name), (program, index, bufSize, length, size, type, name))
 SNAPSHOT_PROGRAM_CALL(glProgramParameteri, (void* self,  GLuint program, GLenum pname, GLint value), (program, pname, value))
 SNAPSHOT_PROGRAM_CALL(glProgramBinary, (void* self,  GLuint program, GLenum binaryFormat, const void* binary, GLsizei length), (program, binaryFormat, binary, length))

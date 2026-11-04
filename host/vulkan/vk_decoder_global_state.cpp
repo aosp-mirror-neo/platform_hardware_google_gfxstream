@@ -99,14 +99,27 @@ using gfxstream::base::StaticLock;
 using gfxstream::base::UdmabufCreator;
 using gfxstream::host::GfxApiLogger;
 
-#define VALIDATE_REQUIRED_HANDLE(parameter) \
-    validateRequiredHandle(__FUNCTION__, #parameter, parameter)
+#define VALIDATE_REQUIRED_HANDLE(parameter)                                                    \
+    do {                                                                                       \
+        VkResult validateResult = validateRequiredHandle(__FUNCTION__, #parameter, parameter); \
+        if (validateResult != VK_SUCCESS) {                                                    \
+            return validateResult;                                                             \
+        }                                                                                      \
+    } while (0)
 
 template <typename T>
-void validateRequiredHandle(const char* api_name, const char* parameter_name, T value) {
+VkResult validateRequiredHandle(const char* api_name, const char* parameter_name, T value) {
     if (value == VK_NULL_HANDLE) {
+        if (VkDecoderGlobalState::get()->isSnapshotCurrentlyLoading()) {
+            GFXSTREAM_ERROR("Invalid required handle for %s param %s during snapshot load",
+                            api_name, parameter_name);
+            VkDecoderGlobalState::get()->setSnapshotLoadError();
+            return VK_ERROR_VALIDATION_FAILED;
+        }
         GFXSTREAM_FATAL("Invalid required handle for %s param %s", api_name, parameter_name);
+        return VK_ERROR_VALIDATION_FAILED;
     }
+    return VK_SUCCESS;
 }
 
 #define VALIDATE_NEW_HANDLE_INFO_ENTRY(objectMap, newEntry) \
@@ -117,6 +130,46 @@ void validateNewHandleInfoEntry(const std::unordered_map<T, K>& vkObjectMap, con
                                 const char* typeName) {
     if (vkObjectMap.find(newEntry) != vkObjectMap.end()) {
         GFXSTREAM_ERROR("Found duplicate in %s (%p)!", typeName, newEntry);
+    }
+}
+
+bool isValidImageLayoutForSnapshot(uint32_t layout) {
+    // TODO(b/535587757): some of these don't make sense in snapshot (e.g. undefined).
+    // For the layouts that don't make sense, we should skip or transition before saving.
+    switch (layout) {
+        case VK_IMAGE_LAYOUT_UNDEFINED: return true;
+        case VK_IMAGE_LAYOUT_GENERAL: return true;
+        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL: return true;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL: return true;
+        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL: return true;
+        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL: return true;
+        case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL: return true;
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL: return true;
+        case VK_IMAGE_LAYOUT_PREINITIALIZED: return true;
+        case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL: return true;
+        case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL: return true;
+        case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL: return true;
+        case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL: return true;
+        case VK_IMAGE_LAYOUT_STENCIL_ATTACHMENT_OPTIMAL: return true;
+        case VK_IMAGE_LAYOUT_STENCIL_READ_ONLY_OPTIMAL: return true;
+        case VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL: return true;
+        case VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL: return true;
+        case VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ: return true;
+        case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR: return true;
+        case VK_IMAGE_LAYOUT_VIDEO_DECODE_DST_KHR: return true;
+        case VK_IMAGE_LAYOUT_VIDEO_DECODE_SRC_KHR: return true;
+        case VK_IMAGE_LAYOUT_VIDEO_DECODE_DPB_KHR: return true;
+        case VK_IMAGE_LAYOUT_SHARED_PRESENT_KHR: return true;
+        case VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT: return true;
+        case VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR: return true;
+        case VK_IMAGE_LAYOUT_VIDEO_ENCODE_DST_KHR: return true;
+        case VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR: return true;
+        case VK_IMAGE_LAYOUT_VIDEO_ENCODE_DPB_KHR: return true;
+        case VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT: return true;
+        case VK_IMAGE_LAYOUT_TENSOR_ALIASING_ARM: return true;
+        case VK_IMAGE_LAYOUT_VIDEO_ENCODE_QUANTIZATION_MAP_KHR: return true;
+        case VK_IMAGE_LAYOUT_ZERO_INITIALIZED_EXT: return true;
+        default: return false;
     }
 }
 
@@ -273,6 +326,10 @@ DescriptorUpdateTemplateInfo calcLinearizedDescriptorUpdateTemplateInfo(
 
 class VkDecoderGlobalState::Impl {
    public:
+    friend struct VkDecoderGlobalStateTestPeer;
+
+    Impl() : m_vk(vkDispatch()), m_vkEmulation(nullptr) {}
+
     Impl(VkEmulation* emulation)
         : m_vk(vkDispatch()) {
         if (!emulation || !m_vk) {
@@ -403,7 +460,7 @@ class VkDecoderGlobalState::Impl {
 
             auto& queueinfo = *q2Info[boxed_queue];
             unboxed_device = queueinfo.device;
-            unboxed_queue_of_event = unboxed_to_boxed_VkQueue(boxed_queue);
+            unboxed_queue_of_event = unbox_VkQueue(boxed_queue);
             queueFamilyIndex = queueinfo.queueFamilyIndex;
             StateBlock stateBlock =
                 createSnapshotStateBlock(unboxed_device, unboxed_queue_of_event, queueFamilyIndex);
@@ -559,7 +616,15 @@ class VkDecoderGlobalState::Impl {
         GFXSTREAM_DEBUG("VulkanSnapshots save (begin)");
         std::lock_guard<std::mutex> lock(mMutex);
 
-        mSnapshotState = SnapshotState::Saving;
+        struct ScopedSnapshotSaveState {
+            Impl* self;
+            ScopedSnapshotSaveState(Impl* impl) : self(impl) {
+                self->mSnapshotState = SnapshotState::Saving;
+            }
+            ~ScopedSnapshotSaveState() {
+                self->mSnapshotState = SnapshotState::Normal;
+            }
+        } scopedSnapshotSaveState(this);
 
 #ifdef CONFIG_AEMU
         if (!mInstanceInfo.empty()) {
@@ -617,6 +682,38 @@ class VkDecoderGlobalState::Impl {
         // Set up VK structs to snapshot other Vulkan objects
         // TODO(b/323064243): group all images from the same device and reuse queue / command pool
 
+        // snapshot buffers before images so that on load, loadImageContent (vkCmdCopyBufferToImage)
+        // is always the final write to any unified/shared VkDeviceMemory.
+        GFXSTREAM_DEBUG("snapshot save: buffers");
+        std::vector<VkBuffer> sortedBoxedBuffers;
+        for (const auto& bufferIte : mBufferInfo) {
+            sortedBoxedBuffers.push_back(
+                unboxed_to_boxed_non_dispatchable_VkBuffer(bufferIte.first));
+        }
+        sort(sortedBoxedBuffers.begin(), sortedBoxedBuffers.end());
+        for (const auto& boxedBuffer : sortedBoxedBuffers) {
+            auto unboxedBuffer = try_unbox_VkBuffer(boxedBuffer);
+            if (unboxedBuffer == VK_NULL_HANDLE) {
+                GFXSTREAM_ERROR("Failed to unbox VkBuffer %p when saving snapshot.", boxedBuffer);
+                return false;
+            }
+            const BufferInfo& bufferInfo = mBufferInfo[unboxedBuffer];
+            const bool hasContentToSave = (bufferInfo.memory != VK_NULL_HANDLE);
+            stream->putBe32(hasContentToSave ? 1 : 0);
+            if (!hasContentToSave) {
+                continue;
+            }
+            // TODO: add a special case for host mapped memory
+            StateBlock stateBlock = createSnapshotStateBlock(bufferInfo.device);
+
+            // TODO(b/294277842): make sure the queue is empty before using.
+            if (!saveBufferContent(stream, &stateBlock, unboxedBuffer, &bufferInfo)) {
+                releaseSnapshotStateBlock(&stateBlock);
+                return false;
+            }
+            releaseSnapshotStateBlock(&stateBlock);
+        }
+
         GFXSTREAM_DEBUG("snapshot save: image content");
         std::vector<VkImage> sortedBoxedImages;
         for (const auto& imageIte : mImageInfo) {
@@ -628,52 +725,31 @@ class VkDecoderGlobalState::Impl {
         for (const auto& boxedImage : sortedBoxedImages) {
             auto unboxedImage = try_unbox_VkImage(boxedImage);
             if (unboxedImage == VK_NULL_HANDLE) {
-                // TODO(b/294277842): should return an error here.
-                continue;
+                GFXSTREAM_ERROR("Failed to unbox VkImage %p when saving snapshot.", boxedImage);
+                return false;
             }
             const ImageInfo& imageInfo = mImageInfo[unboxedImage];
-            if (imageInfo.memory == VK_NULL_HANDLE) {
+
+            // Color buffer is saved in ColorBufferVk already
+            const bool hasContentToSave =
+                (imageInfo.memory != VK_NULL_HANDLE) && !isMemoryBoundToColorBuffer(imageInfo.memory);
+            stream->putBe32(hasContentToSave ? 1 : 0);
+            if (!hasContentToSave) {
                 continue;
             }
-            if (isMemoryBoundToColorBuffer(imageInfo.memory)) {
-                // color buffer is saved in ColorBufferVk already
-                continue;
+
+            uint32_t layoutVal = static_cast<uint32_t>(imageInfo.layout);
+            if (!isValidImageLayoutForSnapshot(layoutVal)) {
+                GFXSTREAM_ERROR("Snapshot save: image %p layout %s [%u] is invalid", boxedImage,
+                                string_VkImageLayout(imageInfo.layout), layoutVal);
+                return false;
             }
             // Vulkan command playback doesn't recover image layout. We need to do it here.
-            stream->putBe32(imageInfo.layout);
+            stream->putBe32(layoutVal);
 
             StateBlock stateBlock = createSnapshotStateBlock(imageInfo.device);
             // TODO(b/294277842): make sure the queue is empty before using.
             if (!saveImageContent(stream, &stateBlock, unboxedImage, &imageInfo)) {
-                releaseSnapshotStateBlock(&stateBlock);
-                return false;
-            }
-            releaseSnapshotStateBlock(&stateBlock);
-        }
-
-        // snapshot buffers
-        GFXSTREAM_DEBUG("snapshot save: buffers");
-        std::vector<VkBuffer> sortedBoxedBuffers;
-        for (const auto& bufferIte : mBufferInfo) {
-            sortedBoxedBuffers.push_back(
-                unboxed_to_boxed_non_dispatchable_VkBuffer(bufferIte.first));
-        }
-        sort(sortedBoxedBuffers.begin(), sortedBoxedBuffers.end());
-        for (const auto& boxedBuffer : sortedBoxedBuffers) {
-            auto unboxedBuffer = try_unbox_VkBuffer(boxedBuffer);
-            if (unboxedBuffer == VK_NULL_HANDLE) {
-                // TODO(b/294277842): should return an error here.
-                continue;
-            }
-            const BufferInfo& bufferInfo = mBufferInfo[unboxedBuffer];
-            if (bufferInfo.memory == VK_NULL_HANDLE) {
-                continue;
-            }
-            // TODO: add a special case for host mapped memory
-            StateBlock stateBlock = createSnapshotStateBlock(bufferInfo.device);
-
-            // TODO(b/294277842): make sure the queue is empty before using.
-            if (!saveBufferContent(stream, &stateBlock, unboxedBuffer, &bufferInfo)) {
                 releaseSnapshotStateBlock(&stateBlock);
                 return false;
             }
@@ -866,7 +942,6 @@ class VkDecoderGlobalState::Impl {
         // Semaphores
         saveSemaphores(stream);
 
-        mSnapshotState = SnapshotState::Normal;
         GFXSTREAM_DEBUG("VulkanSnapshots save (end)");
         if (stream && stream->hasErrors()) {
             GFXSTREAM_ERROR("VulkanSnapshots save failed due to stream errors: %s",
@@ -881,6 +956,17 @@ class VkDecoderGlobalState::Impl {
         // from FrameBuffer's onLoad method.
         GFXSTREAM_DEBUG("VulkanSnapshots load (begin)");
 
+        struct ScopedSnapshotLoadState {
+            Impl* self;
+            ~ScopedSnapshotLoadState() {
+                std::lock_guard<std::mutex> lock(self->mMutex);
+                self->mSnapshotLoadVkDeviceToVirtioCpuContextId.reset();
+                self->mSnapshotLoadBoxedInstance2ContextId.clear();
+                self->mSnapshotState = SnapshotState::Normal;
+                sBoxedHandleManager.replayHandles({});
+            }
+        } scopedSnapshotLoadState{this};
+
         // destroy all current internal data structures
         GFXSTREAM_DEBUG("snapshot load: setup internal structures");
         {
@@ -889,6 +975,7 @@ class VkDecoderGlobalState::Impl {
             clearLocked();
 
             mSnapshotState = SnapshotState::Loading;
+            mSnapshotLoadHasError = false;
 
             // This needs to happen before the replay in the decoder so that virtio gpu context ids
             // are available for operations involving `ExternalObjectManager`.
@@ -945,6 +1032,10 @@ class VkDecoderGlobalState::Impl {
                                 consumed, decoderReplayBuffer.size());
                 return false;
             }
+            if (mSnapshotLoadHasError) {
+                GFXSTREAM_ERROR("Failed to decode snapshot replay buffer due to errors.");
+                return false;
+            }
         }
 
         {
@@ -977,14 +1068,13 @@ class VkDecoderGlobalState::Impl {
                 bool hasPtr = stream->getByte() != 0;
                 if (hasPtr) {
                     VkDeviceSize size = stream->getBe64();
-                    if (size != it->second.size || !it->second.ptr) {
+                    if (!loadMappedMemoryContent(stream, &it->second, size)) {
                         GFXSTREAM_ERROR(
                             "Snapshot load failure: memory size does not match for "
                             "VkDeviceMemory:%p",
                             boxedMemory);
                         return false;
                     }
-                    stream->read(it->second.ptr, size);
                 }
 
                 uint64_t hostmemId = stream->getBe64();
@@ -1034,6 +1124,40 @@ class VkDecoderGlobalState::Impl {
             // TODO(b/323064243): group all images from the same device and reuse queue / command
             // pool
 
+            // snapshot buffers before images so that loadImageContent (vkCmdCopyBufferToImage)
+            // is always the final write to any unified/shared VkDeviceMemory.
+            GFXSTREAM_DEBUG("snapshot load: buffers");
+            std::vector<VkBuffer> sortedBoxedBuffers;
+            for (const auto& bufferIte : mBufferInfo) {
+                sortedBoxedBuffers.push_back(
+                    unboxed_to_boxed_non_dispatchable_VkBuffer(bufferIte.first));
+            }
+            sort(sortedBoxedBuffers.begin(), sortedBoxedBuffers.end());
+            for (const auto& boxedBuffer : sortedBoxedBuffers) {
+                auto unboxedBuffer = try_unbox_VkBuffer(boxedBuffer);
+                if (unboxedBuffer == VK_NULL_HANDLE) {
+                    GFXSTREAM_ERROR("Failed to unbox VkBuffer %p when loading snapshot.", boxedBuffer);
+                    return false;
+                }
+                const BufferInfo& bufferInfo = mBufferInfo[unboxedBuffer];
+                const bool hasContentToLoad = stream->getBe32() == 1;
+                if (!hasContentToLoad) {
+                    continue;
+                }
+                if (bufferInfo.memory == VK_NULL_HANDLE) {
+                    GFXSTREAM_ERROR("Snapshot load failure: buffer %p has content to load but no memory.", boxedBuffer);
+                    return false;
+                }
+                // TODO: add a special case for host mapped memory
+                StateBlock stateBlock = createSnapshotStateBlock(bufferInfo.device);
+                // TODO(b/294277842): make sure the queue is empty before using.
+                if (!loadBufferContent(stream, &stateBlock, unboxedBuffer, &bufferInfo)) {
+                    releaseSnapshotStateBlock(&stateBlock);
+                    return false;
+                }
+                releaseSnapshotStateBlock(&stateBlock);
+            }
+
             GFXSTREAM_DEBUG("snapshot load: image content");
             std::vector<VkImage> sortedBoxedImages;
             for (const auto& imageIte : mImageInfo) {
@@ -1042,15 +1166,28 @@ class VkDecoderGlobalState::Impl {
             }
             sort(sortedBoxedImages.begin(), sortedBoxedImages.end());
             for (const auto& boxedImage : sortedBoxedImages) {
-                auto unboxedImage = unbox_VkImage(boxedImage);
+                auto unboxedImage = try_unbox_VkImage(boxedImage);
+                if (unboxedImage == VK_NULL_HANDLE) {
+                    GFXSTREAM_ERROR(
+                        "Failed to unbox VkImage %p when loading snapshot.", boxedImage);
+                    return false;
+                }
+
                 ImageInfo& imageInfo = mImageInfo[unboxedImage];
-                if (imageInfo.memory == VK_NULL_HANDLE) {
+
+                const bool hasContentToLoad = (stream->getBe32() == 1);
+                if (!hasContentToLoad) {
                     continue;
                 }
-                if (isMemoryBoundToColorBuffer(imageInfo.memory)) {
-                    // color buffer is loaded in ColorBufferVk already
-                    continue;
+
+                if (imageInfo.memory == VK_NULL_HANDLE || isMemoryBoundToColorBuffer(imageInfo.memory)) {
+                    // Color buffer should have been handled by ColorBufferVk already
+                    // and saved with 'hasContentToSave' set to false.
+                    GFXSTREAM_ERROR("Cannot load image %p with content in the snapshot",
+                                    boxedImage);
+                    return false;
                 }
+
                 // Playback doesn't recover image layout. We need to do it here.
                 //
                 // Layout transform was done by vkCmdPipelineBarrier but we don't record such
@@ -1060,36 +1197,19 @@ class VkDecoderGlobalState::Impl {
                 // We do the layout transform in loadImageContent. There are still use cases where
                 // it should recover the layout but does not.
                 //
-                // TODO(b/323059453): fix corner cases when image contents cannot be properly
-                // loaded.
-                imageInfo.layout = static_cast<VkImageLayout>(stream->getBe32());
+                uint32_t layoutRead = stream->getBe32();
+                if (!isValidImageLayoutForSnapshot(layoutRead)) {
+                    // We check this when saving the layout, so it should never happen here unless
+                    // the stream is corrupted.
+                    GFXSTREAM_ERROR("Snapshot load: image %p layout %s [%u] is invalid", boxedImage,
+                                    string_VkImageLayout(static_cast<VkImageLayout>(layoutRead)),
+                                    layoutRead);
+                    return false;
+                }
+                imageInfo.layout = static_cast<VkImageLayout>(layoutRead);
                 StateBlock stateBlock = createSnapshotStateBlock(imageInfo.device);
                 // TODO(b/294277842): make sure the queue is empty before using.
                 if (!loadImageContent(stream, &stateBlock, unboxedImage, &imageInfo)) {
-                    releaseSnapshotStateBlock(&stateBlock);
-                    return false;
-                }
-                releaseSnapshotStateBlock(&stateBlock);
-            }
-
-            // snapshot buffers
-            GFXSTREAM_DEBUG("snapshot load: buffers");
-            std::vector<VkBuffer> sortedBoxedBuffers;
-            for (const auto& bufferIte : mBufferInfo) {
-                sortedBoxedBuffers.push_back(
-                    unboxed_to_boxed_non_dispatchable_VkBuffer(bufferIte.first));
-            }
-            sort(sortedBoxedBuffers.begin(), sortedBoxedBuffers.end());
-            for (const auto& boxedBuffer : sortedBoxedBuffers) {
-                auto unboxedBuffer = unbox_VkBuffer(boxedBuffer);
-                const BufferInfo& bufferInfo = mBufferInfo[unboxedBuffer];
-                if (bufferInfo.memory == VK_NULL_HANDLE) {
-                    continue;
-                }
-                // TODO: add a special case for host mapped memory
-                StateBlock stateBlock = createSnapshotStateBlock(bufferInfo.device);
-                // TODO(b/294277842): make sure the queue is empty before using.
-                if (!loadBufferContent(stream, &stateBlock, unboxedBuffer, &bufferInfo)) {
                     releaseSnapshotStateBlock(&stateBlock);
                     return false;
                 }
@@ -1239,13 +1359,13 @@ class VkDecoderGlobalState::Impl {
                                 inlineUniformBlock.pData =
                                     tmpInlineUniformBlockBuffers.back().data();
                                 writeDescriptorSet.pNext = &inlineUniformBlock;
-                                // Note: following is redundant, as arrayElement is guarantee to be
+                                // Note: following is redundant, as arrayElement is guaranteed to be
                                 // 0 due to the way descriptor is handled in snapshot. it just
                                 // serves to clarify that we are updating the whole buffer, to
                                 // account the possibility of accumulative updating
                                 writeDescriptorSet.dstArrayElement = 0;
                                 // Note: following is important to indicate we are updating
-                                // the whole buffer, as it could accumulate multiple update before
+                                // the whole buffer, as it could accumulate multiple updates before
                                 // snapshot is taken
                                 writeDescriptorSet.descriptorCount = dataSize;
                             } break;
@@ -1344,11 +1464,12 @@ class VkDecoderGlobalState::Impl {
 
             // semaphores
             loadSemaphores(stream);
-
-            mSnapshotLoadBoxedInstance2ContextId.clear();
-            mSnapshotState = SnapshotState::Normal;
         }
         GFXSTREAM_DEBUG("VulkanSnapshots load (end)");
+        if (hasSnapshotLoadError()) {
+            GFXSTREAM_ERROR("VulkanSnapshots load failed due to handle unboxing errors.");
+            return false;
+        }
         if (stream && stream->hasErrors()) {
             GFXSTREAM_ERROR("VulkanSnapshots load failed due to stream errors: %s",
                             stream->getErrors().value_or("unknown error").c_str());
@@ -1475,7 +1596,7 @@ class VkDecoderGlobalState::Impl {
             m_vkEmulation->createVVLContext(vvlAppName, vvlEngineName, &debugInfo);
 
         if (debugContext) {
-            GFXSTREAM_INFO("Enabling VVL for %s %s", vvlAppName.c_str(), vvlEngineName.c_str());
+            GFXSTREAM_INFO("VVL: Enabling for %s %s", vvlAppName.c_str(), vvlEngineName.c_str());
 
             bool hasDebugUtils = false;
             for (const char* ext : finalExts) {
@@ -1487,8 +1608,8 @@ class VkDecoderGlobalState::Impl {
             if (!hasDebugUtils) {
                 finalExts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
             }
-        } else {
-            GFXSTREAM_VERBOSE("Not enabling VVL for %s %s", vvlAppName.c_str(), vvlEngineName.c_str());
+        } else if (!vvlAppName.empty() || !vvlEngineName.empty()) {
+            GFXSTREAM_VERBOSE("VVL: Not enabling for %s %s", vvlAppName.c_str(), vvlEngineName.c_str());
         }
 
         createInfoFiltered.enabledExtensionCount = static_cast<uint32_t>(finalExts.size());
@@ -1554,8 +1675,10 @@ class VkDecoderGlobalState::Impl {
                        info.applicationName.c_str(), info.engineName.c_str());
 
 #ifdef CONFIG_AEMU
-        m_vkEmulation->getGlobalState()->registerVulkanInstance((uint64_t)*pInstance,
-                                                                info.applicationName.c_str());
+        if (m_vkEmulation->getGlobalState()) {
+            m_vkEmulation->getGlobalState()->registerVulkanInstance((uint64_t)*pInstance,
+                                                                    info.applicationName.c_str());
+        }
 #endif
         // Box it up
         VkInstance boxed = new_boxed_VkInstance(*pInstance, nullptr);
@@ -1593,7 +1716,7 @@ class VkDecoderGlobalState::Impl {
 
         *pInstance = (VkInstance)boxed;
 
-        if (vkCleanupEnabled()) {
+        if (vkCleanupEnabled() && m_vkEmulation->getGlobalState()) {
             m_vkEmulation->getGlobalState()->registerProcessCleanupCallback(
                 unbox_VkInstance(boxed), contextId, [this, boxed] {
                     if (snapshotsEnabled()) {
@@ -1653,7 +1776,9 @@ class VkDecoderGlobalState::Impl {
         }
         // The instance should not be used after vkDestroyInstanceImpl is called,
         // remove it from the cleanup callback mapping.
-        m_vkEmulation->getGlobalState()->unregisterProcessCleanupCallback(instance);
+        if (m_vkEmulation->getGlobalState()) {
+            m_vkEmulation->getGlobalState()->unregisterProcessCleanupCallback(instance);
+        }
 
         vkDestroyInstanceImpl(instance);
     }
@@ -1728,6 +1853,59 @@ class VkDecoderGlobalState::Impl {
         }
     }
 
+    // Enumerates the host physical devices visible to `instance`, records their
+    // properties in mPhysdevInfo and boxes them into
+    // `instanceInfo.boxedPhysicalDevices`. Called once per instance: the boxed
+    // handles live as long as the instance and are released with it.
+    VkResult populatePhysicalDevicesLocked(VkInstance instance, VulkanDispatch* vk,
+                                           InstanceInfo& instanceInfo) REQUIRES(mMutex) {
+        std::vector<VkPhysicalDevice> physicalDevices;
+        VkResult res = GetPhysicalDevices(instance, vk, physicalDevices);
+        if (res != VK_SUCCESS) {
+            return res;
+        }
+
+        FilterPhysicalDevicesLocked(instance, vk, physicalDevices);
+
+        instanceInfo.boxedPhysicalDevices.reserve(physicalDevices.size());
+        for (VkPhysicalDevice physicalDevice : physicalDevices) {
+            VALIDATE_NEW_HANDLE_INFO_ENTRY(mPhysdevInfo, physicalDevice);
+            auto& physdevInfo = mPhysdevInfo[physicalDevice];
+            physdevInfo.instance = instance;
+
+            vk->vkGetPhysicalDeviceProperties(physicalDevice, &physdevInfo.props);
+
+            m_vkEmulation->applyApiVersionLimits(physdevInfo.props.apiVersion);
+
+            VkPhysicalDeviceMemoryProperties hostMemoryProperties;
+            vk->vkGetPhysicalDeviceMemoryProperties(physicalDevice, &hostMemoryProperties);
+
+            physdevInfo.memoryPropertiesHelper =
+                std::make_unique<EmulatedPhysicalDeviceMemoryProperties>(
+                    hostMemoryProperties,
+                    m_vkEmulation->getRepresentativeColorBufferMemoryTypeInfo()
+                        .hostMemoryTypeIndex,
+                    getFeatures());
+
+            std::vector<VkQueueFamilyProperties> queueFamilyProperties;
+            uint32_t queueFamilyPropCount = 0;
+            vk->vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyPropCount,
+                                                         nullptr);
+            queueFamilyProperties.resize((size_t)queueFamilyPropCount);
+            vk->vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyPropCount,
+                                                         queueFamilyProperties.data());
+
+            physdevInfo.queuePropertiesHelper =
+                std::make_unique<EmulatedPhysicalDeviceQueueProperties>(queueFamilyProperties,
+                                                                        getFeatures());
+
+            instanceInfo.boxedPhysicalDevices.push_back(
+                new_boxed_VkPhysicalDevice(physicalDevice, vk));
+        }
+
+        return VK_SUCCESS;
+    }
+
     VkResult on_vkEnumeratePhysicalDevices(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
                                            VkInstance boxed_instance,
                                            uint32_t* pPhysicalDeviceCount,
@@ -1735,67 +1913,48 @@ class VkDecoderGlobalState::Impl {
         auto instance = unbox_VkInstance(boxed_instance);
         auto vk = dispatch_VkInstance(boxed_instance);
 
-        std::vector<VkPhysicalDevice> physicalDevices;
-        auto res = GetPhysicalDevices(instance, vk, physicalDevices);
-        if (res != VK_SUCCESS) {
-            return res;
-        }
-
         std::lock_guard<std::mutex> lock(mMutex);
 
-        FilterPhysicalDevicesLocked(instance, vk, physicalDevices);
+        auto* instanceInfo = gfxstream::base::find(mInstanceInfo, instance);
+        if (!instanceInfo) {
+            GFXSTREAM_ERROR("%s: unknown VkInstance %p.", __func__, instance);
+            return VK_ERROR_INITIALIZATION_FAILED;
+        }
 
-        const uint32_t requestedCount = pPhysicalDeviceCount ? *pPhysicalDeviceCount : 0;
-        const uint32_t availableCount = static_cast<uint32_t>(physicalDevices.size());
+        // The physical devices are owned by the instance: box them on the first
+        // call and hand out the same boxed handles afterwards, as Vulkan requires
+        // repeated enumeration on the same instance to return the same handles.
+        if (instanceInfo->boxedPhysicalDevices.empty()) {
+            VkResult res = populatePhysicalDevicesLocked(instance, vk, *instanceInfo);
+            if (res != VK_SUCCESS) {
+                return res;
+            }
+        }
 
-        if (pPhysicalDeviceCount) {
+        const std::vector<VkPhysicalDevice>& boxedPhysicalDevices =
+            instanceInfo->boxedPhysicalDevices;
+        const uint32_t availableCount = static_cast<uint32_t>(boxedPhysicalDevices.size());
+
+        if (!pPhysicalDeviceCount) {
+            return VK_SUCCESS;
+        }
+
+        if (!pPhysicalDevices) {
             *pPhysicalDeviceCount = availableCount;
+            return VK_SUCCESS;
         }
 
-        if (pPhysicalDeviceCount && pPhysicalDevices) {
-            // Box them up
-            for (uint32_t i = 0; i < std::min(requestedCount, availableCount); ++i) {
-                VALIDATE_NEW_HANDLE_INFO_ENTRY(mPhysdevInfo, physicalDevices[i]);
-                auto& physdevInfo = mPhysdevInfo[physicalDevices[i]];
-                physdevInfo.instance = instance;
-                physdevInfo.boxed = new_boxed_VkPhysicalDevice(physicalDevices[i], vk);
+        // Standard Vulkan two-call pattern: write at most *pPhysicalDeviceCount
+        // handles, report how many were actually written, and return
+        // VK_INCOMPLETE if the array was too small. The decoder writes exactly
+        // *pPhysicalDeviceCount handles back to the guest, so it must match the
+        // number copied here.
+        const uint32_t requestedCount = *pPhysicalDeviceCount;
+        const uint32_t writtenCount = std::min(requestedCount, availableCount);
+        std::copy_n(boxedPhysicalDevices.begin(), writtenCount, pPhysicalDevices);
+        *pPhysicalDeviceCount = writtenCount;
 
-                vk->vkGetPhysicalDeviceProperties(physicalDevices[i], &physdevInfo.props);
-
-                m_vkEmulation->applyApiVersionLimits(physdevInfo.props.apiVersion);
-
-                VkPhysicalDeviceMemoryProperties hostMemoryProperties;
-                vk->vkGetPhysicalDeviceMemoryProperties(physicalDevices[i], &hostMemoryProperties);
-
-                physdevInfo.memoryPropertiesHelper =
-                    std::make_unique<EmulatedPhysicalDeviceMemoryProperties>(
-                        hostMemoryProperties,
-                        m_vkEmulation->getRepresentativeColorBufferMemoryTypeInfo()
-                            .hostMemoryTypeIndex,
-                        getFeatures());
-
-                std::vector<VkQueueFamilyProperties> queueFamilyProperties;
-                uint32_t queueFamilyPropCount = 0;
-                vk->vkGetPhysicalDeviceQueueFamilyProperties(physicalDevices[i],
-                                                             &queueFamilyPropCount, nullptr);
-                queueFamilyProperties.resize((size_t)queueFamilyPropCount);
-                vk->vkGetPhysicalDeviceQueueFamilyProperties(
-                    physicalDevices[i], &queueFamilyPropCount,
-                    queueFamilyProperties.data());
-
-                physdevInfo.queuePropertiesHelper =
-                    std::make_unique<EmulatedPhysicalDeviceQueueProperties>(
-                        queueFamilyProperties,
-                        getFeatures());
-
-                pPhysicalDevices[i] = (VkPhysicalDevice)physdevInfo.boxed;
-            }
-            if (requestedCount < availableCount) {
-                res = VK_INCOMPLETE;
-            }
-        }
-
-        return res;
+        return writtenCount < availableCount ? VK_INCOMPLETE : VK_SUCCESS;
     }
 
     void on_vkGetPhysicalDeviceFeatures(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
@@ -2468,7 +2627,7 @@ class VkDecoderGlobalState::Impl {
 #endif
 
         // If MoltenVK is supported on host, we need to ensure that we include
-        // VK_MVK_moltenvk extenstion in returned properties.
+        // VK_MVK_moltenvk extension in returned properties.
 #if defined(__APPLE__) && defined(VK_MVK_moltenvk)
         // Guest will check for VK_MVK_moltenvk extension for enabling AHB support
         if ((m_vkEmulation->getExternalMemoryMode() == ExternalMemory::Mode::Metal) &&
@@ -2936,11 +3095,15 @@ class VkDecoderGlobalState::Impl {
 
         if (mSnapshotState == SnapshotState::Loading) {
             if (!mSnapshotLoadVkDeviceToVirtioCpuContextId) {
-                GFXSTREAM_FATAL("Missing device to context id map during snapshot load.");
+                GFXSTREAM_ERROR("Missing device to context id map during snapshot load.");
+                setSnapshotLoadError();
+                return VK_ERROR_INITIALIZATION_FAILED;
             }
             auto contextIdIt = mSnapshotLoadVkDeviceToVirtioCpuContextId->find(boxedDevice);
             if (contextIdIt == mSnapshotLoadVkDeviceToVirtioCpuContextId->end()) {
-                GFXSTREAM_FATAL("Missing context id for VkDevice:%p", boxedDevice);
+                GFXSTREAM_ERROR("Missing context id for VkDevice:%p", boxedDevice);
+                setSnapshotLoadError();
+                return VK_ERROR_INITIALIZATION_FAILED;
             }
             deviceInfo.virtioGpuContextId = contextIdIt->second;
         } else {
@@ -3014,7 +3177,7 @@ class VkDecoderGlobalState::Impl {
                     const uint64_t physicalQueue64 = reinterpret_cast<uint64_t>(physicalQueue);
 
                     if ((physicalQueue64 & QueueInfo::kVirtualQueueBit) != 0) {
-                        // Cannot use queue virtualization on this GPU, where the pysical handle
+                        // Cannot use queue virtualization on this GPU, where the physical handle
                         // values generated are not 2-byte aligned. This is very unusual, but the
                         // spec is not enforcing handle values to be aligned and the driver is free
                         // to use a similar logic to use the last bit for other purposes.
@@ -3296,7 +3459,9 @@ class VkDecoderGlobalState::Impl {
     void destroyDeviceWithExclusiveInfo(VkDevice device, DeviceInfo& deviceInfo,
                                         std::unordered_map<VkFence, FenceInfo>& fenceInfos,
                                         std::unordered_map<VkQueue, QueueInfo>& queueInfos) {
-        m_vkEmulation->getDeviceLostHelper().onDeviceDestroyed(device);
+        if (m_vkEmulation) {
+            m_vkEmulation->getDeviceLostHelper().onDeviceDestroyed(device);
+        }
 
         deviceInfo.decompPipelines->clear();
 
@@ -3390,7 +3555,7 @@ class VkDecoderGlobalState::Impl {
             //   c) use storage and compute shaders.
             //
             // (a) is covered by memory snapshot. (b) requires an extra vkCmdCopyBuffer
-            // command on snapshot, thuse we need to add transfer_src for (b) so that
+            // command on snapshot, thus we need to add transfer_src for (b) so that
             // they could be loaded back on snapshot save. (c) is still future work.
             if (localCreateInfo.usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT) {
                 localCreateInfo.usage |= VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
@@ -3423,6 +3588,7 @@ class VkDecoderGlobalState::Impl {
             bufInfo.usage = pCreateInfo->usage;
             bufInfo.size = pCreateInfo->size;
             *pBuffer = new_boxed_non_dispatchable_VkBuffer(*pBuffer);
+            bufInfo.boxed = *pBuffer;
         }
 
         return result;
@@ -3597,19 +3763,20 @@ class VkDecoderGlobalState::Impl {
             pCreateInfo = &decompInfo;
         }
 
-#ifdef __APPLE__
-        // We do some validation on macOS, because it can crash the whole app if exceeded.
+        // We do some validation to avoid undefined behaviors, for stability.
+        // This is needed mainly for Metal backend, as the invalid usage leads
+        // to driver crashes, but it's also required for software backend to avoid
+        // integer overflows and potential vulnerabilities.
         if (pCreateInfo->imageType == VK_IMAGE_TYPE_2D &&
             (pCreateInfo->extent.width > deviceInfo->maxImageDimension2D ||
              pCreateInfo->extent.height > deviceInfo->maxImageDimension2D)) {
             GFXSTREAM_WARNING(
                 "vkCreateImage: requested image dimensions (%u x %u) "
-                "exceeds maxImageDimension2D limit (%u).",
+                "exceed maxImageDimension2D limit (%u).",
                 pCreateInfo->extent.width, pCreateInfo->extent.height,
                 deviceInfo->maxImageDimension2D);
             return VK_ERROR_VALIDATION_FAILED;
         }
-#endif
 
         std::unique_ptr<AndroidNativeBufferInfo> anbInfo = nullptr;
         const VkNativeBufferANDROID* nativeBufferANDROID =
@@ -3751,6 +3918,35 @@ class VkDecoderGlobalState::Impl {
         imageInfo.anbInfo.reset();
     }
 
+    void unbindFromOptimalImageLocked(MemoryInfo* memoryInfo, VkImage image) {
+        memoryInfo->optimalImageMemoryRanges.erase(image);
+    }
+
+    void bindToOptimalImageLocked(MemoryInfo* memoryInfo, VkImage image, VkDeviceSize offset,
+                                  VkDeviceSize size) {
+        memoryInfo->optimalImageMemoryRanges[image] = {offset, size};
+    }
+
+    void recordImageMemoryBindLocked(VkDevice device, VulkanDispatch* vk, VkImage image,
+                                     ImageInfo* imageInfo, MemoryInfo* memoryInfo,
+                                     VkDeviceMemory memory, VkDeviceSize memoryOffset)
+        REQUIRES(mMutex) {
+        imageInfo->memory = memory;
+        imageInfo->memoryOffset = memoryOffset;
+        if (imageInfo->imageCreateInfoShallow.tiling == VK_IMAGE_TILING_OPTIMAL &&
+            !imageInfo->anbInfo) {
+            VkMemoryRequirements memReqs = {};
+            if (vk && vk->vkGetImageMemoryRequirements) {
+                vk->vkGetImageMemoryRequirements(device, image, &memReqs);
+            }
+            updateImageMemoryRequirementsLocked(device, image, &memReqs);
+            imageInfo->memorySize = memReqs.size;
+            if (imageInfo->memorySize > 0) {
+                bindToOptimalImageLocked(memoryInfo, image, memoryOffset, imageInfo->memorySize);
+            }
+        }
+    }
+
     void destroyImageLocked(VkDevice device, VulkanDispatch* deviceDispatch, VkImage image)
         REQUIRES(mMutex) {
         auto imageInfoIt = mImageInfo.find(image);
@@ -3758,6 +3954,12 @@ class VkDecoderGlobalState::Impl {
         auto& imageInfo = imageInfoIt->second;
 
         destroyImageWithExclusiveInfo(device, deviceDispatch, image, imageInfo);
+        if (imageInfo.memory != VK_NULL_HANDLE) {
+            auto* memoryInfo = gfxstream::base::find(mMemoryInfo, imageInfo.memory);
+            if (memoryInfo) {
+                unbindFromOptimalImageLocked(memoryInfo, image);
+            }
+        }
 
         mImageInfo.erase(image);
     }
@@ -3837,6 +4039,7 @@ class VkDecoderGlobalState::Impl {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
 
+        VALIDATE_REQUIRED_HANDLE(image);
         VALIDATE_REQUIRED_HANDLE(memory);
         VkResult result = vk->vkBindImageMemory(device, image, memory, memoryOffset);
         if (result != VK_SUCCESS) {
@@ -3858,7 +4061,7 @@ class VkDecoderGlobalState::Impl {
             deviceInfo->debugUtilsHelper.addDebugLabel(image, "ColorBuffer:%d",
                                                        *imageInfo->boundColorBuffer);
         }
-        imageInfo->memory = memory;
+        recordImageMemoryBindLocked(device, vk, image, imageInfo, memoryInfo, memory, memoryOffset);
 
         if (!imageInfo->compressInfo) {
             return VK_SUCCESS;
@@ -3958,7 +4161,8 @@ class VkDecoderGlobalState::Impl {
                     deviceInfo->debugUtilsHelper.addDebugLabel(
                         pBindInfos[i].image, "ColorBuffer:%d", *memoryInfo->boundColorBuffer);
                 }
-                imageInfo->memory = pBindInfos[i].memory;
+                recordImageMemoryBindLocked(device, vk, pBindInfos[i].image, imageInfo, memoryInfo,
+                                            pBindInfos[i].memory, pBindInfos[i].memoryOffset);
             }
         }
 
@@ -3975,8 +4179,9 @@ class VkDecoderGlobalState::Impl {
         }
 
         std::lock_guard<std::mutex> lock(mMutex);
+        const VkImage originalImage = pCreateInfo->image;
         auto* deviceInfo = gfxstream::base::find(mDeviceInfo, device);
-        auto* imageInfo = gfxstream::base::find(mImageInfo, pCreateInfo->image);
+        auto* imageInfo = gfxstream::base::find(mImageInfo, originalImage);
         if (!deviceInfo || !imageInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
         VkImageViewCreateInfo createInfo;
         bool needEmulatedAlpha = false;
@@ -3996,6 +4201,9 @@ class VkDecoderGlobalState::Impl {
             needEmulatedAlpha = false;
             createInfo.image = imageInfo->compressInfo->compressedMipmap(
                 pCreateInfo->subresourceRange.baseMipLevel);
+            if (createInfo.image == VK_NULL_HANDLE) {
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
             createInfo.subresourceRange.baseMipLevel = 0;
             pCreateInfo = &createInfo;
         }
@@ -4012,6 +4220,7 @@ class VkDecoderGlobalState::Impl {
         VALIDATE_NEW_HANDLE_INFO_ENTRY(mImageViewInfo, *pView);
         auto& imageViewInfo = mImageViewInfo[*pView];
         imageViewInfo.device = device;
+        imageViewInfo.image = originalImage;
         imageViewInfo.needEmulatedAlpha = needEmulatedAlpha;
         imageViewInfo.boundColorBuffer = imageInfo->boundColorBuffer;
         if (imageViewInfo.boundColorBuffer) {
@@ -4210,7 +4419,7 @@ class VkDecoderGlobalState::Impl {
             if (!hasDeviceExtension(device, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME)) {
                 // Note: VK_KHR_external_semaphore_fd might be advertised in the guest,
                 // because SYNC_FD handling is performed guest-side only. But still need
-                // need to error out here when handling a non-sync, opaque FD.
+                // to error out here when handling a non-sync, opaque FD.
                 return VK_ERROR_OUT_OF_HOST_MEMORY;
             }
         }
@@ -4330,15 +4539,13 @@ class VkDecoderGlobalState::Impl {
         if (exportSyncFd) {
             // Remove VkExportFenceCreateInfo, since host doesn't need to create
             // an exportable fence in this case
-            ExternalFencePool<VulkanDispatch>* externalFencePool = nullptr;
             vk_struct_chain_remove(exportFenceInfoPtr, &localCreateInfo);
             {
                 std::lock_guard<std::mutex> lock(mMutex);
                 auto* deviceInfo = gfxstream::base::find(mDeviceInfo, device);
                 if (!deviceInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
-                externalFencePool = deviceInfo->externalFencePool.get();
+                *pFence = deviceInfo->externalFencePool->pop(&localCreateInfo);
             }
-            *pFence = externalFencePool->pop(&localCreateInfo);
             if (*pFence != VK_NULL_HANDLE) {
                 fenceReused = true;
             }
@@ -4444,7 +4651,7 @@ class VkDecoderGlobalState::Impl {
         }
 
         // Ensure that any host operations that reference this fence have completed
-        // before reseting.
+        // before resetting.
         while (!pendingUses.empty()) {
             {
                 std::lock_guard<std::mutex> lock(mMutex);
@@ -4554,7 +4761,7 @@ class VkDecoderGlobalState::Impl {
             if (!hasDeviceExtension(device, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME)) {
                 // Note: VK_KHR_external_semaphore_fd might be advertised in the guest,
                 // because SYNC_FD handling is performed guest-side only. But still need
-                // need to error out here when handling a non-sync, opaque FD.
+                // to error out here when handling a non-sync, opaque FD.
                 return VK_ERROR_OUT_OF_HOST_MEMORY;
             }
         }
@@ -4757,7 +4964,7 @@ class VkDecoderGlobalState::Impl {
             std::lock_guard<std::mutex> lock(mMutex);
             auto semaphoreInfo = gfxstream::base::find(mSemaphoreInfo, semaphore);
             if (!semaphoreInfo) {
-                GFXSTREAM_VERBOSE("%f: cound not find semaphore info for %p", __func__, semaphore);
+                GFXSTREAM_VERBOSE("%s: could not find semaphore info for %p", __func__, semaphore);
                 return VK_SUCCESS;
             }
 
@@ -4776,7 +4983,7 @@ class VkDecoderGlobalState::Impl {
             // Check if any of the pending submissions can now be executed
             auto deviceInfo = gfxstream::base::find(mDeviceInfo, semaphoreInfo->device);
             if (!deviceInfo) {
-                GFXSTREAM_VERBOSE("%f: cound not find device info for %p", __func__,
+                GFXSTREAM_VERBOSE("%s: could not find device info for %p", __func__,
                                   semaphoreInfo->device);
                 return VK_SUCCESS;
             }
@@ -4785,7 +4992,7 @@ class VkDecoderGlobalState::Impl {
                 for (auto& unboxed_queue : queue_iter.second) {
                     auto queueInfo = gfxstream::base::find(mQueueInfo, unboxed_queue);
                     if (!queueInfo) {
-                        GFXSTREAM_VERBOSE("%f: cound not find queue info for %p", __func__,
+                        GFXSTREAM_VERBOSE("%s: could not find queue info for %p", __func__,
                                           unboxed_queue);
                         continue;
                     }
@@ -5095,12 +5302,12 @@ class VkDecoderGlobalState::Impl {
             auto unboxedSet = it.first;
             auto boxedSet = it.second;
             descriptorSetInfos.erase(unboxedSet);
-            if (!m_vkEmulation->getFeatures().VulkanBatchedDescriptorSetUpdate.enabled()) {
+            if (!mBatchedDescriptorSetUpdateEnabled) {
                 delete_VkDescriptorSet(boxedSet);
             }
         }
 
-        if (m_vkEmulation->getFeatures().VulkanBatchedDescriptorSetUpdate.enabled()) {
+        if (mBatchedDescriptorSetUpdateEnabled) {
             if (isDestroy) {
                 for (auto boxedSet : descriptorPoolInfo.preallocatedBoxedSets) {
                     delete_VkDescriptorSet((VkDescriptorSet)boxedSet);
@@ -5644,6 +5851,7 @@ class VkDecoderGlobalState::Impl {
         shaderModuleInfo.device = device;
 
         *pShaderModule = new_boxed_non_dispatchable_VkShaderModule(*pShaderModule);
+        shaderModuleInfo.boxed = *pShaderModule;
 
         return result;
     }
@@ -5696,6 +5904,7 @@ class VkDecoderGlobalState::Impl {
         pipelineCacheInfo.device = device;
 
         *pPipelineCache = new_boxed_non_dispatchable_VkPipelineCache(*pPipelineCache);
+        pipelineCacheInfo.boxed = *pPipelineCache;
 
         return result;
     }
@@ -5749,6 +5958,7 @@ class VkDecoderGlobalState::Impl {
         pipelineLayoutInfo.device = device;
 
         *pPipelineLayout = new_boxed_non_dispatchable_VkPipelineLayout(*pPipelineLayout);
+        pipelineLayoutInfo.boxed = *pPipelineLayout;
 
         return result;
     }
@@ -5808,6 +6018,7 @@ class VkDecoderGlobalState::Impl {
             pipelineInfo.device = device;
 
             pPipelines[i] = new_boxed_non_dispatchable_VkPipeline(pPipelines[i]);
+            pipelineInfo.boxed = pPipelines[i];
         }
 
         return result;
@@ -5838,6 +6049,7 @@ class VkDecoderGlobalState::Impl {
             pipelineInfo.device = device;
 
             pPipelines[i] = new_boxed_non_dispatchable_VkPipeline(pPipelines[i]);
+            pipelineInfo.boxed = pPipelines[i];
         }
 
         return result;
@@ -5897,10 +6109,12 @@ class VkDecoderGlobalState::Impl {
             if (srcImg->compressInfo) {
                 srcImageMip =
                     srcImg->compressInfo->compressedMipmap(pRegions[r].srcSubresource.mipLevel);
+                if (srcImageMip == VK_NULL_HANDLE) continue;
             }
             if (dstImg->compressInfo) {
                 dstImageMip =
                     dstImg->compressInfo->compressedMipmap(pRegions[r].dstSubresource.mipLevel);
+                if (dstImageMip == VK_NULL_HANDLE) continue;
             }
             VkImageCopy region = CompressedImageInfo::getCompressedMipmapsImageCopy(
                 pRegions[r], srcImg->compressInfo.get(), dstImg->compressInfo.get());
@@ -5929,8 +6143,10 @@ class VkDecoderGlobalState::Impl {
         CompressedImageInfo& cmpInfo = *imageInfo->compressInfo;
         for (uint32_t r = 0; r < regionCount; r++) {
             uint32_t mipLevel = pRegions[r].imageSubresource.mipLevel;
+            VkImage mipImage = cmpInfo.compressedMipmap(mipLevel);
+            if (mipImage == VK_NULL_HANDLE) continue;
             VkBufferImageCopy region = cmpInfo.getBufferImageCopy(pRegions[r]);
-            vk->vkCmdCopyImageToBuffer(commandBuffer, cmpInfo.compressedMipmap(mipLevel),
+            vk->vkCmdCopyImageToBuffer(commandBuffer, mipImage,
                                        srcImageLayout, dstBuffer, 1, &region);
         }
     }
@@ -5960,10 +6176,12 @@ class VkDecoderGlobalState::Impl {
             if (srcImg->compressInfo) {
                 srcImageMip = srcImg->compressInfo->compressedMipmap(
                     pCopyImageInfo->pRegions[r].srcSubresource.mipLevel);
+                if (srcImageMip == VK_NULL_HANDLE) continue;
             }
             if (dstImg->compressInfo) {
                 dstImageMip = dstImg->compressInfo->compressedMipmap(
                     pCopyImageInfo->pRegions[r].dstSubresource.mipLevel);
+                if (dstImageMip == VK_NULL_HANDLE) continue;
             }
 
             VkCopyImageInfo2 inf2 = *pCopyImageInfo;
@@ -5997,11 +6215,13 @@ class VkDecoderGlobalState::Impl {
         CompressedImageInfo& cmpInfo = *imageInfo->compressInfo;
         for (uint32_t r = 0; r < pCopyImageToBufferInfo->regionCount; r++) {
             uint32_t mipLevel = pCopyImageToBufferInfo->pRegions[r].imageSubresource.mipLevel;
+            VkImage mipImage = cmpInfo.compressedMipmap(mipLevel);
+            if (mipImage == VK_NULL_HANDLE) continue;
             VkBufferImageCopy2 region = cmpInfo.getBufferImageCopy(pCopyImageToBufferInfo->pRegions[r]);
             VkCopyImageToBufferInfo2 inf = *pCopyImageToBufferInfo;
             inf.regionCount = 1;
             inf.pRegions = &region;
-            inf.srcImage = cmpInfo.compressedMipmap(mipLevel);
+            inf.srcImage = mipImage;
 
             vk->vkCmdCopyImageToBuffer2(commandBuffer, &inf);
         }
@@ -6032,10 +6252,12 @@ class VkDecoderGlobalState::Impl {
             if (srcImg->compressInfo) {
                 srcImageMip = srcImg->compressInfo->compressedMipmap(
                     pCopyImageInfo->pRegions[r].srcSubresource.mipLevel);
+                if (srcImageMip == VK_NULL_HANDLE) continue;
             }
             if (dstImg->compressInfo) {
                 dstImageMip = dstImg->compressInfo->compressedMipmap(
                     pCopyImageInfo->pRegions[r].dstSubresource.mipLevel);
+                if (dstImageMip == VK_NULL_HANDLE) continue;
             }
 
             VkCopyImageInfo2KHR inf2 = *pCopyImageInfo;
@@ -6069,11 +6291,13 @@ class VkDecoderGlobalState::Impl {
         CompressedImageInfo& cmpInfo = *imageInfo->compressInfo;
         for (uint32_t r = 0; r < pCopyImageToBufferInfo->regionCount; r++) {
             uint32_t mipLevel = pCopyImageToBufferInfo->pRegions[r].imageSubresource.mipLevel;
+            VkImage mipImage = cmpInfo.compressedMipmap(mipLevel);
+            if (mipImage == VK_NULL_HANDLE) continue;
             VkBufferImageCopy2KHR region = cmpInfo.getBufferImageCopy(pCopyImageToBufferInfo->pRegions[r]);
             VkCopyImageToBufferInfo2KHR inf = *pCopyImageToBufferInfo;
             inf.regionCount = 1;
             inf.pRegions = &region;
-            inf.srcImage = cmpInfo.compressedMipmap(mipLevel);
+            inf.srcImage = mipImage;
 
             vk->vkCmdCopyImageToBuffer2KHR(commandBuffer, &inf);
         }
@@ -6284,8 +6508,10 @@ class VkDecoderGlobalState::Impl {
 
         for (uint32_t r = 0; r < regionCount; r++) {
             uint32_t mipLevel = pRegions[r].imageSubresource.mipLevel;
+            VkImage mipImage = cmpInfo.compressedMipmap(mipLevel);
+            if (mipImage == VK_NULL_HANDLE) continue;
             VkBufferImageCopy region = cmpInfo.getBufferImageCopy(pRegions[r]);
-            vk->vkCmdCopyBufferToImage(commandBuffer, srcBuffer, cmpInfo.compressedMipmap(mipLevel),
+            vk->vkCmdCopyBufferToImage(commandBuffer, srcBuffer, mipImage,
                                        dstImageLayout, 1, &region);
         }
 
@@ -6347,9 +6573,10 @@ class VkDecoderGlobalState::Impl {
         CompressedImageInfo& cmpInfo = *imageInfo->compressInfo;
 
         for (uint32_t r = 0; r < pCopyBufferToImageInfo->regionCount; r++) {
-            VkCopyBufferToImageInfo2 inf;
+            VkCopyBufferToImageInfo2 inf = *pCopyBufferToImageInfo;
             uint32_t mipLevel = pCopyBufferToImageInfo->pRegions[r].imageSubresource.mipLevel;
             inf.dstImage = cmpInfo.compressedMipmap(mipLevel);
+            if (inf.dstImage == VK_NULL_HANDLE) continue;
             VkBufferImageCopy2 region = cmpInfo.getBufferImageCopy(pCopyBufferToImageInfo->pRegions[r]);
             inf.regionCount = 1;
             inf.pRegions = &region;
@@ -6404,9 +6631,10 @@ class VkDecoderGlobalState::Impl {
 
         CompressedImageInfo& cmpInfo = *imageInfo->compressInfo;
         for (uint32_t r = 0; r < pCopyBufferToImageInfo->regionCount; r++) {
-            VkCopyBufferToImageInfo2KHR inf;
+            VkCopyBufferToImageInfo2KHR inf = *pCopyBufferToImageInfo;
             uint32_t mipLevel = pCopyBufferToImageInfo->pRegions[r].imageSubresource.mipLevel;
             inf.dstImage = cmpInfo.compressedMipmap(mipLevel);
+            if (inf.dstImage == VK_NULL_HANDLE) continue;
             VkBufferImageCopy2KHR region = cmpInfo.getBufferImageCopy(pCopyBufferToImageInfo->pRegions[r]);
             inf.regionCount = 1;
             inf.pRegions = &region;
@@ -7163,6 +7391,7 @@ class VkDecoderGlobalState::Impl {
 
         if (!plan.isHostVisible()) {
             *pMemory = new_boxed_non_dispatchable_VkDeviceMemory(*pMemory);
+            memoryInfo.boxed = *pMemory;
             return result;
         }
 
@@ -7185,6 +7414,7 @@ class VkDecoderGlobalState::Impl {
         }
 
         *pMemory = new_boxed_non_dispatchable_VkDeviceMemory(*pMemory);
+        memoryInfo.boxed = *pMemory;
 
         return result;
     }
@@ -7818,8 +8048,9 @@ class VkDecoderGlobalState::Impl {
         for (const VkCommandBuffer commandBuffer : commandPoolInfo.cmdBuffers) {
             auto commandBufferIt = commandBufferInfos.find(commandBuffer);
             if (commandBufferIt != commandBufferInfos.end()) {
+                VkCommandBuffer boxedCommandBuffer = commandBufferIt->second.boxed;
                 commandBufferInfos.erase(commandBufferIt);
-                delete_VkCommandBuffer(commandBuffer);
+                delete_VkCommandBuffer(boxedCommandBuffer);
             } else {
                 GFXSTREAM_ERROR("Cannot find command buffer reference (%p).", commandBuffer);
             }
@@ -8103,10 +8334,10 @@ class VkDecoderGlobalState::Impl {
         std::unordered_set<HandleType> acquiredColorBuffers;
         std::unordered_set<HandleType> releasedColorBuffers;
         VkDevice device = VK_NULL_HANDLE;
-        std::mutex* queueMutex = nullptr;
-        PhysicalQueuePendingOps* pendingOps = nullptr;
+        std::shared_ptr<std::mutex> queueMutex;
+        std::shared_ptr<PhysicalQueuePendingOps> pendingOps;
         bool sharedQueue = false;
-        DeviceOpTracker* deviceOpTracker = nullptr;
+        DeviceOpTrackerPtr deviceOpTracker;
 
         {
             std::lock_guard<std::mutex> lock(mMutex);
@@ -8154,8 +8385,8 @@ class VkDecoderGlobalState::Impl {
                 return VK_ERROR_INITIALIZATION_FAILED;
             }
             device = queueInfo->device;
-            queueMutex = queueInfo->queueMutex.get();
-            pendingOps = queueInfo->pendingOps.get();
+            queueMutex = queueInfo->queueMutex;
+            pendingOps = queueInfo->pendingOps;
             sharedQueue = queueInfo->usingSharedPhysicalQueue;
 
             auto* deviceInfo = gfxstream::base::find(mDeviceInfo, device);
@@ -8164,7 +8395,7 @@ class VkDecoderGlobalState::Impl {
                 return VK_ERROR_INITIALIZATION_FAILED;
             }
 
-            deviceOpTracker = deviceInfo->deviceOpTracker.get();
+            deviceOpTracker = deviceInfo->deviceOpTracker;
 
             if (mRenderDocWithMultipleVkInstances && m_vkEmulation->supportsFrameBoundary()) {
                 // Check if this is a frame boundary submission, only the first submit call
@@ -8251,7 +8482,7 @@ class VkDecoderGlobalState::Impl {
                 // semaphore signaling is made.
                 // We cannot partially send some of the submissions, as that'd break the fence
                 // signalling, so we defer all the operations for this call.
-                // For other post-submit operations, we treat this submissions as if it has been
+                // For other post-submit operations, we treat this submission as if it has been
                 // sent to the GPU, because all the object lifetimes (e.g. semaphores, fences,
                 // command buffers) need to be managed correctly by the app side until actual
                 // GPU operation is started.
@@ -8424,12 +8655,12 @@ class VkDecoderGlobalState::Impl {
 
         if (!queue) return VK_SUCCESS;
 
-        std::mutex* queueMutex;
+        std::shared_ptr<std::mutex> queueMutex;
         {
             std::lock_guard<std::mutex> lock(mMutex);
             auto* queueInfo = gfxstream::base::find(mQueueInfo, queue);
             if (!queueInfo) return VK_SUCCESS;
-            queueMutex = queueInfo->queueMutex.get();
+            queueMutex = queueInfo->queueMutex;
         }
 
         // TODO(b/379862480): register and track gpu workload to wait only for the
@@ -8527,7 +8758,7 @@ class VkDecoderGlobalState::Impl {
         }
 
         if (m_vkEmulation->getFeatures().VulkanExternalSync.enabled()) {
-            // Cannot forward this call to driver because nVidia linux driver crahses on it.
+            // Cannot forward this call to driver because nVidia linux driver crashes on it.
             switch (pExternalSemaphoreInfo->handleType) {
                 case VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT:
                     pExternalSemaphoreProperties->exportFromImportedHandleTypes =
@@ -8570,10 +8801,12 @@ class VkDecoderGlobalState::Impl {
             device, &descriptorUpdateTemplateInfo.createInfo, nullptr, pDescriptorUpdateTemplate);
 
         if (res == VK_SUCCESS) {
-            registerDescriptorUpdateTemplate(*pDescriptorUpdateTemplate,
-                                             descriptorUpdateTemplateInfo);
+            VkDescriptorUpdateTemplate unboxedTemplate = *pDescriptorUpdateTemplate;
             *pDescriptorUpdateTemplate =
-                new_boxed_non_dispatchable_VkDescriptorUpdateTemplate(*pDescriptorUpdateTemplate);
+                new_boxed_non_dispatchable_VkDescriptorUpdateTemplate(unboxedTemplate);
+            descriptorUpdateTemplateInfo.device = device;
+            descriptorUpdateTemplateInfo.boxed = *pDescriptorUpdateTemplate;
+            registerDescriptorUpdateTemplate(unboxedTemplate, descriptorUpdateTemplateInfo);
         }
 
         return res;
@@ -8592,10 +8825,12 @@ class VkDecoderGlobalState::Impl {
             device, &descriptorUpdateTemplateInfo.createInfo, nullptr, pDescriptorUpdateTemplate);
 
         if (res == VK_SUCCESS) {
-            registerDescriptorUpdateTemplate(*pDescriptorUpdateTemplate,
-                                             descriptorUpdateTemplateInfo);
+            VkDescriptorUpdateTemplate unboxedTemplate = *pDescriptorUpdateTemplate;
             *pDescriptorUpdateTemplate =
-                new_boxed_non_dispatchable_VkDescriptorUpdateTemplate(*pDescriptorUpdateTemplate);
+                new_boxed_non_dispatchable_VkDescriptorUpdateTemplate(unboxedTemplate);
+            descriptorUpdateTemplateInfo.device = device;
+            descriptorUpdateTemplateInfo.boxed = *pDescriptorUpdateTemplate;
+            registerDescriptorUpdateTemplate(unboxedTemplate, descriptorUpdateTemplateInfo);
         }
 
         return res;
@@ -8690,7 +8925,8 @@ class VkDecoderGlobalState::Impl {
 
         auto timeoutDeadline = gfxstream::base::getUnixTimeUs() + 5000000;  // 5 s
 
-        OrderMaintenanceInfo* order = ordmaint_VkCommandBuffer(boxed_commandBuffer);
+        std::shared_ptr<OrderMaintenanceInfo> order =
+            ordmaint_VkCommandBuffer(boxed_commandBuffer);
         if (!order) return;
 
         AutoLock lock(order->lock);
@@ -8709,7 +8945,6 @@ class VkDecoderGlobalState::Impl {
 
         __atomic_store_n(&order->sequenceNumber, sequenceNumber, __ATOMIC_RELEASE);
         order->cv.signal();
-        releaseOrderMaintInfo(order);
     }
 
     void on_vkCommandBufferHostSyncGOOGLE(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
@@ -8726,7 +8961,7 @@ class VkDecoderGlobalState::Impl {
 
         auto timeoutDeadline = gfxstream::base::getUnixTimeUs() + 5000000;  // 5 s
 
-        OrderMaintenanceInfo* order = ordmaint_VkQueue(boxed_queue);
+        std::shared_ptr<OrderMaintenanceInfo> order = ordmaint_VkQueue(boxed_queue);
         if (!order) return;
 
         AutoLock lock(order->lock);
@@ -8745,7 +8980,6 @@ class VkDecoderGlobalState::Impl {
 
         __atomic_store_n(&order->sequenceNumber, sequenceNumber, __ATOMIC_RELEASE);
         order->cv.signal();
-        releaseOrderMaintInfo(order);
     }
 
     void on_vkQueueHostSyncGOOGLE(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
@@ -8770,7 +9004,17 @@ class VkDecoderGlobalState::Impl {
             return imageCreateRes;
         }
 
-        on_vkGetImageMemoryRequirements(pool, apiCallHandle, boxed_device, unbox_VkImage(*pImage),
+        VkImage image = try_unbox_VkImage(*pImage);
+        if (image == VK_NULL_HANDLE) {
+            // This should not happen on valid Vulkan apps and the boxed image
+            // should stay valid until the end of this call even after moving out
+            // of the lock, but better to avoid crashes with invalid inputs.
+            GFXSTREAM_ERROR("Failed to unbox VkImage %p when creating image with requirements.", *pImage);
+            *pImage = VK_NULL_HANDLE;
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+
+        on_vkGetImageMemoryRequirements(pool, apiCallHandle, boxed_device, image,
                                         pMemoryRequirements);
 
         return imageCreateRes;
@@ -8790,9 +9034,17 @@ class VkDecoderGlobalState::Impl {
         if (bufferCreateRes != VK_SUCCESS) {
             return bufferCreateRes;
         }
+        VkBuffer buffer = try_unbox_VkBuffer(*pBuffer);
+        if (buffer == VK_NULL_HANDLE) {
+            // This should not happen on valid Vulkan apps and the boxed buffer
+            // should stay valid until the end of this call even after moving out
+            // of the lock, but better to avoid crashes with invalid inputs.
+            GFXSTREAM_ERROR("Failed to unbox VkBuffer %p when creating buffer with requirements.", *pBuffer);
+            *pBuffer = VK_NULL_HANDLE;
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
 
-        on_vkGetBufferMemoryRequirements(pool, apiCallHandle, boxed_device, unbox_VkBuffer(*pBuffer),
-                                         pMemoryRequirements);
+        on_vkGetBufferMemoryRequirements(pool, apiCallHandle, boxed_device, buffer, pMemoryRequirements);
 
         return bufferCreateRes;
     }
@@ -9047,8 +9299,16 @@ class VkDecoderGlobalState::Impl {
         VALIDATE_NEW_HANDLE_INFO_ENTRY(mRenderPassInfo, *pRenderPass);
         auto& renderPassInfo = mRenderPassInfo[*pRenderPass];
         renderPassInfo.device = device;
+        if (pCreateInfo->pAttachments) {
+            renderPassInfo.attachmentFinalLayouts.reserve(pCreateInfo->attachmentCount);
+            for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
+                renderPassInfo.attachmentFinalLayouts.push_back(
+                    pCreateInfo->pAttachments[i].finalLayout);
+            }
+        }
 
         *pRenderPass = new_boxed_non_dispatchable_VkRenderPass(*pRenderPass);
+        renderPassInfo.boxed = *pRenderPass;
 
         return res;
     }
@@ -9127,8 +9387,16 @@ class VkDecoderGlobalState::Impl {
         VALIDATE_NEW_HANDLE_INFO_ENTRY(mRenderPassInfo, *pRenderPass);
         auto& renderPassInfo = mRenderPassInfo[*pRenderPass];
         renderPassInfo.device = device;
+        if (pCreateInfo->pAttachments) {
+            renderPassInfo.attachmentFinalLayouts.reserve(pCreateInfo->attachmentCount);
+            for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
+                renderPassInfo.attachmentFinalLayouts.push_back(
+                    pCreateInfo->pAttachments[i].finalLayout);
+            }
+        }
 
         *pRenderPass = new_boxed_non_dispatchable_VkRenderPass(*pRenderPass);
+        renderPassInfo.boxed = *pRenderPass;
 
         return res;
     }
@@ -9184,6 +9452,45 @@ class VkDecoderGlobalState::Impl {
 
         cmdBufferInfo->releasedColorBuffers.insert(fbInfo->attachedColorBuffers.begin(),
                                                    fbInfo->attachedColorBuffers.end());
+
+        RenderPassInfo* rpInfo =
+            gfxstream::base::find(mRenderPassInfo, pRenderPassBegin->renderPass);
+        if (rpInfo) {
+            const VkRenderPassAttachmentBeginInfo* attachmentBeginInfo = nullptr;
+            for (const auto* next =
+                     reinterpret_cast<const VkBaseInStructure*>(pRenderPassBegin->pNext);
+                 next != nullptr; next = next->pNext) {
+                if (next->sType == VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO) {
+                    attachmentBeginInfo =
+                        reinterpret_cast<const VkRenderPassAttachmentBeginInfo*>(next);
+                    break;
+                }
+            }
+            if (attachmentBeginInfo && attachmentBeginInfo->pAttachments) {
+                const uint32_t count =
+                    std::min<uint32_t>(attachmentBeginInfo->attachmentCount,
+                                       rpInfo->attachmentFinalLayouts.size());
+                for (uint32_t i = 0; i < count; i++) {
+                    auto* imageViewInfo =
+                        gfxstream::base::find(mImageViewInfo, attachmentBeginInfo->pAttachments[i]);
+                    if (imageViewInfo && imageViewInfo->image != VK_NULL_HANDLE &&
+                        rpInfo->attachmentFinalLayouts[i] != VK_IMAGE_LAYOUT_UNDEFINED) {
+                        cmdBufferInfo->imageLayouts[imageViewInfo->image] =
+                            rpInfo->attachmentFinalLayouts[i];
+                    }
+                }
+            } else {
+                const size_t count = std::min(fbInfo->attachedImages.size(),
+                                              rpInfo->attachmentFinalLayouts.size());
+                for (size_t i = 0; i < count; i++) {
+                    VkImage image = fbInfo->attachedImages[i];
+                    if (image != VK_NULL_HANDLE &&
+                        rpInfo->attachmentFinalLayouts[i] != VK_IMAGE_LAYOUT_UNDEFINED) {
+                        cmdBufferInfo->imageLayouts[image] = rpInfo->attachmentFinalLayouts[i];
+                    }
+                }
+            }
+        }
         return true;
     }
 
@@ -9344,13 +9651,20 @@ class VkDecoderGlobalState::Impl {
         auto& framebufferInfo = mFramebufferInfo[*pFramebuffer];
         framebufferInfo.device = device;
 
-        if ((pCreateInfo->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT) == 0) {
+        if ((pCreateInfo->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT) == 0 &&
+            pCreateInfo->pAttachments) {
             // b/327522469
             // Track the Colorbuffers that would be written to.
             // It might be better to check for VK_QUEUE_FAMILY_EXTERNAL in pipeline barrier.
             // But the guest does not always add it to pipeline barrier.
+            framebufferInfo.attachedImages.reserve(pCreateInfo->attachmentCount);
             for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
                 auto* imageViewInfo = gfxstream::base::find(mImageViewInfo, pCreateInfo->pAttachments[i]);
+                if (!imageViewInfo) {
+                    framebufferInfo.attachedImages.push_back(VK_NULL_HANDLE);
+                    continue;
+                }
+                framebufferInfo.attachedImages.push_back(imageViewInfo->image);
                 if (imageViewInfo->boundColorBuffer.has_value()) {
                     framebufferInfo.attachedColorBuffers.push_back(
                         imageViewInfo->boundColorBuffer.value());
@@ -9359,6 +9673,7 @@ class VkDecoderGlobalState::Impl {
         }
 
         *pFramebuffer = new_boxed_non_dispatchable_VkFramebuffer(*pFramebuffer);
+        framebufferInfo.boxed = *pFramebuffer;
 
         return result;
     }
@@ -9691,10 +10006,18 @@ class VkDecoderGlobalState::Impl {
         uint64_t poolId, uint32_t pendingAlloc, bool* didAlloc) REQUIRES(mMutex) {
         auto* poolInfo = gfxstream::base::find(mDescriptorPoolInfo, pool);
         if (!poolInfo) {
-            GFXSTREAM_FATAL("VkDescriptorPool:%p not found.", pool);
+            GFXSTREAM_ERROR("VkDescriptorPool:%p not found.", pool);
+            *didAlloc = false;
+            return VK_NULL_HANDLE;
         }
 
         BoxedHandleInfo* setHandleInfo = sBoxedHandleManager.get(poolId);
+        if (!setHandleInfo) {
+            GFXSTREAM_ERROR("Invalid descriptor set poolId 0x%" PRIx64 " for VkDescriptorPool:%p",
+                            poolId, pool);
+            *didAlloc = false;
+            return VK_NULL_HANDLE;
+        }
 
         if (setHandleInfo->underlying) {
             if (pendingAlloc) {
@@ -9725,8 +10048,10 @@ class VkDecoderGlobalState::Impl {
                 *didAlloc = true;
                 return allocedSet;
             } else {
-                GFXSTREAM_FATAL("VkDescriptorPool:%p wanted to get set with id 0x%" PRIx64, pool, poolId);
-                return nullptr;
+                GFXSTREAM_ERROR("VkDescriptorPool:%p wanted to get set with id 0x%" PRIx64, pool,
+                                poolId);
+                *didAlloc = false;
+                return VK_NULL_HANDLE;
             }
         }
     }
@@ -9787,6 +10112,9 @@ class VkDecoderGlobalState::Impl {
             setsToUpdate[i] = getOrAllocateDescriptorSetFromPoolAndIdLocked(
                 vk, device, pDescriptorPools[whichPool], pDescriptorSetLayouts[i], poolId,
                 pendingAlloc, &didAllocThisTime);
+            if (setsToUpdate[i] == VK_NULL_HANDLE) {
+                return;
+            }
 
             if (didAllocThisTime) didAlloc = true;
         }
@@ -9850,12 +10178,14 @@ class VkDecoderGlobalState::Impl {
         const uint32_t availableCount = static_cast<uint32_t>(info.preallocatedBoxedSets.size());
 
         if (pPoolIdCount) {
-            *pPoolIdCount = availableCount;
-        }
-
-        if (pPoolIdCount && pPoolIds) {
-            for (uint32_t i = 0; i < std::min(requestedCount, availableCount); ++i) {
-                pPoolIds[i] = info.preallocatedBoxedSets[i];
+            if (pPoolIds) {
+                const uint32_t writtenCount = std::min(requestedCount, availableCount);
+                for (uint32_t i = 0; i < writtenCount; ++i) {
+                    pPoolIds[i] = info.preallocatedBoxedSets[i];
+                }
+                *pPoolIdCount = writtenCount;
+            } else {
+                *pPoolIdCount = availableCount;
             }
         }
     }
@@ -9898,6 +10228,7 @@ class VkDecoderGlobalState::Impl {
         ycbcrConversionInfo.device = device;
 
         *pYcbcrConversion = new_boxed_non_dispatchable_VkSamplerYcbcrConversion(*pYcbcrConversion);
+        ycbcrConversionInfo.boxed = *pYcbcrConversion;
         return VK_SUCCESS;
     }
 
@@ -9905,7 +10236,37 @@ class VkDecoderGlobalState::Impl {
                                                         VulkanDispatch* deviceDispatch,
                                                         VkSamplerYcbcrConversion ycbcrConversion,
                                                         SamplerYcbcrConversionInfo&) {
-        deviceDispatch->vkDestroySamplerYcbcrConversion(device, ycbcrConversion, nullptr);
+        if (deviceDispatch->vkDestroySamplerYcbcrConversion) {
+            deviceDispatch->vkDestroySamplerYcbcrConversion(device, ycbcrConversion, nullptr);
+        } else if (deviceDispatch->vkDestroySamplerYcbcrConversionKHR) {
+            deviceDispatch->vkDestroySamplerYcbcrConversionKHR(device, ycbcrConversion, nullptr);
+        } else {
+            GFXSTREAM_ERROR(
+                "Failed to destroy VkSamplerYcbcrConversion %p on device %p: neither "
+                "vkDestroySamplerYcbcrConversion nor vkDestroySamplerYcbcrConversionKHR is "
+                "loaded, so the host object will leak. Enable Vulkan 1.1 or "
+                "VK_KHR_sampler_ycbcr_conversion on the device.",
+                ycbcrConversion, device);
+        }
+    }
+
+    void destroyDescriptorUpdateTemplateWithExclusiveInfo(
+        VkDevice device, VulkanDispatch* deviceDispatch,
+        VkDescriptorUpdateTemplate descriptorUpdateTemplate, DescriptorUpdateTemplateInfo&) {
+        if (deviceDispatch->vkDestroyDescriptorUpdateTemplate) {
+            deviceDispatch->vkDestroyDescriptorUpdateTemplate(device, descriptorUpdateTemplate,
+                                                              nullptr);
+        } else if (deviceDispatch->vkDestroyDescriptorUpdateTemplateKHR) {
+            deviceDispatch->vkDestroyDescriptorUpdateTemplateKHR(device, descriptorUpdateTemplate,
+                                                                 nullptr);
+        } else {
+            GFXSTREAM_ERROR(
+                "Failed to destroy VkDescriptorUpdateTemplate %p on device %p: neither "
+                "vkDestroyDescriptorUpdateTemplate nor vkDestroyDescriptorUpdateTemplateKHR is "
+                "loaded, so the host object will leak. Enable Vulkan 1.1 or "
+                "VK_KHR_descriptor_update_template on the device.",
+                descriptorUpdateTemplate, device);
+        }
     }
 
     void destroySamplerYcbcrConversionLocked(VkDevice device, VulkanDispatch* deviceDispatch,
@@ -10457,13 +10818,15 @@ class VkDecoderGlobalState::Impl {
     DEFINE_EXTERNAL_MEMORY_PROPERTIES_TRANSFORM(VkExternalImageFormatProperties)
     DEFINE_EXTERNAL_MEMORY_PROPERTIES_TRANSFORM(VkExternalBufferProperties)
 
-    BoxedHandle newGlobalHandle(const BoxedHandleInfo& item, BoxedHandleTypeTag typeTag) {
-        return sBoxedHandleManager.add(item, typeTag);
+    BoxedHandle newGlobalHandle(BoxedHandleInfo item, BoxedHandleTypeTag typeTag) {
+        return sBoxedHandleManager.add(std::move(item), typeTag);
     }
 
     VkDecoderSnapshot* snapshot() { return &mSnapshot; }
 
     bool isSnapshotCurrentlyLoading() const { return mSnapshotState == SnapshotState::Loading; }
+    void setSnapshotLoadError() { mSnapshotLoadHasError = true; }
+    bool hasSnapshotLoadError() const { return mSnapshotLoadHasError; }
 
    private:
     bool isEmulatedInstanceExtension(const char* name) const {
@@ -10534,7 +10897,7 @@ class VkDecoderGlobalState::Impl {
                 // ppEnabledExtensionNames. Mesa WSI (in Linux) does this, because it has certain
                 // assumptions about the Vulkan loader architecture it is using. However, depending
                 // on
-                // the host's Vulkan loader architecture, this could in NULL function pointer access
+                // the host's Vulkan loader architecture, this could result in NULL function pointer access
                 // (i.e. on vkGetImageDrmFormatModifierPropertiesEXT()). So just enable it if it's
                 // available.
                 VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
@@ -11127,6 +11490,8 @@ class VkDecoderGlobalState::Impl {
         extractInfosWithDeviceInto(device, mDescriptorSetInfo, deviceObjects.descriptorSets);
         extractInfosWithDeviceInto(device, mDescriptorSetLayoutInfo,
                                    deviceObjects.descriptorSetLayouts);
+        extractInfosWithDeviceInto(device, mDescriptorUpdateTemplateInfo,
+                                   deviceObjects.descriptorUpdateTemplates);
         extractInfosWithDeviceInto(device, mMemoryInfo, deviceObjects.memories);
         extractInfosWithDeviceInto(device, mFenceInfo, deviceObjects.fences);
         extractInfosWithDeviceInto(device, mFramebufferInfo, deviceObjects.framebuffers);
@@ -11165,10 +11530,7 @@ class VkDecoderGlobalState::Impl {
         }
 
         for (auto it = mPhysdevInfo.begin(); it != mPhysdevInfo.end();) {
-            auto physicalDevice = it->first;
-            auto& physDevInfo = it->second;
-            if (physDevInfo.instance == instance) {
-                delete_VkPhysicalDevice(mPhysdevInfo[physicalDevice].boxed);
+            if (it->second.instance == instance) {
                 it = mPhysdevInfo.erase(it);
             } else {
                 // Only increment if not erased
@@ -11217,6 +11579,7 @@ class VkDecoderGlobalState::Impl {
             LOG_CALLS_VERBOSE("%s: %zu buffers.", __func__, deviceObjects.buffers.size());
             for (auto& [buffer, bufferInfo] : deviceObjects.buffers) {
                 destroyBufferWithExclusiveInfo(device, deviceDispatch, buffer, bufferInfo);
+                delete_VkBuffer(bufferInfo.boxed);
             }
 
             LOG_CALLS_VERBOSE("%s: %zu imageViews.", __func__, deviceObjects.imageViews.size());
@@ -11241,18 +11604,30 @@ class VkDecoderGlobalState::Impl {
             LOG_CALLS_VERBOSE("%s: %zu memories.", __func__, deviceObjects.memories.size());
             for (auto& [memory, memoryInfo] : deviceObjects.memories) {
                 destroyMemoryWithExclusiveInfo(device, deviceDispatch, memory, memoryInfo);
+                delete_VkDeviceMemory(memoryInfo.boxed);
             }
 
             LOG_CALLS_VERBOSE("%s: %zu commandBuffers.", __func__, deviceObjects.commandBuffers.size());
             for (auto& [commandBuffer, commandBufferInfo] : deviceObjects.commandBuffers) {
                 freeCommandBufferWithExclusiveInfos(device, deviceDispatch, commandBuffer,
                                                     commandBufferInfo, deviceObjects.commandPools);
+                delete_VkCommandBuffer(commandBufferInfo.boxed);
             }
 
             LOG_CALLS_VERBOSE("%s: %zu commandPools.", __func__, deviceObjects.commandPools.size());
             for (auto& [commandPool, commandPoolInfo] : deviceObjects.commandPools) {
                 destroyCommandPoolWithExclusiveInfo(device, deviceDispatch, commandPool,
                                                     commandPoolInfo, deviceObjects.commandBuffers);
+                delete_VkCommandPool(commandPoolInfo.boxed);
+            }
+
+            LOG_CALLS_VERBOSE("%s: %zu descriptorUpdateTemplates.", __func__,
+                              deviceObjects.descriptorUpdateTemplates.size());
+            for (auto& [descriptorUpdateTemplate, templateInfo] :
+                 deviceObjects.descriptorUpdateTemplates) {
+                destroyDescriptorUpdateTemplateWithExclusiveInfo(
+                    device, deviceDispatch, descriptorUpdateTemplate, templateInfo);
+                delete_VkDescriptorUpdateTemplate(templateInfo.boxed);
             }
 
             LOG_CALLS_VERBOSE("%s: %zu descriptorPools.", __func__, deviceObjects.descriptorPools.size());
@@ -11260,6 +11635,7 @@ class VkDecoderGlobalState::Impl {
                 destroyDescriptorPoolWithExclusiveInfo(device, deviceDispatch, descriptorPool,
                                                        descriptorPoolInfo,
                                                        deviceObjects.descriptorSets);
+                delete_VkDescriptorPool(descriptorPoolInfo.boxed);
             }
 
             LOG_CALLS_VERBOSE("%s: %zu descriptorSetLayouts.", __func__, deviceObjects.descriptorSetLayouts.size());
@@ -11270,39 +11646,54 @@ class VkDecoderGlobalState::Impl {
                 delete_VkDescriptorSetLayout(descriptorSetLayoutInfo.boxed);
             }
 
+            LOG_CALLS_VERBOSE("%s: %zu samplerYcbcrConversions.", __func__,
+                              deviceObjects.samplerYcbcrConversions.size());
+            for (auto& [ycbcrConversion, ycbcrConversionInfo] :
+                 deviceObjects.samplerYcbcrConversions) {
+                destroySamplerYcbcrConversionWithExclusiveInfo(
+                    device, deviceDispatch, ycbcrConversion, ycbcrConversionInfo);
+                delete_VkSamplerYcbcrConversion(ycbcrConversionInfo.boxed);
+            }
+
             LOG_CALLS_VERBOSE("%s: %zu shaderModules.", __func__, deviceObjects.shaderModules.size());
             for (auto& [shaderModule, shaderModuleInfo] : deviceObjects.shaderModules) {
                 destroyShaderModuleWithExclusiveInfo(device, deviceDispatch, shaderModule,
                                                      shaderModuleInfo);
+                delete_VkShaderModule(shaderModuleInfo.boxed);
             }
 
             LOG_CALLS_VERBOSE("%s: %zu pipelines.", __func__, deviceObjects.pipelines.size());
             for (auto& [pipeline, pipelineInfo] : deviceObjects.pipelines) {
                 destroyPipelineWithExclusiveInfo(device, deviceDispatch, pipeline, pipelineInfo);
+                delete_VkPipeline(pipelineInfo.boxed);
             }
 
             LOG_CALLS_VERBOSE("%s: %zu pipelineCaches.", __func__, deviceObjects.pipelineCaches.size());
             for (auto& [pipelineCache, pipelineCacheInfo] : deviceObjects.pipelineCaches) {
                 destroyPipelineCacheWithExclusiveInfo(device, deviceDispatch, pipelineCache,
                                                       pipelineCacheInfo);
+                delete_VkPipelineCache(pipelineCacheInfo.boxed);
             }
 
             LOG_CALLS_VERBOSE("%s: %zu pipelineLayouts.", __func__, deviceObjects.pipelineLayouts.size());
             for (auto& [pipelineLayout, pipelineLayoutInfo] : deviceObjects.pipelineLayouts) {
                 destroyPipelineLayoutWithExclusiveInfo(device, deviceDispatch, pipelineLayout,
                                                        pipelineLayoutInfo);
+                delete_VkPipelineLayout(pipelineLayoutInfo.boxed);
             }
 
             LOG_CALLS_VERBOSE("%s: %zu framebuffers.", __func__, deviceObjects.framebuffers.size());
             for (auto& [framebuffer, framebufferInfo] : deviceObjects.framebuffers) {
                 destroyFramebufferWithExclusiveInfo(device, deviceDispatch, framebuffer,
                                                     framebufferInfo);
+                delete_VkFramebuffer(framebufferInfo.boxed);
             }
 
             LOG_CALLS_VERBOSE("%s: %zu renderPasses.", __func__, deviceObjects.renderPasses.size());
             for (auto& [renderPass, renderPassInfo] : deviceObjects.renderPasses) {
                 destroyRenderPassWithExclusiveInfo(device, deviceDispatch, renderPass,
                                                    renderPassInfo);
+                delete_VkRenderPass(renderPassInfo.boxed);
             }
 
             destroyDeviceWithExclusiveInfo(device, deviceInfo, deviceObjects.fences,
@@ -11334,8 +11725,15 @@ class VkDecoderGlobalState::Impl {
                        instanceInfo.applicationName.c_str(), instanceInfo.engineName.c_str());
 
 #ifdef CONFIG_AEMU
-        m_vkEmulation->getGlobalState()->unregisterVulkanInstance((uint64_t)instance);
+        if (m_vkEmulation && m_vkEmulation->getGlobalState()) {
+            m_vkEmulation->getGlobalState()->unregisterVulkanInstance((uint64_t)instance);
+        }
 #endif
+        // The boxed physical devices are owned by the instance; release them
+        // together with it.
+        for (VkPhysicalDevice boxedPhysicalDevice : instanceInfo.boxedPhysicalDevices) {
+            delete_VkPhysicalDevice(boxedPhysicalDevice);
+        }
         delete_VkInstance(instanceInfo.boxed);
         LOG_CALLS_VERBOSE("destroyInstanceObjects: finished.");
 
@@ -11558,6 +11956,7 @@ class VkDecoderGlobalState::Impl {
         Loading,
     };
     SnapshotState mSnapshotState = SnapshotState::Normal;
+    std::atomic<bool> mSnapshotLoadHasError = false;
 
     // NOTE: Only present during snapshot loading. This is needed to associate
     // `VkDevice`s with Virtio GPU context ids because API calls are not currently
@@ -11661,11 +12060,19 @@ bool VkDecoderGlobalState::batchedDescriptorSetUpdateEnabled() const { return mI
 
 uint64_t VkDecoderGlobalState::newGlobalVkGenericHandle(BoxedHandleTypeTag typeTag) {
     BoxedHandleInfo item;
-    return mImpl->newGlobalHandle(item, typeTag);
+    return mImpl->newGlobalHandle(std::move(item), typeTag);
 }
 
 bool VkDecoderGlobalState::isSnapshotCurrentlyLoading() const {
     return mImpl->isSnapshotCurrentlyLoading();
+}
+
+void VkDecoderGlobalState::setSnapshotLoadError() {
+    mImpl->setSnapshotLoadError();
+}
+
+bool VkDecoderGlobalState::hasSnapshotLoadError() const {
+    return mImpl->hasSnapshotLoadError();
 }
 
 const gfxstream::host::FeatureSet& VkDecoderGlobalState::getFeatures() const { return mImpl->getFeatures(); }

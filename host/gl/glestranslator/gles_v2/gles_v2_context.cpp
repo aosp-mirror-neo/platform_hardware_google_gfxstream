@@ -33,6 +33,11 @@ static const char kGLES32StringPart[] = "OpenGL ES 3.2";
 
 static GLESVersion s_maxGlesVersion = GLES_2_0;
 
+// Upper bound on the number of vertices for which the emulated vertex
+// attribute 0 array is materialized (4 floats per vertex, 256 MiB max).
+// Applies to both draw-call-supplied and snapshot-supplied counts.
+static constexpr unsigned int kMaxAtt0Vertices = 16 * 1024 * 1024;
+
 static const char* sPickVersionStringPart(int maj, int min) {
     switch (maj) {
         case 2:
@@ -160,9 +165,15 @@ GLESv2Context::GLESv2Context(int maj, int min, GlobalNameSpace* globalNameSpace,
         stream->read(m_attribute0value, sizeof(m_attribute0value));
         m_attribute0valueChanged = stream->getByte();
         m_att0ArrayLength = stream->getBe32();
+        if (m_att0ArrayLength > kMaxAtt0Vertices) {
+            GFXSTREAM_ERROR("GLESv2Context: snapshot att0 array length %u exceeds max %u\n",
+                            m_att0ArrayLength, kMaxAtt0Vertices);
+            m_att0ArrayLength = kMaxAtt0Vertices;
+        }
         if (m_att0ArrayLength != 0) {
-            m_att0Array.reset(new GLfloat[4 * m_att0ArrayLength]);
-            stream->read(m_att0Array.get(), sizeof(GLfloat) * 4 * m_att0ArrayLength);
+            m_att0Array.reset(new GLfloat[static_cast<size_t>(4) * m_att0ArrayLength]);
+            stream->read(m_att0Array.get(),
+                         sizeof(GLfloat) * static_cast<size_t>(4) * m_att0ArrayLength);
         }
         m_att0NeedsDisable = stream->getByte();
         m_useProgram = stream->getBe32();
@@ -224,13 +235,13 @@ void GLESv2Context::addVertexArrayObject(GLuint array) {
 
 void GLESv2Context::enableArr(GLenum arrType, bool enable) {
     uint32_t index = (uint32_t)arrType;
-    if (index > kMaxVertexAttributes) return;
+    if (index >= kMaxVertexAttributes) return;
     m_currVaoState.attribInfo()[index].enable(enable);
 }
 
 const GLESpointer* GLESv2Context::getPointer(GLenum arrType) {
     uint32_t index = (uint32_t)arrType;
-    if (index > kMaxVertexAttributes) return nullptr;
+    if (index >= kMaxVertexAttributes) return nullptr;
     return m_currVaoState.attribInfo().data() + index;
 }
 
@@ -464,16 +475,23 @@ void GLESv2Context::validateAtt0PreDraw(unsigned int count)
     if (count == 0) {
         return;
     }
+    if (count > kMaxAtt0Vertices) {
+        setGLerror(GL_OUT_OF_MEMORY);
+        return;
+    }
 
     if (count > m_att0ArrayLength) {
-        const unsigned newLen = std::max(count, 2 * m_att0ArrayLength);
-        m_att0Array.reset(new GLfloat[4 * newLen]);
+        const uint64_t doubled = 2ULL * static_cast<uint64_t>(m_att0ArrayLength);
+        const uint64_t newLen64 = std::min<uint64_t>(
+            kMaxAtt0Vertices, std::max<uint64_t>(count, doubled));
+        const unsigned int newLen = static_cast<unsigned int>(newLen64);
+        m_att0Array.reset(new GLfloat[4 * static_cast<size_t>(newLen)]);
         m_att0ArrayLength = newLen;
         m_attribute0valueChanged = true;
     }
     if (m_attribute0valueChanged) {
-        for(unsigned int i = 0; i<m_att0ArrayLength; i++) {
-            memcpy(m_att0Array.get()+i*4, m_attribute0value,
+        for(size_t i = 0; i < m_att0ArrayLength; i++) {
+            memcpy(m_att0Array.get() + i * 4, m_attribute0value,
                     sizeof(m_attribute0value));
         }
         m_attribute0valueChanged = false;
@@ -483,7 +501,11 @@ void GLESv2Context::validateAtt0PreDraw(unsigned int count)
     s_glDispatch.glGetIntegerv(GL_ARRAY_BUFFER_BINDING, (GLint*)&prevArrayBuffer);
 
     s_glDispatch.glBindBuffer(GL_ARRAY_BUFFER, m_emulatedClientVBOs[0]);
-    s_glDispatch.glBufferData(GL_ARRAY_BUFFER, m_att0ArrayLength * sizeof(GLfloat), m_att0Array.get(), GL_STREAM_DRAW);
+    s_glDispatch.glBufferData(
+        GL_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(m_att0ArrayLength) * 4 * sizeof(GLfloat),
+        m_att0Array.get(),
+        GL_STREAM_DRAW);
 
     s_glDispatch.glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, 0);
     s_glDispatch.glEnableVertexAttribArray(0);
@@ -517,11 +539,49 @@ void GLESv2Context::drawWithEmulations(
     }
 
     bool needClientVBOSetup = !vertexAttributesBufferBacked();
-
-    bool needClientIBOSetup =
+    bool isIndexed =
         (cmd != DrawCallCmd::Arrays &&
-         cmd != DrawCallCmd::ArraysInstanced) &&
+         cmd != DrawCallCmd::ArraysInstanced);
+    bool needClientIBOSetup =
+        isIndexed &&
         !isBindedBuffer(GL_ELEMENT_ARRAY_BUFFER);
+
+    uint64_t att0Count = 0;
+    if (needClientVBOSetup && needAtt0PreDrawValidation() && count > 0) {
+        if (isIndexed) {
+            if (isBindedBuffer(GL_ELEMENT_ARRAY_BUFFER)) {
+                const unsigned char* buf =
+                    static_cast<const unsigned char*>(getBindedBuffer(GL_ELEMENT_ARRAY_BUFFER));
+                GLint iboSize = 0;
+                getBufferSize(GL_ELEMENT_ARRAY_BUFFER, &iboSize);
+                uint64_t offset = SafeUIntFromPointer(indices);
+                uint64_t bpv = (type == GL_UNSIGNED_BYTE) ? 1 : (type == GL_UNSIGNED_SHORT ? 2 : 4);
+                if (!buf || iboSize < 0 || offset > static_cast<uint64_t>(iboSize) ||
+                    static_cast<uint64_t>(count) * bpv > static_cast<uint64_t>(iboSize) - offset) {
+                    setGLerror(GL_INVALID_OPERATION);
+                    return;
+                }
+                att0Count = static_cast<uint64_t>(findMaxIndex(count, type, buf + offset)) + 1;
+            } else {
+                if (!indices) {
+                    setGLerror(GL_INVALID_OPERATION);
+                    return;
+                }
+                att0Count = static_cast<uint64_t>(findMaxIndex(count, type, indices)) + 1;
+            }
+        } else {
+            if (first < 0) {
+                setGLerror(GL_INVALID_VALUE);
+                return;
+            }
+            att0Count = static_cast<uint64_t>(first) + static_cast<uint64_t>(count);
+        }
+        if (att0Count > kMaxAtt0Vertices) {
+            setGLerror(GL_OUT_OF_MEMORY);
+            return;
+        }
+    }
+
     bool needPointEmulation = mode == GL_POINTS && !isGles2Gles();
 
 #ifdef __APPLE__
@@ -555,11 +615,7 @@ void GLESv2Context::drawWithEmulations(
             s_glDispatch.glResumeTransformFeedback();
         }
         if (needAtt0PreDrawValidation()) {
-            if (indices) {
-                validateAtt0PreDraw(findMaxIndex(count, type, indices));
-            } else {
-                validateAtt0PreDraw(count);
-            }
+            validateAtt0PreDraw(static_cast<unsigned int>(att0Count));
         }
     }
 
@@ -702,13 +758,13 @@ void GLESv2Context::setVertexAttribDivisor(GLuint bindingindex, GLuint divisor) 
 }
 
 void GLESv2Context::setVertexAttribBindingIndex(GLuint attribindex, GLuint bindingindex) {
-    if (attribindex > kMaxVertexAttributes) return;
+    if (attribindex >= kMaxVertexAttributes) return;
 
     m_currVaoState.attribInfo()[attribindex].setBindingIndex(bindingindex);
 }
 
 void GLESv2Context::setVertexAttribFormat(GLuint attribindex, GLint size, GLenum type, GLboolean normalized, GLuint reloffset, bool isInt) {
-    if (attribindex > kMaxVertexAttributes) return;
+    if (attribindex >= kMaxVertexAttributes) return;
     m_currVaoState.attribInfo()[attribindex].setFormat(size, type, normalized == GL_TRUE, reloffset, isInt);
 }
 

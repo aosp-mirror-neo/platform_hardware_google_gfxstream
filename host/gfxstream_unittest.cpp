@@ -16,6 +16,8 @@
 
 #include <vector>
 
+#include "gfxstream/common/testing/graphics_test_environment.h"
+#include "gfxstream/host/iostream.h"
 #include "gfxstream/host/testing/OSWindow.h"
 #include "gfxstream/system/System.h"
 #include "gfxstream/virtio-gpu-gfxstream-renderer-unstable.h"
@@ -59,6 +61,7 @@ class GfxStreamBackendTest : public ::testing::Test {
                                 {STREAM_RENDERER_PARAM_RENDERER_FLAGS, surfacelessFlags}} {}
 
     static void SetUpTestSuite() {
+        ASSERT_TRUE(gfxstream::testing::SetupGraphicsTestEnvironment());
         if (useWindow) {
             window.reset(CreateOSWindow());
         }
@@ -67,6 +70,9 @@ class GfxStreamBackendTest : public ::testing::Test {
     static void TearDownTestSuite() { window.reset(nullptr); }
 
     void SetUp() override {
+        if (!gfxstream::testing::IsGraphicsTestEnvironmentProvidingGlesDriver()) {
+            GTEST_SKIP() << "Skipping GLES test in gles_none test environment.";
+        }
         gfxstream::base::setEnvironmentVariable("ANDROID_GFXSTREAM_EGL", "1");
         if (useWindow) {
             window->initialize("GfxStreamBackendTestWindow", width, height);
@@ -76,6 +82,9 @@ class GfxStreamBackendTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        if (IsSkipped()) {
+            return;
+        }
         // Ensure background threads aren't mid-initialization.
         sleepMs(100);
         if (useWindow) {
@@ -255,4 +264,37 @@ TEST_F(GfxStreamBackendTest, RenderThreadTracking) {
 
     EXPECT_EQ(stream_renderer_get_metrics(&metrics), 0);
     EXPECT_EQ(metrics.render_thread_count, initialRenderThreads);
+}
+
+namespace {
+class FakeIOStream : public gfxstream::IOStream {
+   public:
+    explicit FakeIOStream(size_t bufSize) : IOStream(bufSize) {}
+
+    void* allocBuffer(size_t minSize) override {
+        lastRequestedMinSize = minSize;
+        return &dummyByte;
+    }
+    int commitBuffer(size_t size) override { return 0; }
+    int writeFully(const void* buf, size_t len) override { return 0; }
+    const unsigned char* readFully(void* buf, size_t len) override { return nullptr; }
+    void* getDmaForReading(uint64_t guest_paddr) override { return nullptr; }
+    void unlockDma(uint64_t guest_paddr) override {}
+
+    size_t lastRequestedMinSize = 0;
+    unsigned char dummyByte = 0;
+
+   protected:
+    const unsigned char* readRaw(void* buf, size_t* inout_len) override { return nullptr; }
+    void onSave(gfxstream::Stream* stream) override {}
+    unsigned char* onLoad(gfxstream::Stream* stream) override { return nullptr; }
+};
+}  // namespace
+
+TEST(IOStreamTest, AllocDoesNotTruncateSizeToInt) {
+    FakeIOStream stream(16);
+    const size_t largeLen = 0x80000004ULL;
+    unsigned char* ptr = stream.alloc(largeLen);
+    EXPECT_NE(ptr, nullptr);
+    EXPECT_EQ(stream.lastRequestedMinSize, largeLen);
 }
