@@ -2493,7 +2493,8 @@ bool VkEmulation::allocExternalMemory(VulkanDispatch* vk, VkEmulation::ExternalM
         exportAi.handleTypes =
             static_cast<VkExternalMemoryHandleTypeFlags>(getDefaultExternalMemoryHandleType());
 
-        if (mDeviceInfo.supportsDmaBuf) {
+        if (mDeviceInfo.supportsDmaBuf &&
+            getExternalMemoryMode() != ExternalMemory::Mode::AndroidAHB) {
             exportAi.handleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
         }
 
@@ -4874,7 +4875,9 @@ bool VkEmulation::setupVkBuffer(uint64_t size, uint32_t bufferHandle, bool vulka
     bool allocRes = allocExternalMemory(vk, &res.memory, deviceAlignment, dedicated_buffer);
 
     if (!allocRes) {
-        GFXSTREAM_WARNING("Failed to allocate ColorBuffer with Vulkan backing.");
+        GFXSTREAM_WARNING("Failed to allocate Buffer %d with Vulkan backing.", bufferHandle);
+        vk->vkDestroyBuffer(mDevice, res.buffer, nullptr);
+        return false;
     }
 
     res.memory.pageOffset = reinterpret_cast<uint64_t>(res.memory.mappedPtr) % kPageSize;
@@ -4886,7 +4889,9 @@ bool VkEmulation::setupVkBuffer(uint64_t size, uint32_t bufferHandle, bool vulka
     if (bindBufferMemoryRes != VK_SUCCESS) {
         GFXSTREAM_ERROR("Failed to bind buffer memory. Error: %s\n",
                         string_VkResult(bindBufferMemoryRes));
-        return bindBufferMemoryRes;
+        vk->vkDestroyBuffer(mDevice, res.buffer, nullptr);
+        freeExternalMemoryLocked(vk, &res.memory);
+        return false;
     }
 
     bool isHostVisibleMemory = memoryProperty & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
