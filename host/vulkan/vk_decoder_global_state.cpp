@@ -106,20 +106,27 @@ using gfxstream::host::GfxApiLogger;
 #define STREAM_BLOB_FLAG_USE_CROSS_DEVICE 4
 #define STREAM_BLOB_FLAG_CREATE_GUEST_HANDLE 8
 
-#define VALIDATE_REQUIRED_HANDLE(parameter) \
-    validateRequiredHandle(__FUNCTION__, #parameter, parameter)
+#define VALIDATE_REQUIRED_HANDLE(parameter)                                                    \
+    do {                                                                                       \
+        VkResult validateResult = validateRequiredHandle(__FUNCTION__, #parameter, parameter); \
+        if (validateResult != VK_SUCCESS) {                                                    \
+            return validateResult;                                                             \
+        }                                                                                      \
+    } while (0)
 
 template <typename T>
-void validateRequiredHandle(const char* api_name, const char* parameter_name, T value) {
+VkResult validateRequiredHandle(const char* api_name, const char* parameter_name, T value) {
     if (value == VK_NULL_HANDLE) {
         if (VkDecoderGlobalState::get()->isSnapshotCurrentlyLoading()) {
             GFXSTREAM_ERROR("Invalid required handle for %s param %s during snapshot load",
                             api_name, parameter_name);
             VkDecoderGlobalState::get()->setSnapshotLoadError();
-            return;
+            return VK_ERROR_VALIDATION_FAILED;
         }
         GFXSTREAM_FATAL("Invalid required handle for %s param %s", api_name, parameter_name);
+        return VK_ERROR_VALIDATION_FAILED;
     }
+    return VK_SUCCESS;
 }
 
 #define VALIDATE_NEW_HANDLE_INFO_ENTRY(objectMap, newEntry) \
@@ -221,6 +228,113 @@ static constexpr uint64_t kPageSizeforBlob = 4096;
 static constexpr uint64_t kPageMaskForBlob = ~(0xfff);
 
 static std::atomic<uint64_t> sUniqueShmemId = 0;
+
+static bool isDescriptorTypeImageInfo(VkDescriptorType descType) {
+    return (descType == VK_DESCRIPTOR_TYPE_SAMPLER) ||
+           (descType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ||
+           (descType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) ||
+           (descType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) ||
+           (descType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT);
+}
+
+static bool isDescriptorTypeBufferInfo(VkDescriptorType descType) {
+    return (descType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) ||
+           (descType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) ||
+           (descType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) ||
+           (descType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC);
+}
+
+static bool isDescriptorTypeBufferView(VkDescriptorType descType) {
+    return (descType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) ||
+           (descType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER);
+}
+
+DescriptorUpdateTemplateInfo calcLinearizedDescriptorUpdateTemplateInfo(
+    const VkDescriptorUpdateTemplateCreateInfo* pCreateInfo) {
+    DescriptorUpdateTemplateInfo res;
+    res.createInfo = *pCreateInfo;
+
+    size_t numImageInfos = 0;
+    size_t numBufferInfos = 0;
+    size_t numBufferViews = 0;
+    size_t numInlineUniformBlocks = 0;
+
+    for (uint32_t i = 0; i < pCreateInfo->descriptorUpdateEntryCount; ++i) {
+        const auto& entry = pCreateInfo->pDescriptorUpdateEntries[i];
+        auto type = entry.descriptorType;
+        auto count = entry.descriptorCount;
+        if (isDescriptorTypeImageInfo(type)) {
+            numImageInfos += count;
+        } else if (isDescriptorTypeBufferInfo(type)) {
+            numBufferInfos += count;
+        } else if (isDescriptorTypeBufferView(type)) {
+            numBufferViews += count;
+        } else if (type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK_EXT) {
+            numInlineUniformBlocks += count;
+        } else {
+            const std::string typeString = string_VkDescriptorType(type);
+            GFXSTREAM_FATAL("Unhandled descriptor type %s.", typeString.c_str());
+        }
+    }
+
+    size_t imageInfoBytes = numImageInfos * sizeof(VkDescriptorImageInfo);
+    size_t bufferInfoBytes = numBufferInfos * sizeof(VkDescriptorBufferInfo);
+    size_t bufferViewBytes = numBufferViews * sizeof(VkBufferView);
+    size_t inlineUniformBlockBytes = numInlineUniformBlocks;
+
+    res.data.resize(imageInfoBytes + bufferInfoBytes + bufferViewBytes + inlineUniformBlockBytes);
+    res.imageInfoStart = 0;
+    res.imageInfoCount = numImageInfos;
+    res.bufferInfoStart = imageInfoBytes;
+    res.bufferInfoCount = numBufferInfos;
+    res.bufferViewStart = imageInfoBytes + bufferInfoBytes;
+    res.bufferViewCount = numBufferViews;
+    res.inlineUniformBlockStart = imageInfoBytes + bufferInfoBytes + bufferViewBytes;
+    res.inlineUniformBlockCount = numInlineUniformBlocks;
+
+    size_t imageInfoCount = 0;
+    size_t bufferInfoCount = 0;
+    size_t bufferViewCount = 0;
+    size_t inlineUniformBlockCount = 0;
+
+    for (uint32_t i = 0; i < pCreateInfo->descriptorUpdateEntryCount; ++i) {
+        const auto& entry = pCreateInfo->pDescriptorUpdateEntries[i];
+        VkDescriptorUpdateTemplateEntry entryForHost = entry;
+
+        auto type = entry.descriptorType;
+
+        // The guest sends every array element of an entry, in entry order, so an entry
+        // starts after all elements of the entries before it.
+        if (isDescriptorTypeImageInfo(type)) {
+            entryForHost.offset =
+                res.imageInfoStart + imageInfoCount * sizeof(VkDescriptorImageInfo);
+            entryForHost.stride = sizeof(VkDescriptorImageInfo);
+            imageInfoCount += entryForHost.descriptorCount;
+        } else if (isDescriptorTypeBufferInfo(type)) {
+            entryForHost.offset =
+                res.bufferInfoStart + bufferInfoCount * sizeof(VkDescriptorBufferInfo);
+            entryForHost.stride = sizeof(VkDescriptorBufferInfo);
+            bufferInfoCount += entryForHost.descriptorCount;
+        } else if (isDescriptorTypeBufferView(type)) {
+            entryForHost.offset = res.bufferViewStart + bufferViewCount * sizeof(VkBufferView);
+            entryForHost.stride = sizeof(VkBufferView);
+            bufferViewCount += entryForHost.descriptorCount;
+        } else if (type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK_EXT) {
+            entryForHost.offset = res.inlineUniformBlockStart + inlineUniformBlockCount;
+            entryForHost.stride = 0;
+            inlineUniformBlockCount += entryForHost.descriptorCount;
+        } else {
+            const std::string typeString = string_VkDescriptorType(type);
+            GFXSTREAM_FATAL("Unhandled descriptor type %s.", typeString.c_str());
+        }
+
+        res.linearizedTemplateEntries.push_back(entryForHost);
+    }
+
+    res.createInfo.pDescriptorUpdateEntries = res.linearizedTemplateEntries.data();
+
+    return res;
+}
 
 class VkDecoderGlobalState::Impl {
    public:
@@ -1505,6 +1619,7 @@ class VkDecoderGlobalState::Impl {
 
         vk_struct_chain_filter<VkDebugReportCallbackCreateInfoEXT>(&createInfoFiltered);
         vk_struct_chain_filter<VkDebugUtilsMessengerCreateInfoEXT>(&createInfoFiltered);
+        vk_struct_chain_filter<VkGuestCapabilitiesGOOGLE>(&createInfoFiltered);
 
         if (debugContext) {
             auto chainIter = vk_make_chain_iterator(&createInfoFiltered);
@@ -1546,6 +1661,11 @@ class VkDecoderGlobalState::Impl {
         }
         for (uint32_t i = 0; i < createInfoFiltered.enabledExtensionCount; ++i) {
             info.enabledExtensionNames.push_back(createInfoFiltered.ppEnabledExtensionNames[i]);
+        }
+        const VkGuestCapabilitiesGOOGLE* guestCapabilities =
+            vk_find_struct<VkGuestCapabilitiesGOOGLE>(pCreateInfo);
+        if (guestCapabilities != nullptr) {
+            info.guestCapabilities = guestCapabilities->capabilities;
         }
 
         GFXSTREAM_INFO("Created VkInstance:%p for application:'%s' engine:'%s'.", *pInstance,
@@ -1916,8 +2036,9 @@ class VkDecoderGlobalState::Impl {
                 // can be enabled without enabling 'protectedMemory'
             }
 
-            if (m_vkEmulation->getFeatures().VulkanBatchedDescriptorSetUpdate.enabled()) {
-                // Currently not supporting IUB with descriptor set optimizations.
+            if (m_vkEmulation->getFeatures().VulkanBatchedDescriptorSetUpdate.enabled() &&
+                !instanceInfo->hasGuestCapability(
+                    VK_GUEST_CAPABILITY_BATCHED_INLINE_UNIFORM_BLOCK_BIT_GOOGLE)) {
                 VkPhysicalDeviceInlineUniformBlockFeatures* iubFeatures =
                     vk_find_struct<VkPhysicalDeviceInlineUniformBlockFeatures>(pFeatures);
                 if (iubFeatures != nullptr) {
@@ -1949,6 +2070,11 @@ class VkDecoderGlobalState::Impl {
         VkImageFormatProperties* pImageFormatProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
         auto vk = dispatch_VkPhysicalDevice(boxed_physicalDevice);
+        VkResult checkRes = CheckImageFormatPropertiesForUnsupportedExtensions(
+            vk, physicalDevice, format, tiling, usage, flags, pImageFormatProperties);
+        if (checkRes != VK_SUCCESS) {
+            return checkRes;
+        }
         const bool emulatedTexture = isEmulatedCompressedTexture(format, physicalDevice, vk);
         if (emulatedTexture) {
             if (!supportEmulatedCompressedImageFormatProperty(format, type, tiling, usage, flags)) {
@@ -1981,6 +2107,12 @@ class VkDecoderGlobalState::Impl {
         auto vk = dispatch_VkPhysicalDevice(boxed_physicalDevice);
         VkPhysicalDeviceImageFormatInfo2 imageFormatInfo;
         VkFormat format = pImageFormatInfo->format;
+        VkResult checkRes = CheckImageFormatPropertiesForUnsupportedExtensions(
+            vk, physicalDevice, format, pImageFormatInfo->tiling, pImageFormatInfo->usage,
+            pImageFormatInfo->flags, &pImageFormatProperties->imageFormatProperties);
+        if (checkRes != VK_SUCCESS) {
+            return checkRes;
+        }
         const bool emulatedTexture = isEmulatedCompressedTexture(format, physicalDevice, vk);
         if (emulatedTexture) {
             if (!supportEmulatedCompressedImageFormatProperty(
@@ -2400,6 +2532,20 @@ class VkDecoderGlobalState::Impl {
                                       supportedDeviceExtensions.end();
                            }),
             properties.end());
+
+        // In AndroidAHB mode, guest dmabufs are backed by AHardwareBuffers whose layout is
+        // chosen by gralloc, so native DRM format modifiers can't be honored. Hide the
+        // extension so the guest falls back to its DRM_FORMAT_MOD_LINEAR emulation.
+        if (m_vkEmulation->getExternalMemoryMode() == ExternalMemory::Mode::AndroidAHB) {
+            properties.erase(
+                std::remove_if(properties.begin(), properties.end(),
+                               [](const VkExtensionProperties& extension) {
+                                   return strcmp(extension.extensionName,
+                                                 VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME) ==
+                                          0;
+                               }),
+                properties.end());
+        }
 
         // Add in emulated extensions:
 
@@ -3173,13 +3319,6 @@ class VkDecoderGlobalState::Impl {
             GFXSTREAM_FATAL("%s: function implementation cannot be found!");
         }
 
-        const VkFormat format = pInfo->pCreateInfo->format;
-        bool needDecompression = isEtc2(format) || isAstc(format);
-        if (!needDecompression) {
-            // No modifications needed
-            return;
-        }
-
         std::lock_guard<std::mutex> lock(mMutex);
 
         auto* deviceInfo = gfxstream::base::find(mDeviceInfo, device);
@@ -3188,9 +3327,20 @@ class VkDecoderGlobalState::Impl {
             return;
         }
 
-        needDecompression = deviceInfo->needEmulatedDecompression(format);
+        auto* physicalDeviceInfo = gfxstream::base::find(mPhysdevInfo, deviceInfo->physicalDevice);
+        if (!physicalDeviceInfo) {
+            GFXSTREAM_ERROR("Failed to find physical device info for physical device:%p",
+                            deviceInfo->physicalDevice);
+            return;
+        }
+        auto& physicalDeviceMemHelper = physicalDeviceInfo->memoryPropertiesHelper;
+
+        const VkFormat format = pInfo->pCreateInfo->format;
+        const bool needDecompression =
+            (isEtc2(format) || isAstc(format)) && deviceInfo->needEmulatedDecompression(format);
         if (!needDecompression) {
-            // No modifications needed
+            physicalDeviceMemHelper->transformToGuestImageMemoryRequirements(
+                pInfo->pCreateInfo->tiling, &pMemoryRequirements->memoryRequirements);
             return;
         }
 
@@ -3213,16 +3363,8 @@ class VkDecoderGlobalState::Impl {
         pMemoryRequirements->memoryRequirements = cmpInfo.getMemoryRequirements();
         cmpInfo.destroy(vk);
 
-        auto* physicalDeviceInfo = gfxstream::base::find(mPhysdevInfo, deviceInfo->physicalDevice);
-        if (!physicalDeviceInfo) {
-            GFXSTREAM_ERROR("Failed to find physical device info for physical device:%p",
-                            deviceInfo->physicalDevice);
-            return;
-        }
-
-        auto& physicalDeviceMemHelper = physicalDeviceInfo->memoryPropertiesHelper;
-        physicalDeviceMemHelper->transformToGuestMemoryRequirements(
-            &pMemoryRequirements->memoryRequirements);
+        physicalDeviceMemHelper->transformToGuestImageMemoryRequirements(
+            pInfo->pCreateInfo->tiling, &pMemoryRequirements->memoryRequirements);
     }
 
     void destroyDeviceWithExclusiveInfo(VkDevice device, DeviceInfo& deviceInfo,
@@ -3801,6 +3943,7 @@ class VkDecoderGlobalState::Impl {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
 
+        VALIDATE_REQUIRED_HANDLE(image);
         VALIDATE_REQUIRED_HANDLE(memory);
         VkResult result = vk->vkBindImageMemory(device, image, memory, memoryOffset);
         if (result != VK_SUCCESS) {
@@ -4656,13 +4799,63 @@ class VkDecoderGlobalState::Impl {
         destroySemaphoreLocked(device, deviceDispatch, semaphore);
     }
 
+    std::shared_ptr<const ProcessResources> getCurrentProcessResources() const {
+        auto* renderThreadInfo = RenderThreadInfoVk::get();
+        if (!renderThreadInfo) {
+            return nullptr;
+        }
+        if (renderThreadInfo->m_processResources) {
+            return renderThreadInfo->m_processResources;
+        }
+        if (!m_vkEmulation || !m_vkEmulation->getGlobalState() || renderThreadInfo->ctx_id == 0) {
+            return nullptr;
+        }
+        renderThreadInfo->m_processResources =
+            m_vkEmulation->getGlobalState()->getProcessResources(renderThreadInfo->ctx_id);
+        return renderThreadInfo->m_processResources;
+    }
+
+    template <typename WaitFn>
+    VkResult waitWithProcessDeathCheck(uint64_t timeoutNs, WaitFn&& waitFn) {
+        constexpr uint64_t kStepTimeoutNs = 1ULL * 1000ULL * 1000ULL * 1000ULL;  // 1s
+
+        std::shared_ptr<const ProcessResources> processResources = getCurrentProcessResources();
+        uint64_t remainingTimeoutNs = timeoutNs;
+        auto lastTime = std::chrono::steady_clock::now();
+        while (true) {
+            if (processResources && processResources->isGuestProcessDead()) {
+                return VK_TIMEOUT;
+            }
+            const uint64_t stepTimeoutNs = std::min(remainingTimeoutNs, kStepTimeoutNs);
+            VkResult result = waitFn(stepTimeoutNs);
+            if (result != VK_TIMEOUT) {
+                return result;
+            }
+            if (stepTimeoutNs == remainingTimeoutNs) {
+                return VK_TIMEOUT;
+            }
+            if (timeoutNs != UINT64_MAX) {
+                const auto now = std::chrono::steady_clock::now();
+                const uint64_t elapsedNs =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(now - lastTime).count();
+                lastTime = now;
+                if (elapsedNs >= remainingTimeoutNs) {
+                    return VK_TIMEOUT;
+                }
+                remainingTimeoutNs -= elapsedNs;
+            }
+        }
+    }
+
     VkResult on_vkWaitSemaphores(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
                                  VkDevice boxed_device, const VkSemaphoreWaitInfo* pWaitInfo,
                                  uint64_t timeout) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
 
-        return deviceDispatch->vkWaitSemaphores(device, pWaitInfo, timeout);
+        return waitWithProcessDeathCheck(timeout, [&](uint64_t stepTimeoutNs) {
+            return deviceDispatch->vkWaitSemaphores(device, pWaitInfo, stepTimeoutNs);
+        });
     }
 
     VkResult onSemaphoreSignalledOnSharedQueue(VulkanDispatch* deviceDispatch,
@@ -6026,7 +6219,8 @@ class VkDecoderGlobalState::Impl {
 
         auto& physicalDeviceMemHelper = physicalDeviceInfo->memoryPropertiesHelper;
         updateImageMemoryRequirementsLocked(device, image, pMemoryRequirements);
-        physicalDeviceMemHelper->transformToGuestMemoryRequirements(pMemoryRequirements);
+        physicalDeviceMemHelper->transformToGuestImageMemoryRequirements(
+            imageTilingLocked(image), pMemoryRequirements);
     }
 
     // A driver that defers the layout also reports rowPitch=0; answer with the AHB's stride.
@@ -6092,8 +6286,8 @@ class VkDecoderGlobalState::Impl {
         auto& physicalDeviceMemHelper = physicalDeviceInfo->memoryPropertiesHelper;
         updateImageMemoryRequirementsLocked(device, pInfo->image,
                                             &pMemoryRequirements->memoryRequirements);
-        physicalDeviceMemHelper->transformToGuestMemoryRequirements(
-            &pMemoryRequirements->memoryRequirements);
+        physicalDeviceMemHelper->transformToGuestImageMemoryRequirements(
+            imageTilingLocked(pInfo->image), &pMemoryRequirements->memoryRequirements);
     }
 
     void on_vkGetBufferMemoryRequirements(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
@@ -7181,7 +7375,8 @@ class VkDecoderGlobalState::Impl {
         uint32_t virtioGpuContextId = 0;
         VkMemoryPropertyFlags memoryPropertyFlags;
 
-        bool deviceHasDmabufExt = false;
+        // Only read where dma-buf exists.
+        [[maybe_unused]] bool deviceHasDmabufExt = false;
 
         // Map guest memory index to host memory index and lookup memory properties:
         {
@@ -7294,15 +7489,25 @@ class VkDecoderGlobalState::Impl {
 #endif
             } else if (m_vkEmulation->getFeatures().SystemBlob.enabled() ||
                        m_vkEmulation->getFeatures().VulkanAllocateHostVisibleAsUdmabuf.enabled()) {
+                // A system blob is imported as a host pointer, and a driver can ask for a
+                // coarser alignment than a page: Apple silicon pages are 16KB.
+                uint64_t blobAlignment = kPageSizeforBlob;
+                if (m_vkEmulation->supportsExternalMemoryHostProperties()) {
+                    blobAlignment = std::max<uint64_t>(blobAlignment,
+                                                       m_vkEmulation->externalMemoryHostProperties()
+                                                           .minImportedHostPointerAlignment);
+                }
+
                 // Ensure size is page-aligned.
-                VkDeviceSize alignedSize = ALIGN(localAllocInfo.allocationSize, kPageSizeforBlob);
+                VkDeviceSize alignedSize = ALIGN(localAllocInfo.allocationSize, blobAlignment);
                 if (alignedSize != localAllocInfo.allocationSize) {
                     GFXSTREAM_ERROR("Warning: Aligning allocation size from %llu to %llu",
                                     static_cast<unsigned long long>(localAllocInfo.allocationSize),
                                     static_cast<unsigned long long>(alignedSize));
                 }
                 localAllocInfo.allocationSize = alignedSize;
-                auto memory = SharedMemory("shared-memory-vk-" + std::to_string(sUniqueShmemId++),
+                auto memory = SharedMemory("shared-memory-vk-" + std::to_string(getpid()) + "-" +
+                                               std::to_string(sUniqueShmemId++),
                                            localAllocInfo.allocationSize);
 
                 if (m_vkEmulation->getFeatures().VulkanAllocateHostVisibleAsUdmabuf.enabled()) {
@@ -7347,8 +7552,7 @@ class VkDecoderGlobalState::Impl {
                         return VK_ERROR_OUT_OF_HOST_MEMORY;
                     }
                     mappedPtr = memory.get();
-                    int mappedPtrAlignment =
-                        reinterpret_cast<uintptr_t>(mappedPtr) % kPageSizeforBlob;
+                    int mappedPtrAlignment = reinterpret_cast<uintptr_t>(mappedPtr) % blobAlignment;
                     if (mappedPtrAlignment != 0) {
                         GFXSTREAM_ERROR(
                             "Warning: Mapped shared memory pointer is not aligned to page size, "
@@ -10482,7 +10686,7 @@ class VkDecoderGlobalState::Impl {
             return VK_SUCCESS;
         }
 
-        const auto startTime = std::chrono::system_clock::now();
+        const auto startTime = std::chrono::steady_clock::now();
         for (uint32_t i = 0; i < fenceCount; i++) {
             VkFence fence = pFences[i];
             {
@@ -10540,10 +10744,13 @@ class VkDecoderGlobalState::Impl {
             }
         }
 
-        const auto endTime = std::chrono::system_clock::now();
+        const auto endTime = std::chrono::steady_clock::now();
         const uint64_t timePassed = std::chrono::nanoseconds(endTime - startTime).count();
-        const uint64_t timeoutLeft = (timeout > timePassed) ? timeout - timePassed : 0;
-        return vk->vkWaitForFences(unboxed_device, fenceCount, pFences, waitAll, timeoutLeft);
+        const uint64_t timeoutLeft =
+            (timeout == UINT64_MAX) ? UINT64_MAX : ((timeout > timePassed) ? timeout - timePassed : 0);
+        return waitWithProcessDeathCheck(timeoutLeft, [&](uint64_t stepTimeoutNs) {
+            return vk->vkWaitForFences(unboxed_device, fenceCount, pFences, waitAll, stepTimeoutNs);
+        });
     }
 
     VkResult waitForFence(VkFence fence, uint64_t timeout) {
@@ -11051,6 +11258,11 @@ class VkDecoderGlobalState::Impl {
         return false;
     }
 
+    VkImageTiling imageTilingLocked(VkImage image) REQUIRES(mMutex) {
+        auto* imageInfo = gfxstream::base::find(mImageInfo, image);
+        return imageInfo ? imageInfo->imageCreateInfoShallow.tiling : VK_IMAGE_TILING_OPTIMAL;
+    }
+
     void updateImageMemoryRequirementsLocked(VkDevice device, VkImage image,
                                              VkMemoryRequirements* pMemoryRequirements)
         REQUIRES(mMutex) {
@@ -11378,34 +11590,106 @@ class VkDecoderGlobalState::Impl {
         pFormatProp->formatProperties.bufferFeatures &= kEmulatedTextureBufferFeatureMask;
     }
 
-    static const VkFormatFeatureFlags kUnsupportedFormatFeatureFlags =
-        VK_FORMAT_FEATURE_VIDEO_DECODE_OUTPUT_BIT_KHR |
-        VK_FORMAT_FEATURE_VIDEO_DECODE_DPB_BIT_KHR |
-        VK_FORMAT_FEATURE_VIDEO_ENCODE_INPUT_BIT_KHR |
-        VK_FORMAT_FEATURE_VIDEO_ENCODE_DPB_BIT_KHR;
+    static const VkFormatFeatureFlags kSupportedFormatFeatureFlags =
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+        VK_FORMAT_FEATURE_STORAGE_IMAGE_ATOMIC_BIT |
+        VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT |
+        VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT |
+        VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_ATOMIC_BIT |
+        VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT |
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT |
+        VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
+        VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+        VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+        VK_FORMAT_FEATURE_BLIT_DST_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_MINMAX_BIT |
+        VK_FORMAT_FEATURE_MIDPOINT_CHROMA_SAMPLES_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_CHROMA_RECONSTRUCTION_EXPLICIT_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_YCBCR_CONVERSION_CHROMA_RECONSTRUCTION_EXPLICIT_FORCEABLE_BIT |
+        VK_FORMAT_FEATURE_DISJOINT_BIT |
+        VK_FORMAT_FEATURE_COSITED_CHROMA_SAMPLES_BIT |
+        VK_FORMAT_FEATURE_FRAGMENT_DENSITY_MAP_BIT_EXT;
 
-    static const VkFormatFeatureFlags2 kUnsupportedFormatFeatureFlags2 =
-        VK_FORMAT_FEATURE_2_VIDEO_DECODE_OUTPUT_BIT_KHR |
-        VK_FORMAT_FEATURE_2_VIDEO_DECODE_DPB_BIT_KHR |
-        VK_FORMAT_FEATURE_2_VIDEO_ENCODE_INPUT_BIT_KHR |
-        VK_FORMAT_FEATURE_2_VIDEO_ENCODE_DPB_BIT_KHR |
-        VK_FORMAT_FEATURE_2_VIDEO_ENCODE_QUANTIZATION_DELTA_MAP_BIT_KHR |
-        VK_FORMAT_FEATURE_2_VIDEO_ENCODE_EMPHASIS_MAP_BIT_KHR;
+    static const VkFormatFeatureFlags2 kSupportedFormatFeatureFlags2 =
+        VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+        VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT |
+        VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT |
+        VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
+        VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT |
+        VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT |
+        VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
+        VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT |
+        VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT |
+        VK_FORMAT_FEATURE_2_BLIT_SRC_BIT |
+        VK_FORMAT_FEATURE_2_BLIT_DST_BIT |
+        VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+        VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
+        VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
+        VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT |
+        VK_FORMAT_FEATURE_2_MIDPOINT_CHROMA_SAMPLES_BIT |
+        VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT |
+        VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT |
+        VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_CHROMA_RECONSTRUCTION_EXPLICIT_BIT |
+        VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_CHROMA_RECONSTRUCTION_EXPLICIT_FORCEABLE_BIT |
+        VK_FORMAT_FEATURE_2_DISJOINT_BIT |
+        VK_FORMAT_FEATURE_2_COSITED_CHROMA_SAMPLES_BIT |
+        VK_FORMAT_FEATURE_2_FRAGMENT_DENSITY_MAP_BIT_EXT |
+        VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+        VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT |
+        VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT |
+        VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT;
 
     void maskFormatPropertiesForUnsupportedExtensions(VkFormatProperties* pFormatProp) {
-        pFormatProp->linearTilingFeatures &= ~kUnsupportedFormatFeatureFlags;
-        pFormatProp->optimalTilingFeatures &= ~kUnsupportedFormatFeatureFlags;
-        pFormatProp->bufferFeatures &= ~kUnsupportedFormatFeatureFlags;
+        pFormatProp->linearTilingFeatures &= kSupportedFormatFeatureFlags;
+        pFormatProp->optimalTilingFeatures &= kSupportedFormatFeatureFlags;
+        pFormatProp->bufferFeatures &= kSupportedFormatFeatureFlags;
     }
 
     void maskFormatPropertiesForUnsupportedExtensions(VkFormatProperties2* pFormatProp) {
         maskFormatPropertiesForUnsupportedExtensions(&pFormatProp->formatProperties);
         VkFormatProperties3* formatProps3 = vk_find_struct<VkFormatProperties3>(pFormatProp);
         if (formatProps3) {
-            formatProps3->linearTilingFeatures &= ~kUnsupportedFormatFeatureFlags2;
-            formatProps3->optimalTilingFeatures &= ~kUnsupportedFormatFeatureFlags2;
-            formatProps3->bufferFeatures &= ~kUnsupportedFormatFeatureFlags2;
+            formatProps3->linearTilingFeatures &= kSupportedFormatFeatureFlags2;
+            formatProps3->optimalTilingFeatures &= kSupportedFormatFeatureFlags2;
+            formatProps3->bufferFeatures &= kSupportedFormatFeatureFlags2;
         }
+    }
+
+    VkResult CheckImageFormatPropertiesForUnsupportedExtensions(
+        VulkanDispatch* vk, VkPhysicalDevice physicalDevice, VkFormat format, VkImageTiling tiling,
+        VkImageUsageFlags usage, VkImageCreateFlags flags,
+        VkImageFormatProperties* pImageFormatProperties) {
+        // vkGetPhysicalDeviceFormatProperties(2) and vkGetPhysicalDeviceImageFormatProperties(2)
+        // are VkPhysicalDevice-level queries made before vkCreateDevice, so a host driver may
+        // advertise format features and image format support for device extensions supported by the
+        // host physical device (such as VK_NV_linear_color_attachment) even when those extensions
+        // are not exposed to the guest or explicitly enabled on the host VkDevice.
+        //
+        // Specifically, host drivers supporting VK_NV_linear_color_attachment may return VK_SUCCESS
+        // from vkGetPhysicalDeviceImageFormatProperties(2) for VK_IMAGE_TILING_LINEAR with
+        // VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT while setting
+        // VK_FORMAT_FEATURE_2_LINEAR_COLOR_ATTACHMENT_BIT_NV instead of
+        // VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT in linearTilingFeatures (e.g. for
+        // VK_FORMAT_R8G8B8A8_UNORM). Since Gfxstream does not expose VK_NV_linear_color_attachment
+        // to the guest, reject linear color attachment usage when the core
+        // VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT is not present in linearTilingFeatures.
+        if (tiling == VK_IMAGE_TILING_LINEAR && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+            !(flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)) {
+            VkFormatProperties formatProps = {};
+            vk->vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &formatProps);
+            if (!(formatProps.linearTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
+                memset(pImageFormatProperties, 0, sizeof(VkImageFormatProperties));
+                return VK_ERROR_FORMAT_NOT_SUPPORTED;
+            }
+        }
+        return VK_SUCCESS;
     }
 
     void maskImageFormatPropertiesForEmulatedTextures(VkImageFormatProperties* pProperties) {
@@ -11674,14 +11958,6 @@ class VkDecoderGlobalState::Impl {
                           sBoxedHandleManager.getHandlesCount());
     }
 
-    bool isDescriptorTypeImageInfo(VkDescriptorType descType) {
-        return (descType == VK_DESCRIPTOR_TYPE_SAMPLER) ||
-               (descType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ||
-               (descType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) ||
-               (descType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) ||
-               (descType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT);
-    }
-
     bool descriptorTypeContainsImage(VkDescriptorType descType) {
         return (descType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ||
                (descType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) ||
@@ -11692,18 +11968,6 @@ class VkDecoderGlobalState::Impl {
     bool descriptorTypeContainsSampler(VkDescriptorType descType) {
         return (descType == VK_DESCRIPTOR_TYPE_SAMPLER) ||
                (descType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
-    }
-
-    bool isDescriptorTypeBufferInfo(VkDescriptorType descType) {
-        return (descType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) ||
-               (descType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) ||
-               (descType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) ||
-               (descType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC);
-    }
-
-    bool isDescriptorTypeBufferView(VkDescriptorType descType) {
-        return (descType == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) ||
-               (descType == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER);
     }
 
     bool isDescriptorTypeInlineUniformBlock(VkDescriptorType descType) {
@@ -11732,92 +11996,6 @@ class VkDecoderGlobalState::Impl {
             default:
                 return 0;
         }
-    }
-
-    DescriptorUpdateTemplateInfo calcLinearizedDescriptorUpdateTemplateInfo(
-        const VkDescriptorUpdateTemplateCreateInfo* pCreateInfo) {
-        DescriptorUpdateTemplateInfo res;
-        res.createInfo = *pCreateInfo;
-
-        size_t numImageInfos = 0;
-        size_t numBufferInfos = 0;
-        size_t numBufferViews = 0;
-        size_t numInlineUniformBlocks = 0;
-
-        for (uint32_t i = 0; i < pCreateInfo->descriptorUpdateEntryCount; ++i) {
-            const auto& entry = pCreateInfo->pDescriptorUpdateEntries[i];
-            auto type = entry.descriptorType;
-            auto count = entry.descriptorCount;
-            if (isDescriptorTypeImageInfo(type)) {
-                numImageInfos += count;
-            } else if (isDescriptorTypeBufferInfo(type)) {
-                numBufferInfos += count;
-            } else if (isDescriptorTypeBufferView(type)) {
-                numBufferViews += count;
-            } else if (type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK_EXT) {
-                numInlineUniformBlocks += count;
-            } else {
-                const std::string typeString = string_VkDescriptorType(type);
-                GFXSTREAM_FATAL("Unhandled descriptor type %s.", typeString.c_str());
-            }
-        }
-
-        size_t imageInfoBytes = numImageInfos * sizeof(VkDescriptorImageInfo);
-        size_t bufferInfoBytes = numBufferInfos * sizeof(VkDescriptorBufferInfo);
-        size_t bufferViewBytes = numBufferViews * sizeof(VkBufferView);
-        size_t inlineUniformBlockBytes = numInlineUniformBlocks;
-
-        res.data.resize(imageInfoBytes + bufferInfoBytes + bufferViewBytes +
-                        inlineUniformBlockBytes);
-        res.imageInfoStart = 0;
-        res.imageInfoCount = numImageInfos;
-        res.bufferInfoStart = imageInfoBytes;
-        res.bufferInfoCount = numBufferInfos;
-        res.bufferViewStart = imageInfoBytes + bufferInfoBytes;
-        res.bufferViewCount = numBufferViews;
-        res.inlineUniformBlockStart = imageInfoBytes + bufferInfoBytes + bufferViewBytes;
-        res.inlineUniformBlockCount = numInlineUniformBlocks;
-
-        size_t imageInfoCount = 0;
-        size_t bufferInfoCount = 0;
-        size_t bufferViewCount = 0;
-        size_t inlineUniformBlockCount = 0;
-
-        for (uint32_t i = 0; i < pCreateInfo->descriptorUpdateEntryCount; ++i) {
-            const auto& entry = pCreateInfo->pDescriptorUpdateEntries[i];
-            VkDescriptorUpdateTemplateEntry entryForHost = entry;
-
-            auto type = entry.descriptorType;
-
-            if (isDescriptorTypeImageInfo(type)) {
-                entryForHost.offset =
-                    res.imageInfoStart + imageInfoCount * sizeof(VkDescriptorImageInfo);
-                entryForHost.stride = sizeof(VkDescriptorImageInfo);
-                ++imageInfoCount;
-            } else if (isDescriptorTypeBufferInfo(type)) {
-                entryForHost.offset =
-                    res.bufferInfoStart + bufferInfoCount * sizeof(VkDescriptorBufferInfo);
-                entryForHost.stride = sizeof(VkDescriptorBufferInfo);
-                ++bufferInfoCount;
-            } else if (isDescriptorTypeBufferView(type)) {
-                entryForHost.offset = res.bufferViewStart + bufferViewCount * sizeof(VkBufferView);
-                entryForHost.stride = sizeof(VkBufferView);
-                ++bufferViewCount;
-            } else if (type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK_EXT) {
-                entryForHost.offset = res.inlineUniformBlockStart + inlineUniformBlockCount;
-                entryForHost.stride = 0;
-                inlineUniformBlockCount += entryForHost.descriptorCount;
-            } else {
-                const std::string typeString = string_VkDescriptorType(type);
-                GFXSTREAM_FATAL("Unhandled descriptor type %s.", typeString.c_str());
-            }
-
-            res.linearizedTemplateEntries.push_back(entryForHost);
-        }
-
-        res.createInfo.pDescriptorUpdateEntries = res.linearizedTemplateEntries.data();
-
-        return res;
     }
 
     void registerDescriptorUpdateTemplate(VkDescriptorUpdateTemplate descriptorUpdateTemplate,

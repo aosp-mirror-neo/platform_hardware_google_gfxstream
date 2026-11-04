@@ -509,13 +509,6 @@ class VkEmulation {
     // caller (the probing image's own DeferredLayoutInfo) already holds.
     void stashPendingDeferredLayoutAhb(const VkImageCreateInfo* imageCreateInfo,
                                        AHardwareBuffer* ahb);
-
-    // Withdraws a previously stashed AHB from the pending pool, releasing the pool's reference.
-    // Must be called once the probing image imports the AHB as its own backing memory: at that
-    // point it is in use, and letting a ColorBuffer adopt it would alias two unrelated images
-    // onto one allocation. No-op if it was already adopted or never stashed.
-    void unstashPendingDeferredLayoutAhb(const VkImageCreateInfo* imageCreateInfo,
-                                         AHardwareBuffer* ahb);
 #endif
 
    private:
@@ -524,12 +517,8 @@ class VkEmulation {
     std::optional<host::RepresentativeColorBufferMemoryTypeInfo>
     findRepresentativeColorBufferMemoryTypeIndexLocked() REQUIRES(mMutex);
 
-    // For a given ImageSupportInfo, populates usageWithExternalHandles and
-    // requiresDedicatedAllocation. memoryTypeBits are populated later once the
-    // device is created, because that needs a test image to be created.
-    // If we don't support external memory, it's assumed dedicated allocations are
-    // not needed.
-    // Precondition: sVkEmulation instance has been created and ext memory caps known.
+    // Populates format and image support properties for a given ImageSupportInfo.
+    // Precondition: sVkEmulation instance has been created and device caps known.
     // Returns false if the query failed.
     bool populateImageFormatExternalMemorySupportInfo(VulkanDispatch* vk, VkPhysicalDevice physdev,
                                                       ImageSupportInfo* info);

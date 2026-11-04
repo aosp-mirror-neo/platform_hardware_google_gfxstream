@@ -25,129 +25,6 @@
 namespace gfxstream {
 namespace host {
 namespace vk {
-namespace {
-using ::testing::_;
-using ::testing::InSequence;
-using ::testing::MockFunction;
-using ::testing::Return;
-using ::testing::Test;
-using ::testing::UnorderedElementsAre;
-
-class VkDecoderGlobalStateExternalFenceTest : public Test {
-protected:
-    class MockDispatch {
-       public:
-        MOCK_METHOD(VkResult, vkGetFenceStatus, (VkDevice device, VkFence fence), ());
-        MOCK_METHOD(VkResult,
-                    vkResetFences,
-                    (VkDevice device, uint32_t numFences, const VkFence* fence),
-                    ());
-    };
-
-    VkDecoderGlobalStateExternalFenceTest()
-        : mDevice(reinterpret_cast<VkDevice>(0x2222'0000)), mPool(&mMockDispatch, mDevice) {}
-
-    ~VkDecoderGlobalStateExternalFenceTest() {
-        mPool.popAll();
-    }
-
-    MockDispatch mMockDispatch;
-    VkDevice mDevice;
-    ExternalFencePool<MockDispatch> mPool;
-};
-
-using VkDecoderGlobalStateExternalFenceDeathTest = VkDecoderGlobalStateExternalFenceTest;
-
-TEST_F(VkDecoderGlobalStateExternalFenceTest, poolNoDeviceFences) {
-    VkFenceCreateInfo createInfo{
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .pNext = 0,
-        .flags = 0,
-    };
-    ASSERT_EQ(VK_NULL_HANDLE, mPool.pop(&createInfo));
-}
-
-TEST_F(VkDecoderGlobalStateExternalFenceTest, poolReuseSignalledFence) {
-    {
-        InSequence s;
-        EXPECT_CALL(mMockDispatch, vkGetFenceStatus(_, _)).WillOnce(Return(VK_SUCCESS));
-        EXPECT_CALL(mMockDispatch, vkResetFences(_, _, _)).WillOnce(Return(VK_SUCCESS));
-    }
-
-    VkFence fence = reinterpret_cast<VkFence>(0x1234'0000);
-    VkFenceCreateInfo createInfo{
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .pNext = 0,
-        .flags = 0,
-    };
-    mPool.add(fence);
-    VkFence reusedFence = mPool.pop(&createInfo);
-
-    ASSERT_EQ(fence, reusedFence);
-}
-
-TEST_F(VkDecoderGlobalStateExternalFenceTest, poolReuseSignalledFenceAsSignaled) {
-    {
-        InSequence s;
-        EXPECT_CALL(mMockDispatch, vkGetFenceStatus(_, _)).WillOnce(Return(VK_SUCCESS));
-        EXPECT_CALL(mMockDispatch, vkResetFences(_, _, _)).Times(0);
-    }
-
-    VkFence fence = reinterpret_cast<VkFence>(0x1234'0000);
-    VkFenceCreateInfo createInfo{
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .pNext = 0,
-        .flags = VK_FENCE_CREATE_SIGNALED_BIT,
-    };
-    mPool.add(fence);
-    VkFence reusedFence = mPool.pop(&createInfo);
-
-    ASSERT_EQ(fence, reusedFence);
-}
-
-TEST_F(VkDecoderGlobalStateExternalFenceTest, poolUnsignalledFence) {
-    {
-        InSequence s;
-        EXPECT_CALL(mMockDispatch, vkGetFenceStatus(_, _)).WillOnce(Return(VK_NOT_READY));
-        EXPECT_CALL(mMockDispatch, vkResetFences(_, _, _)).Times(0);
-    }
-
-    VkFence fence = reinterpret_cast<VkFence>(0x1234'0000);
-    VkFenceCreateInfo createInfo{
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-        .pNext = 0,
-        .flags = 0,
-    };
-    mPool.add(fence);
-
-    ASSERT_EQ(VK_NULL_HANDLE, mPool.pop(&createInfo));
-}
-
-TEST_F(VkDecoderGlobalStateExternalFenceTest, poolPopAll) {
-    VkFence fence1 = reinterpret_cast<VkFence>(0x1234'0000);
-    VkFence fence2 = reinterpret_cast<VkFence>(0x2234'0000);
-    VkFence fence3 = reinterpret_cast<VkFence>(0x3234'0000);
-    mPool.add(fence1);
-    mPool.add(fence2);
-    mPool.add(fence3);
-
-    std::vector<VkFence> result = mPool.popAll();
-    ASSERT_THAT(result, UnorderedElementsAre(fence1, fence2, fence3));
-}
-
-TEST_F(VkDecoderGlobalStateExternalFenceDeathTest, undestroyedFences) {
-    ASSERT_DEATH(
-        {
-            ExternalFencePool<MockDispatch> pool(&mMockDispatch, mDevice);
-            VkFence fence = reinterpret_cast<VkFence>(0x1234'0000);
-            pool.add(fence);
-        },
-        MatchesStdRegex(
-            "External fence pool for VkDevice:0000000022220000|0x22220000 destroyed but 1 "
-            "fences still not destroyed."));
-}
-
-}  // namespace
 
 struct VkDecoderGlobalStateTestPeer {
     VkDecoderGlobalState::Impl impl;
@@ -319,6 +196,89 @@ TEST(VkDecoderGlobalStateBoxedHandleTest, ConcurrentOrderMaintenanceInfoLookupAn
 
     done.store(true, std::memory_order_release);
     reader.join();
+}
+
+// Regression test for b/573373414: the host driver can hand out the same unboxed handle value
+// for a new object right after the previous object was destroyed, and the new boxed handle may be
+// registered before the old boxed handle is removed. Removing the old boxed handle must not drop
+// the reverse mapping owned by the new boxed handle, otherwise unboxed_to_boxed_* lookups fail
+// and (among other things) snapshot dependency tracking for dedicated allocations breaks.
+TEST(BoxedHandleManagerReverseMapTest, RemoveOldBoxedHandleKeepsReusedUnboxedMapping) {
+    VkImage underlying = reinterpret_cast<VkImage>(0x5555'0000);
+
+    VkImage boxedOld = new_boxed_non_dispatchable_VkImage(underlying);
+    ASSERT_NE(VK_NULL_HANDLE, boxedOld);
+    EXPECT_EQ(boxedOld, unboxed_to_boxed_non_dispatchable_VkImage(underlying));
+
+    // Host destroys the old image and immediately reuses the handle value for a new image, whose
+    // boxed handle gets registered before the old boxed handle is deleted.
+    VkImage boxedNew = new_boxed_non_dispatchable_VkImage(underlying);
+    ASSERT_NE(VK_NULL_HANDLE, boxedNew);
+    ASSERT_NE(boxedOld, boxedNew);
+    EXPECT_EQ(boxedNew, unboxed_to_boxed_non_dispatchable_VkImage(underlying));
+
+    delete_VkImage(boxedOld);
+    EXPECT_EQ(nullptr, sBoxedHandleManager.get(reinterpret_cast<uint64_t>(boxedOld)));
+    // The new boxed handle must still be reachable from the (reused) unboxed handle.
+    EXPECT_EQ(boxedNew, unboxed_to_boxed_non_dispatchable_VkImage(underlying));
+
+    delete_VkImage(boxedNew);
+    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkImage(underlying));
+}
+
+TEST(BoxedHandleManagerReverseMapTest, UpdateOldUnboxedDoesNotDropReusedMapping) {
+    VkImage underlyingA = reinterpret_cast<VkImage>(0x6666'0000);
+    VkImage underlyingB = reinterpret_cast<VkImage>(0x7777'0000);
+
+    VkImage boxed1 = new_boxed_non_dispatchable_VkImage(underlyingA);
+    // Another boxed handle takes over underlyingA (reuse) before boxed1 is re-pointed.
+    VkImage boxed2 = new_boxed_non_dispatchable_VkImage(underlyingA);
+    EXPECT_EQ(boxed2, unboxed_to_boxed_non_dispatchable_VkImage(underlyingA));
+
+    set_boxed_non_dispatchable_VkImage(boxed1, underlyingB);
+    EXPECT_EQ(boxed1, unboxed_to_boxed_non_dispatchable_VkImage(underlyingB));
+    // boxed2's mapping for underlyingA must survive boxed1's update.
+    EXPECT_EQ(boxed2, unboxed_to_boxed_non_dispatchable_VkImage(underlyingA));
+
+    delete_VkImage(boxed1);
+    delete_VkImage(boxed2);
+    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkImage(underlyingA));
+    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkImage(underlyingB));
+}
+
+TEST(BoxedHandleManagerReverseMapTest, NullUnboxedHandleIsNeverReverseMapped) {
+    // Boxing VK_NULL_HANDLE must not register key 0 in the reverse map: it could never be erased
+    // (eraseReverseMappingLocked skips 0) and would make lookups of VK_NULL_HANDLE return a
+    // stale boxed handle.
+    VkImage boxedNull = new_boxed_non_dispatchable_VkImage(VK_NULL_HANDLE);
+    ASSERT_NE(VK_NULL_HANDLE, boxedNull);
+    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkImage(VK_NULL_HANDLE));
+
+    VkImage underlying = reinterpret_cast<VkImage>(0x9999'0000);
+    set_boxed_non_dispatchable_VkImage(boxedNull, underlying);
+    EXPECT_EQ(boxedNull, unboxed_to_boxed_non_dispatchable_VkImage(underlying));
+    set_boxed_non_dispatchable_VkImage(boxedNull, VK_NULL_HANDLE);
+    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkImage(underlying));
+    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkImage(VK_NULL_HANDLE));
+
+    delete_VkImage(boxedNull);
+    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkImage(VK_NULL_HANDLE));
+}
+
+TEST(BoxedHandleManagerReverseMapTest, DelayedRemoveClearsReverseMapping) {
+    VkDevice device = reinterpret_cast<VkDevice>(0x1111'0000);
+    VkSampler underlying = reinterpret_cast<VkSampler>(0x8888'0000);
+
+    VkSampler boxed = new_boxed_non_dispatchable_VkSampler(underlying);
+    EXPECT_EQ(boxed, unboxed_to_boxed_non_dispatchable_VkSampler(underlying));
+
+    delayed_delete_VkSampler(boxed, device, nullptr);
+    // Still alive until the delayed removes for the device are processed.
+    EXPECT_EQ(boxed, unboxed_to_boxed_non_dispatchable_VkSampler(underlying));
+
+    sBoxedHandleManager.processDelayedRemoves(device);
+    EXPECT_EQ(nullptr, sBoxedHandleManager.get(reinterpret_cast<uint64_t>(boxed)));
+    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkSampler(underlying));
 }
 
 }  // namespace
