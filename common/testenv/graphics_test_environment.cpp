@@ -19,6 +19,10 @@
 #include <optional>
 #include <string>
 
+#if defined(__linux__) || defined(__APPLE__)
+#include <dlfcn.h>
+#endif
+
 #ifdef BAZEL_CURRENT_REPOSITORY
 #include <rules_cc/cc/runfiles/runfiles.h>
 #endif
@@ -26,11 +30,26 @@
 #include "gfxstream/common/logging.h"
 #include "gfxstream/system/System.h"
 
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+// TSAN reads its suppressions at runtime startup before main() runs.
+// Lavapipe (@mesa//:vulkan_lvp) is built without -fsanitize=thread, and TSAN's
+// POSIX interceptors report false-positive races in lp_fence_destroy() and
+// util_queue_thread_func() (b/573994192, b/579560506).
+extern "C" const char* __tsan_default_suppressions() {
+    return "race:lp_fence_destroy\n"
+           "race:util_queue_thread_func\n";
+}
+#endif
+#endif
+
 namespace gfxstream {
 namespace testing {
 namespace {
 
-#if defined(GFXSTREAM_TESTING_USE_GLES_ANGLE)
+#if defined(GFXSTREAM_TESTING_USE_GLES_ANGLE) || \
+    defined(GFXSTREAM_TESTING_USE_VULKAN_LAVAPIPE) || \
+    defined(GFXSTREAM_TESTING_USE_VULKAN_SWIFTSHADER)
 std::optional<std::filesystem::path> GetGraphicsDriverPath(const std::string& basename) {
 #if defined(BAZEL_CURRENT_REPOSITORY)
     // https://github.com/bazelbuild/rules_cc/blob/main/cc/runfiles/runfiles.h
@@ -49,6 +68,7 @@ std::optional<std::filesystem::path> GetGraphicsDriverPath(const std::string& ba
         return std::nullopt;
     }
     const std::vector<std::string> possiblePaths = {
+        std::string("gfxstream/common/testenv/graphics_test_environment_drivers/") + basename,
         std::string("_main/common/testenv/graphics_test_environment_drivers/") + basename,
     };
     for (const std::string& possiblePath : possiblePaths) {
@@ -64,7 +84,7 @@ std::optional<std::filesystem::path> GetGraphicsDriverPath(const std::string& ba
     return std::nullopt;
 #endif  // defined(BAZEL_CURRENT_REPOSITORY)
 }
-#endif  // defined(GFXSTREAM_TESTING_USE_GLES_ANGLE)
+#endif
 
 }  // namespace
 
@@ -95,14 +115,21 @@ bool SetupGraphicsTestEnvironment() {
     //     gfxstream::base::setEnvironmentVariable("__EGL_VENDOR_LIBRARY_FILENAMES", driverEglIcd);
     //
     // For now, assume the ANGLE libs are directly used:
-    const auto driverGlesOpt = GetGraphicsDriverPath("libGLESv2.so");
+#if defined(__APPLE__)
+    constexpr const char* kGlesDriverBasename = "libGLESv2.dylib";
+    constexpr const char* kEglDriverBasename = "libEGL.dylib";
+#else
+    constexpr const char* kGlesDriverBasename = "libGLESv2.so";
+    constexpr const char* kEglDriverBasename = "libEGL.so";
+#endif
+    const auto driverGlesOpt = GetGraphicsDriverPath(kGlesDriverBasename);
     if (!driverGlesOpt) {
-        GFXSTREAM_ERROR("Failed to find libGLESv2.so.");
+        GFXSTREAM_ERROR("Failed to find %s.", kGlesDriverBasename);
         return false;
     }
-    const auto driverEglOpt = GetGraphicsDriverPath("libEGL.so");
+    const auto driverEglOpt = GetGraphicsDriverPath(kEglDriverBasename);
     if (!driverEglOpt) {
-        GFXSTREAM_ERROR("Failed to find libEGL.so");
+        GFXSTREAM_ERROR("Failed to find %s", kEglDriverBasename);
         return false;
     }
     const std::filesystem::path driverEgl = *driverEglOpt;
@@ -111,6 +138,11 @@ bool SetupGraphicsTestEnvironment() {
     const std::string currentLdLibraryPath = gfxstream::base::getEnvironmentVariable("LD_LIBRARY_PATH");
     const std::string updatedLdLibraryPath = driverDirectory.string() + ":" + currentLdLibraryPath;
     gfxstream::base::setEnvironmentVariable("LD_LIBRARY_PATH", updatedLdLibraryPath);
+    gfxstream::base::setEnvironmentVariable("ANDROID_EMU_HEADLESS", "1");
+#if defined(GFXSTREAM_TESTING_USE_VULKAN_LAVAPIPE) || \
+    defined(GFXSTREAM_TESTING_USE_VULKAN_SWIFTSHADER)
+    gfxstream::base::setEnvironmentVariable("ANGLE_DEFAULT_PLATFORM", "vulkan");
+#endif
 #else
     GFXSTREAM_INFO("GraphicsTestEnvironment: not changing host EGL/GLES driver configuration.");
 #endif  // defined(GFXSTREAM_TESTING_USE_GLES_ANGLE)
@@ -126,9 +158,17 @@ bool SetupGraphicsTestEnvironment() {
 #if defined(GFXSTREAM_TESTING_USE_VULKAN_LAVAPIPE) || defined(GFXSTREAM_TESTING_USE_VULKAN_SWIFTSHADER)
     const std::string driverBasename =
 #if defined(GFXSTREAM_TESTING_USE_VULKAN_LAVAPIPE)
+#if defined(__APPLE__)
+        "libvulkan_lvp.dylib";
+#else
         "libvulkan_lvp.so";
+#endif
 #elif defined(GFXSTREAM_TESTING_USE_VULKAN_SWIFTSHADER)
+#if defined(__APPLE__)
+        "libvk_swiftshader.dylib";
+#else
         "libvk_swiftshader.so";
+#endif
 #else
 #error "Unhandled driver."
 #endif
@@ -147,17 +187,61 @@ bool SetupGraphicsTestEnvironment() {
         GFXSTREAM_ERROR("Failed to find %s", driverBasename.c_str());
         return false;
     }
-    const auto driverIcdOpt = GetGraphicsDriverPath(driverIcdBasename);
+    auto driverIcdOpt = GetGraphicsDriverPath(driverIcdBasename);
+#if defined(GFXSTREAM_TESTING_USE_VULKAN_LAVAPIPE)
+    if (!driverIcdOpt) {
+        driverIcdOpt = GetGraphicsDriverPath("lvp_icd.json");
+    }
+#endif
     if (!driverIcdOpt) {
         GFXSTREAM_ERROR("Failed to find %s", driverIcdBasename.c_str());
         return false;
     }
+
+#if defined(__APPLE__)
+    constexpr const char* kVulkanLoaderBasename = "libvulkan.dylib";
+    constexpr const char* kLlvmLibBasename = "libLLVM.dylib";
+#else
+    constexpr const char* kVulkanLoaderBasename = "libvulkan.so";
+    constexpr const char* kLlvmLibBasename = "libLLVM.so";
+#endif
+    const std::filesystem::path driverDir = driverOpt->parent_path();
+    const std::filesystem::path bundledLoader = driverDir / kVulkanLoaderBasename;
+    if (std::filesystem::exists(bundledLoader)) {
+        gfxstream::base::setEnvironmentVariable("ANDROID_EMU_VK_LOADER_PATH",
+                                                bundledLoader.string());
+    }
+
+#if defined(__linux__) || defined(__APPLE__)
+    const std::filesystem::path llvmLib = driverDir / kLlvmLibBasename;
+    if (std::filesystem::exists(llvmLib)) {
+        if (void* handle = ::dlopen(llvmLib.c_str(), RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE)) {
+            ::dlclose(handle);
+        }
+    }
+    // Pin the software Vulkan ICD in the process address space with RTLD_NODELETE so
+    // it remains mapped across vkDestroyInstance calls and until process exit.
+    if (void* handle = ::dlopen(driverOpt->c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE)) {
+        ::dlclose(handle);
+    }
+#endif
+
     const std::string driverIcd = driverIcdOpt->string();
     gfxstream::base::setEnvironmentVariable("VK_DRIVER_FILES", driverIcd);
     gfxstream::base::setEnvironmentVariable("VK_ICD_FILENAMES", driverIcd);
 #endif  // defined(GFXSTREAM_TESTING_USE_VULKAN_LAVAPIPE) || defined(GFXSTREAM_TESTING_USE_VULKAN_SWIFTSHADER)
 
     return true;
+}
+
+bool IsGraphicsTestEnvironmentProvidingGlesDriver() {
+#if defined(GFXSTREAM_TESTING_USE_GLES_ANGLE)
+    return true;
+#elif defined(GFXSTREAM_TESTING_USE_VULKAN_LAVAPIPE) || defined(GFXSTREAM_TESTING_USE_VULKAN_SWIFTSHADER)
+    return false;
+#else
+    return true;
+#endif
 }
 
 bool IsGraphicsTestEnvironmentProvidingVulkanDriver() {

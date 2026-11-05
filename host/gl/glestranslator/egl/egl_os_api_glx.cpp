@@ -271,7 +271,9 @@ void pixelFormatToConfig(EGLNativeDisplayType dpy,
     }
 
     info.frmt = new GlxPixelFormat(frmt);
-    (*addConfigFunc)(addConfigOpaque, &info);
+    if (!(*addConfigFunc)(addConfigOpaque, &info)) {
+        delete info.frmt;
+    }
 }
 
 // Implementation of EglOS::Context based on GLX.
@@ -537,6 +539,13 @@ public:
             forLive.erase(std::remove(forLive.begin(), forLive.end(), pb), forLive.end());
             return true;
         }
+    }
+
+    bool releaseWindowSurface(EglOS::Surface* s) override {
+        gfxstream::base::AutoLock lock(mPbufLock);
+        mDisabledVsyncWindows.erase(s);
+        delete s;
+        return true;
     }
 
     virtual bool makeCurrent(EglOS::Surface* read,

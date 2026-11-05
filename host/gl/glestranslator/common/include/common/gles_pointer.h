@@ -29,6 +29,10 @@ public:
         ARRAY, BUFFER, VALUE
     };
     GLESpointer() = default;
+    GLESpointer(const GLESpointer& other);
+    GLESpointer& operator=(const GLESpointer& other);
+    GLESpointer(GLESpointer&& other) noexcept;
+    GLESpointer& operator=(GLESpointer&& other) noexcept;
     GLESpointer(gfxstream::Stream* stream);
     void onLoad(gfxstream::Stream* stream);
     GLenum getType() const;
@@ -43,6 +47,7 @@ public:
     GLboolean getNormalized() const { return m_normalize ? GL_TRUE : GL_FALSE; }
     const GLvoid* getData() const;
     GLsizei getDataSize() const { return m_dataSize; }
+    size_t getDataCapacity() const;
     unsigned int getBufferOffset() const;
     void redirectPointerData();
     void getBufferConversions(const RangeList& rl, RangeList& rlOut);
@@ -57,7 +62,7 @@ public:
     void setBuffer(GLint size,
                    GLenum type,
                    GLsizei stride,
-                   GLESbuffer* buf,
+                   ObjectDataPtr bufObj,
                    GLuint bufferName,
                    int offset,
                    bool normalize = false,
@@ -79,8 +84,10 @@ public:
     bool isIntPointer() const;
     void enable(bool b);
     void onSave(gfxstream::Stream* stream) const;
-    void restoreBufferObj(std::function<GLESbuffer*(GLuint)> getBufferObj);
+    void restoreBufferObj(std::function<ObjectDataPtr(GLuint)> getBufferObj);
 private:
+    void rebindArrayData();
+
     GLint m_size = 4;
     GLenum m_type = GL_FLOAT;
     GLsizei m_stride = 0;
@@ -89,6 +96,7 @@ private:
     AttribType m_attribType = ARRAY;
     GLsizei m_dataSize = 0;
     const GLvoid* m_data = nullptr;
+    ObjectDataPtr m_bufferObject;
     GLESbuffer* m_buffer = nullptr;
     GLuint m_bufferName = 0;
     unsigned int m_buffOffset = 0;
@@ -96,9 +104,8 @@ private:
     GLuint m_divisor = 0;
     GLuint m_bindingIndex = 0;
     GLuint m_reloffset = 0;
-    // m_ownData is only used when loading from a snapshot
     std::vector<unsigned char> m_ownData;
     GLsizei m_valueCount = 0;
-    GLfloat m_values[4];
+    GLfloat m_values[4] = {};
 };
 #endif

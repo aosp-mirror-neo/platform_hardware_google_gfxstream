@@ -50,6 +50,7 @@ public:
     } SurfaceType;
 
     explicit Surface(SurfaceType type) : mType(type) {}
+    virtual ~Surface() = default;
 
     SurfaceType type() const { return mType; }
 
@@ -114,12 +115,14 @@ struct ConfigInfo {
     PixelFormat* frmt;
 };
 
-// A callback function type used with Display::queryConfig() to report to the
+// A callback function type used with Display::queryConfigs() to report to the
 // caller a new host EGLConfig.
-// |opaque| is an opaque value passed to queryConfig().
+// |opaque| is an opaque value passed to queryConfigs().
 // All other parameters are config attributes.
-// Note that ownership of |frmt| is transfered to the callback.
-typedef void (AddConfigCallback)(void* opaque, const ConfigInfo* configInfo);
+// Note that ownership of |frmt| is transferred to the callback if it returns
+// true; if it returns false, the caller retains ownership of |frmt| and must
+// delete it.
+typedef bool (AddConfigCallback)(void* opaque, const ConfigInfo* configInfo);
 
 // Pbuffer description.
 // |width| and |height| are its dimensions.
@@ -204,6 +207,11 @@ public:
     virtual EGLDisplay getNative() { return (EGLDisplay)0; }
 
     virtual bool releasePbuffer(Surface* pb) = 0;
+
+    virtual bool releaseWindowSurface(Surface* s) {
+        delete s;
+        return true;
+    }
 
     virtual bool makeCurrent(Surface* read,
                              Surface* draw,

@@ -115,6 +115,12 @@ void VirtioGpuFrontend::teardown() {
         mRenderer->stop(/*wait*/ true);
         mRenderer.reset();
     }
+
+    // sFrontend() is a never-deleted singleton, so any member not reset here
+    // survives into the next stream_renderer_init(). Reset the timelines after
+    // the renderer has stopped so no stale fence/task state (or late completion
+    // callback) lingers across re-initialization.
+    mVirtioGpuTimelines.reset();
 }
 
 int VirtioGpuFrontend::createContext(VirtioGpuCtxId contextId, uint32_t nlen, const char* name,
@@ -1087,7 +1093,14 @@ int VirtioGpuFrontend::snapshot(const char* directory) {
         GFXSTREAM_ERROR("Failed to restore renderer: renderer not available.");
         return -EINVAL;
     }
-    mRenderer->pauseAllPreSave();
+    if (!mRenderer->pauseAllPreSave()) {
+        GFXSTREAM_ERROR("Failed to save snapshot: failed to pause renderer pre-save.");
+        return -ETIMEDOUT;
+    }
+    struct ScopedResume {
+        RendererPtr& renderer;
+        ~ScopedResume() { renderer->resumeAll(); }
+    } scopedResume{mRenderer};
 
     int ret = snapshotRenderer(directory);
     if (ret) {

@@ -62,6 +62,7 @@
 #include "gfxstream/system/System.h"
 #include "host/gl/context_helper.h"
 #include "render-utils/MediaNative.h"
+#include "render-utils/snapshot_operations.h"
 #include "render_thread_info.h"
 #include "sync_thread.h"
 #include "vulkan/display_vk.h"
@@ -131,9 +132,10 @@ static constexpr uint32_t kNumMaxProcessResources = 5000;
 static constexpr uint32_t kNumMaxColorBuffers = 16000;
 
 // Version and magic numbers for framebuffer stream for validity checks.
-// The global snapshot version (e.g. kVersionBase for AEMU) should be updated when changing
-// the framebuffer version to avoid getting errors when loading old, unsupported snapshots.
-static constexpr uint32_t kFramebufferSnapshotVersionNumber = 4;
+// The version lives in render-utils/snapshot_operations.h so that embedders
+// (e.g. AEMU's Snapshot.cpp) can fold it into their top-level snapshot version
+// and reject old snapshots before loading any state.
+static constexpr uint32_t kFramebufferSnapshotVersionNumber = kFramebufferSnapshotVersion;
 static constexpr uint32_t kFramebufferSnapshotMagicNumber = 0xC0FFEEEE;
 
 // A condition variable needed to wait for framebuffer initialization.
@@ -315,6 +317,23 @@ static std::optional<std::array<float, 16>> GetColorTransform(uint32_t displayId
     return matrix;
 }
 
+// Returns the color transform of the display that |colorBuffer| is currently
+// assigned to, falling back to display 0 (since composeWithCallback only calls
+// setDisplayColorBuffer for displayId != 0, primary display 0's color buffers
+// are not tracked in MultiDisplay and get_color_buffer_display returns < 0 for
+// them). On a folded Pixel Fold the posted color buffer belongs to the outer
+// display while display 0 is powered off, so applying display 0's (all-zero)
+// transform would black out the outer display (b/571840024).
+static std::optional<std::array<float, 16>> GetColorTransformForColorBuffer(
+        uint32_t colorBuffer) {
+    uint32_t displayId = 0;
+    if (get_gfxstream_multi_display_operations().get_color_buffer_display(colorBuffer,
+                                                                          &displayId) < 0) {
+        displayId = 0;
+    }
+    return GetColorTransform(displayId);
+}
+
 }  // namespace
 
 static HandleType sNextHandle = 0;
@@ -401,7 +420,8 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
 
     void signalGuestProcessDead(uint64_t puid);
     void enqueueAsyncCleanup(std::function<void()> cleanup);
-    void waitForAllPendingCleanups();
+    bool waitForAllPendingCleanups(
+        std::optional<std::chrono::milliseconds> timeout = std::nullopt);
 
     void readBuffer(HandleType p_buffer, uint64_t offset, uint64_t size, void* bytes);
 
@@ -977,7 +997,10 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
             mCleanupWorker.join();
         }
 
-        void waitForCleanup() { mCleanupWorker.waitQueuedItems(); }
+        bool waitForCleanup(
+            std::optional<std::chrono::milliseconds> timeout = std::nullopt) {
+            return mCleanupWorker.waitQueuedItems(timeout);
+        }
 
        private:
         struct Exit {};
@@ -989,7 +1012,7 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
     ProcessCleanupThread m_processCleanupThread;
 
     // Flag set when emulator is shutting down.
-    bool m_shuttingDown = false;
+    std::atomic_bool m_shuttingDown = false;
 
     // When this feature is enabled, open/close operations from gralloc in guest
     // will no longer control the reference counting of color buffers on host.
@@ -1740,9 +1763,9 @@ WorkerProcessingResult FrameBuffer::Impl::postWorkerFunc(Post& post) {
 }
 
 std::future<void> FrameBuffer::Impl::sendPostWorkerCmd(Post post) {
-    bool expectedPostThreadStarted = false;
-    if (m_postThreadStarted.compare_exchange_strong(expectedPostThreadStarted, true)) {
+    if (!m_postThreadStarted.load(std::memory_order_acquire)) {
         m_postThread.start();
+        m_postThreadStarted.store(true, std::memory_order_release);
     }
 
     bool shouldPostOnlyOnMainThread = postOnlyOnMainThread();
@@ -1785,6 +1808,11 @@ void FrameBuffer::Impl::setPostCallback(Renderer::OnPostCallback onPost, void* o
             GFXSTREAM_ERROR("display %d already configured for recording", displayId);
             return;
         }
+        if (!m_readbackThreadStarted.load(std::memory_order_acquire)) {
+            m_readbackThread.start();
+            m_readbackThread.enqueue({ ReadbackCmd::Init });
+            m_readbackThreadStarted.store(true, std::memory_order_release);
+        }
         m_onPost[displayId].cb = onPost;
         m_onPost[displayId].context = onPostContext;
         m_onPost[displayId].displayId = displayId;
@@ -1792,11 +1820,6 @@ void FrameBuffer::Impl::setPostCallback(Renderer::OnPostCallback onPost, void* o
         m_onPost[displayId].height = h;
         m_onPost[displayId].img = new unsigned char[4 * w * h];
         m_onPost[displayId].readBgra = useBgraReadback;
-        bool expectedReadbackThreadStarted = false;
-        if (m_readbackThreadStarted.compare_exchange_strong(expectedReadbackThreadStarted, true)) {
-            m_readbackThread.start();
-            m_readbackThread.enqueue({ ReadbackCmd::Init });
-        }
         std::future<void> completeFuture = m_readbackThread.enqueue(
             {ReadbackCmd::AddRecordDisplay, displayId, nullptr, 0, w, h});
         completeFuture.wait();
@@ -1813,6 +1836,26 @@ static void subWindowRepaint(void* param) {
     auto fb = static_cast<FrameBuffer*>(param);
     fb->repost();
 }
+
+namespace {
+
+class ScopedPromise {
+   public:
+    ~ScopedPromise() { mPromise.set_value(); }
+    std::future<void> getFuture() { return mPromise.get_future(); }
+    DISALLOW_COPY_ASSIGN_AND_MOVE(ScopedPromise);
+    static std::tuple<std::unique_ptr<ScopedPromise>, std::future<void>> create() {
+        auto scopedPromise = std::unique_ptr<ScopedPromise>(new ScopedPromise());
+        auto future = scopedPromise->mPromise.get_future();
+        return std::make_tuple(std::move(scopedPromise), std::move(future));
+    }
+
+   private:
+    ScopedPromise() = default;
+    std::promise<void> mPromise;
+};
+
+}  // namespace
 
 bool FrameBuffer::Impl::setupSubWindow(FBNativeWindowType p_window, int wx, int wy, int ww, int wh,
                                        int fbw, int fbh, float dpr, float zRot, bool deleteExisting,
@@ -1854,21 +1897,6 @@ bool FrameBuffer::Impl::setupSubWindow(FBNativeWindowType p_window, int wx, int 
         return true;
     }
 
-    class ScopedPromise {
-       public:
-        ~ScopedPromise() { mPromise.set_value(); }
-        std::future<void> getFuture() { return mPromise.get_future(); }
-        DISALLOW_COPY_ASSIGN_AND_MOVE(ScopedPromise);
-        static std::tuple<std::unique_ptr<ScopedPromise>, std::future<void>> create() {
-            auto scopedPromise = std::unique_ptr<ScopedPromise>(new ScopedPromise());
-            auto future = scopedPromise->mPromise.get_future();
-            return std::make_tuple(std::move(scopedPromise), std::move(future));
-        }
-
-       private:
-        ScopedPromise() = default;
-        std::promise<void> mPromise;
-    };
     std::unique_ptr<ScopedPromise> postWorkerContinueSignal;
     std::future<void> postWorkerContinueSignalFuture;
     std::tie(postWorkerContinueSignal, postWorkerContinueSignalFuture) = ScopedPromise::create();
@@ -2035,6 +2063,16 @@ bool FrameBuffer::Impl::removeSubWindow() {
     AutoLock lock(sGlobals()->lock);
     sInitialized.store(false, std::memory_order_relaxed);
     sGlobals()->condVar.broadcastAndUnlock(&lock);
+
+    std::unique_ptr<ScopedPromise> postWorkerContinueSignal;
+    std::future<void> postWorkerContinueSignalFuture;
+    std::tie(postWorkerContinueSignal, postWorkerContinueSignalFuture) = ScopedPromise::create();
+    {
+        blockPostWorker(std::move(postWorkerContinueSignalFuture)).wait();
+    }
+    if (m_displayVk) {
+        m_displayVk->drainQueues();
+    }
 
     AutoLock mutex(m_lock);
     return removeSubWindow_locked();
@@ -2441,8 +2479,9 @@ void FrameBuffer::Impl::enqueueAsyncCleanup(std::function<void()> cleanup) {
     m_processCleanupThread.enqueueCleanup(std::move(cleanup));
 }
 
-void FrameBuffer::Impl::waitForAllPendingCleanups() {
-    m_processCleanupThread.waitForCleanup();
+bool FrameBuffer::Impl::waitForAllPendingCleanups(
+    std::optional<std::chrono::milliseconds> timeout) {
+    return m_processCleanupThread.waitForCleanup(timeout);
 }
 
 void FrameBuffer::Impl::cleanupGuestProcess(uint64_t puid,
@@ -2459,10 +2498,10 @@ void FrameBuffer::Impl::cleanupGuestProcess(uint64_t puid,
                     renderThreadWithThisPuidExists = true;
                 }
             });
-        if (renderThreadWithThisPuidExists) {
+        if (renderThreadWithThisPuidExists && !m_shuttingDown) {
             gfxstream::base::sleepUs(10000);
         }
-    } while (renderThreadWithThisPuidExists);
+    } while (renderThreadWithThisPuidExists && !m_shuttingDown);
 
     AutoLock mutex(m_lock);
 
@@ -2580,7 +2619,7 @@ void FrameBuffer::Impl::readColorBufferDeprecated(HandleType colorbuffer, int x,
         return;
     }
     auto format = *formatOpt;
-    readColorBuffer(colorbuffer, x, y, width, height, format, pixels);
+    readColorBuffer(colorbuffer, x, y, width, height, format, pixels, pixelsSize);
 }
 
 void FrameBuffer::Impl::readColorBufferYUV(HandleType p_colorbuffer, int x, int y, int width,
@@ -2732,7 +2771,7 @@ AsyncResult FrameBuffer::Impl::postImpl(HandleType p_colorbuffer, Post::Completi
         postCmd.cmd = PostCmd::Post;
         postCmd.cb = colorBuffer.get();
         postCmd.cbHandle = p_colorbuffer;
-        postCmd.colorTransform = GetColorTransform();
+        postCmd.colorTransform = GetColorTransformForColorBuffer(p_colorbuffer);
         postCmd.completionCallback = std::make_unique<Post::CompletionCallback>(callback);
         sendPostWorkerCmd(std::move(postCmd));
         ret = AsyncResult::OK_AND_CALLBACK_SCHEDULED;
@@ -3063,7 +3102,7 @@ int FrameBuffer::Impl::getScreenshot(unsigned int nChannels, unsigned int* width
     scrCmd.screenshot.pixelsFormat = format;
     scrCmd.screenshot.pixels = pixels;
     scrCmd.screenshot.rect = rect;
-    scrCmd.colorTransform = GetColorTransform();
+    scrCmd.colorTransform = GetColorTransformForColorBuffer(cb);
 
     std::future<void> completeFuture = sendPostWorkerCmd(std::move(scrCmd));
 
@@ -4786,7 +4825,10 @@ void FrameBuffer::enqueueAsyncCleanup(std::function<void()> cleanup) {
     mImpl->enqueueAsyncCleanup(std::move(cleanup));
 }
 
-void FrameBuffer::waitForAllPendingCleanups() { mImpl->waitForAllPendingCleanups(); }
+bool FrameBuffer::waitForAllPendingCleanups(
+    std::optional<std::chrono::milliseconds> timeout) {
+    return mImpl->waitForAllPendingCleanups(timeout);
+}
 
 void FrameBuffer::readBuffer(HandleType p_buffer, uint64_t offset, uint64_t size, void* bytes) {
     mImpl->readBuffer(p_buffer, offset, size, bytes);

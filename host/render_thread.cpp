@@ -197,6 +197,15 @@ void RenderThread::save(gfxstream::Stream* stream) {
     }
 }
 
+void RenderThread::waitForPausePreSnapshot() {
+    AutoLock lock(mLock);
+    if (mState != SnapshotState::StartSaving &&
+        mState != SnapshotState::InProgress) {
+        return;
+    }
+    waitForSnapshotCompletion(&lock);
+}
+
 void RenderThread::waitForSnapshotCompletion(AutoLock* lock) {
     while (mState != SnapshotState::Finished &&
            !mFinished.load(std::memory_order_relaxed)) {
@@ -243,6 +252,14 @@ bool RenderThread::loadSnapshot(const SnapshotObjects& objects) {
 
 bool RenderThread::saveSnapshot(const SnapshotObjects& objects) {
     return doSnapshotOp(objects, SnapshotState::StartSaving, [this, &objects] {
+#if GFXSTREAM_ENABLE_HOST_GLES
+        // Make sure everything this thread submitted to the GPU has landed
+        // before FrameBuffer::onSave reads textures back from its own
+        // context; see RenderThreadInfoGl::finishBeforeSnapshot().
+        if (objects.threadInfo->m_glInfo) {
+            objects.threadInfo->m_glInfo->finishBeforeSnapshot();
+        }
+#endif
         objects.readBuffer->onSave(&*mStream);
         if (objects.channelStream) objects.channelStream->save(&*mStream);
         if (objects.ringStream) objects.ringStream->save(&*mStream);
@@ -468,9 +485,17 @@ intptr_t RenderThread::main() {
                 tInfo->setPuid(mContextId);
             }
 
-            if (!processResources && tInfo->m_puid && tInfo->m_puid != INVALID_CONTEXT_ID) {
-                processResources = FrameBuffer::getFB()->getProcessResources(tInfo->m_puid);
-                tInfo->setProcessResources(processResources);
+            if (!processResources) {
+                // With virtio-gpu, process resources are keyed by the context id. m_puid may
+                // have been overwritten by rcSetPuid() with an unrelated GLProcessPipe id.
+                const uint64_t processResourcesId =
+                    (mContextId && mContextId != INVALID_CONTEXT_ID) ? mContextId
+                                                                    : tInfo->m_puid;
+                if (processResourcesId && processResourcesId != INVALID_CONTEXT_ID) {
+                    processResources =
+                        FrameBuffer::getFB()->getProcessResources(processResourcesId);
+                    tInfo->setProcessResources(processResources);
+                }
             }
 
             progress = false;
