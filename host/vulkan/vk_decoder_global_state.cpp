@@ -930,7 +930,7 @@ class VkDecoderGlobalState::Impl {
             const auto& deviceInfo = gfxstream::base::find(mDeviceInfo, device);
             VulkanDispatch* dvk = dispatch_VkDevice(deviceInfo->boxed);
             if (VK_NOT_READY == dvk->vkGetFenceStatus(device, fence.first)) {
-                unsignaledFencesBoxed.push_back(fence.second.boxed);
+                unsignaledFencesBoxed.push_back(fence.second.boxed.value());
             }
         }
         stream->putBe64(unsignaledFencesBoxed.size());
@@ -3484,7 +3484,7 @@ class VkDecoderGlobalState::Impl {
             if (fenceInfo.device == device) {
                 destroyFenceWithExclusiveInfo(device, deviceDispatch, deviceInfo, fence, fenceInfo,
                                               /*allowExternalFenceRecycling=*/false);
-                delete_VkFence(fenceInfo.boxed);
+                delete_VkFence(fenceInfo.boxed.value());
                 fenceInfoIt = fenceInfos.erase(fenceInfoIt);
             } else {
                 ++fenceInfoIt;
@@ -4570,7 +4570,7 @@ class VkDecoderGlobalState::Impl {
             fenceInfo.vk = vk;
 
             *pFence = new_boxed_non_dispatchable_VkFence(*pFence);
-            fenceInfo.boxed = *pFence;
+            fenceInfo.boxed = Boxed<VkFence>(*pFence);
             fenceInfo.external = exportSyncFd;
 
             if (localCreateInfo.flags & VK_FENCE_CREATE_SIGNALED_BIT) {
@@ -4712,11 +4712,11 @@ class VkDecoderGlobalState::Impl {
                 auto& fenceInfo = mFenceInfo[replacement];
                 fenceInfo.device = device;
                 fenceInfo.vk = vk;
-                fenceInfo.boxed = boxed_fence;
+                fenceInfo.boxed = Boxed<VkFence>(boxed_fence);
                 fenceInfo.external = true;
                 fenceInfo.state = FenceInfo::State::kNotWaitable;
 
-                mFenceInfo[fence].boxed = VK_NULL_HANDLE;
+                mFenceInfo[fence].boxed = {};
             }
         }
 
@@ -5130,7 +5130,7 @@ class VkDecoderGlobalState::Impl {
                                                      DeviceInfo& deviceInfo, VkFence fence,
                                                      FenceInfo& fenceInfo,
                                                      bool allowExternalFenceRecycling) {
-        fenceInfo.boxed = VK_NULL_HANDLE;
+        fenceInfo.boxed = {};
 
         // External fences are just slated for recycling. This addresses known
         // behavior where the guest might destroy the fence prematurely. b/228221208
@@ -10529,10 +10529,10 @@ class VkDecoderGlobalState::Impl {
     }
 
 
-    AsyncResult registerQsriCallback(VkImage boxed_image, VkQsriTimeline::Callback callback) {
+    AsyncResult registerQsriCallback(Boxed<VkImage> boxed_image, VkQsriTimeline::Callback callback) {
         std::lock_guard<std::mutex> lock(mMutex);
 
-        VkImage image = try_unbox_VkImage(boxed_image);
+        VkImage image = try_unbox_VkImage(boxed_image.value());
         if (image == VK_NULL_HANDLE) return AsyncResult::FAIL_AND_CALLBACK_NOT_SCHEDULED;
 
         auto imageInfoIt = mImageInfo.find(image);
@@ -13633,12 +13633,12 @@ VkResult VkDecoderGlobalState::on_vkSetDebugUtilsObjectTagEXT(
 
 void VkDecoderGlobalState::on_DeviceLost() { mImpl->on_DeviceLost(); }
 
-VkResult VkDecoderGlobalState::waitForFence(VkFence boxed_fence, uint64_t timeout) {
-    VkFence fence = unbox_VkFence(boxed_fence);
+VkResult VkDecoderGlobalState::waitForFence(Boxed<VkFence> boxed_fence, uint64_t timeout) {
+    VkFence fence = unbox_VkFence(boxed_fence.value());
     return mImpl->waitForFence(fence, timeout);
 }
 
-AsyncResult VkDecoderGlobalState::registerQsriCallback(VkImage image,
+AsyncResult VkDecoderGlobalState::registerQsriCallback(Boxed<VkImage> image,
                                                        VkQsriTimeline::Callback callback) {
     return mImpl->registerQsriCallback(image, std::move(callback));
 }
