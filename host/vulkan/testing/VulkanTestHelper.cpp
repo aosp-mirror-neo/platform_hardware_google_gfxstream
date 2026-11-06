@@ -15,7 +15,6 @@
 #include "VulkanTestHelper.h"
 
 #include "gfxstream/common/logging.h"
-#include "gfxstream/common/testing/graphics_test_environment.h"
 
 namespace gfxstream {
 namespace host {
@@ -26,11 +25,6 @@ namespace {
 using ::gfxstream::base::BumpPool;
 
 bool validationErrorsFound = false;
-
-VulkanDispatch* getTestVulkanDispatch() {
-    gfxstream::testing::SetupGraphicsTestEnvironment();
-    return vkDispatch(!gfxstream::testing::IsGraphicsTestEnvironmentProvidingVulkanDriver());
-}
 
 // Called back by the Vulkan validation layer in case of a validation error
 VKAPI_ATTR VkBool32 VKAPI_CALL validationCallback(
@@ -43,67 +37,12 @@ VKAPI_ATTR VkBool32 VKAPI_CALL validationCallback(
     return VK_FALSE;
 }
 
-class TestGlobalState : public gfxstream::host::GlobalState {
-   public:
-    IColorBufferRef findColorBuffer(uint32_t) override { return nullptr; }
-    void openColorBufferByWindow(uint32_t) override {}
-    bool closeColorBufferByWindow(uint32_t) override { return false; }
-    uint32_t genHandleLocked() override { return ++mNextHandle; }
-
-    bool registerProcessCleanupCallback(void*, uint64_t, std::function<void()>) override {
-        return true;
-    }
-    bool unregisterProcessCleanupCallback(void*) override { return true; }
-    std::shared_ptr<const ProcessResources> getProcessResources(uint64_t) override {
-        return nullptr;
-    }
-
-    gfxstream::base::Lock& getGlobalLock() override { return mGlobalLock; }
-    void lockGlobalState() override ACQUIRE(getGlobalLock()) { mGlobalLock.lock(); }
-    void unlockGlobalState() override RELEASE(getGlobalLock()) { mGlobalLock.unlock(); }
-
-    int getColorBufferScreenshot(IColorBuffer*, int, int, int, GfxstreamFormat, void*, const Rect&,
-                                 const std::optional<std::array<float, 16>>&) override {
-        return -1;
-    }
-
-    float getDpr() const override { return 1.0f; }
-    int windowWidth() const override { return 0; }
-    int windowHeight() const override { return 0; }
-    float getPx() const override { return 0.0f; }
-    float getPy() const override { return 0.0f; }
-    int getZrot() const override { return 0; }
-
-    bool bindContext(uint32_t, uint32_t, uint32_t) override { return false; }
-
-    void invalidateColorBuffer(uint32_t) override {}
-    void flushColorBuffer(uint32_t) override {}
-    void flushColorBufferFromBytes(uint32_t, const void*, size_t) override {}
-
-    CancelableFuture scheduleAsyncWork(std::function<void()> work, std::string_view) override {
-        AutoCancelingPromise promise;
-        CancelableFuture future = promise.GetFuture();
-        if (work) {
-            work();
-        }
-        promise.MarkComplete();
-        return future;
-    }
-
-   private:
-    gfxstream::base::Lock mGlobalLock;
-    uint32_t mNextHandle = 0;
-};
-
-std::unique_ptr<VkEmulation> createTestVkEmulation(VulkanDispatch* vk,
-                                                   gfxstream::host::GlobalState* globalState) {
+gfxstream::host::FeatureSet getGfxstreamFeatures() {
     gfxstream::host::FeatureSet features;
     // Enable so that we can have VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
     features.GlDirectMem.setEnabled(true);
     features.VulkanAstcEmulation.setEnabled(true);
-    auto vkEmu = VkEmulation::create(vk, globalState, features);
-    VkDecoderGlobalState::initialize(vkEmu.get());
-    return vkEmu;
+    return features;
 }
 
 }  // namespace
@@ -112,10 +51,9 @@ std::mutex VulkanTestHelper::mMutex;
 
 VulkanTestHelper::VulkanTestHelper()
     : mLock(mMutex),
-      mVk(getTestVulkanDispatch()),
+      mVk(vkDispatch(/*forTesting=*/true)),
       mLogger(),
-      mGlobalState(std::make_unique<TestGlobalState>()),
-      mVkEmu(createTestVkEmulation(mVk, mGlobalState.get())),
+      mVkEmu(VkEmulation::create(mVk, {}, getGfxstreamFeatures())),
       mBp(std::make_unique<BumpPool>()),
       mDecoderContext(VkDecoderContext{
           .processName = "vulkan_test",
@@ -123,9 +61,6 @@ VulkanTestHelper::VulkanTestHelper()
       }),
       mTestDispatch(mVk, mBp.get(), &mDecoderContext) {
     validationErrorsFound = false;
-    if (!RenderThreadInfoVk::get()) {
-        mRenderThreadInfo = std::make_unique<RenderThreadInfoVk>();
-    }
 }
 
 void VulkanTestHelper::destroy() {
@@ -146,10 +81,8 @@ void VulkanTestHelper::destroy() {
     mInstance = VK_NULL_HANDLE;
     mDebugMessenger = VK_NULL_HANDLE;
 
-    mRenderThreadInfo.reset();
     VkDecoderGlobalState::reset();
     mVkEmu.reset();
-    mGlobalState.reset();
 }
 
 VulkanTestHelper::~VulkanTestHelper() {
@@ -162,9 +95,9 @@ VulkanTestHelper::~VulkanTestHelper() {
 void VulkanTestHelper::initialize(const InitializationOptions& options) {
     mVkEmu->initFeatures(VkEmulation::Features{});
 
-    // Check if the validation layer is present
+    // Check that the validation layer is present
     const char* validationLayer = "VK_LAYER_KHRONOS_validation";
-    uint32_t layerCount = 0;
+    uint32_t layerCount;
     vk().vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
     std::vector<VkLayerProperties> availableLayers(layerCount);
     vk().vkEnumerateInstanceLayerProperties(&layerCount, availableLayers.data());
@@ -177,7 +110,7 @@ void VulkanTestHelper::initialize(const InitializationOptions& options) {
         }
     }
     if (!layerFound) {
-        GFXSTREAM_WARNING("Vulkan Validation Layer not found; running test without VVL");
+        GFXSTREAM_FATAL("Vulkan Validation Layer not found");
     }
 
     // Create the instance
@@ -199,30 +132,25 @@ void VulkanTestHelper::initialize(const InitializationOptions& options) {
         .pfnUserCallback = validationCallback,
     };
 
-    std::vector<const char*> extensions;
-    if (layerFound) {
-        extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-    }
+    std::vector<const char*> extensions = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
     for (const auto& extName : options.enabledExtensions) {
         extensions.push_back(extName.c_str());
     }
 
     VkInstanceCreateInfo createInfo = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        .pNext = layerFound ? &debugCreateInfo : nullptr,
+        .pNext = (VkDebugUtilsMessengerCreateInfoEXT*)&debugCreateInfo,
         .pApplicationInfo = options.appInfo ? &options.appInfo.value() : &defaultAppInfo,
-        .enabledLayerCount = layerFound ? 1u : 0u,
-        .ppEnabledLayerNames = layerFound ? &validationLayer : nullptr,
+        .enabledLayerCount = 1,
+        .ppEnabledLayerNames = &validationLayer,
         .enabledExtensionCount = static_cast<uint32_t>(extensions.size()),
         .ppEnabledExtensionNames = extensions.data(),
     };
     VK_CHECK(vk().vkCreateInstance(&createInfo, nullptr, &mInstance));
 
-    if (layerFound) {
-        // Setup validation layer callbacks
-        VK_CHECK(vk().vkCreateDebugUtilsMessengerEXT(mInstance, &debugCreateInfo, nullptr,
-                                                     &mDebugMessenger));
-    }
+    // Setup validation layer callbacks
+    VK_CHECK(vk().vkCreateDebugUtilsMessengerEXT(mInstance, &debugCreateInfo, nullptr,
+                                                 &mDebugMessenger));
 
     // Pick a physical device
     uint32_t deviceCount = 0;
@@ -249,8 +177,8 @@ void VulkanTestHelper::initialize(const InitializationOptions& options) {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &queueCreateInfo,
-        .enabledLayerCount = layerFound ? 1u : 0u,
-        .ppEnabledLayerNames = layerFound ? &validationLayer : nullptr,
+        .enabledLayerCount = 1,
+        .ppEnabledLayerNames = &validationLayer,
         .pEnabledFeatures = &options.deviceFeatures,
     };
     VK_CHECK(vk().vkCreateDevice(mPhysicalDevice, &deviceCreateInfo, nullptr, &mDevice));

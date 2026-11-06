@@ -7024,12 +7024,6 @@ class VkDecoderGlobalState::Impl {
         dispatchCmdPipelineBarrier2(&dependencyInfo);
     }
 
-    void on_vkCmdPipelineBarrier2KHR(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                     VkCommandBuffer boxed_commandBuffer,
-                                     const VkDependencyInfo* pDependencyInfo) {
-        on_vkCmdPipelineBarrier2(pool, {}, boxed_commandBuffer, pDependencyInfo);
-    }
-
     void on_vkCmdWaitEvents(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
                             VkCommandBuffer boxed_commandBuffer, uint32_t eventCount,
                             const VkEvent* pEvents, VkPipelineStageFlags srcStageMask,
@@ -7064,67 +7058,9 @@ class VkDecoderGlobalState::Impl {
         processImageMemoryBarrierLocked(commandBuffer, imageMemoryBarrierCount,
                                         pImageMemoryBarriers);
 
-        CommandBufferInfo* cmdBufferInfo = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
-        DeviceInfo* deviceInfo =
-            cmdBufferInfo ? gfxstream::base::find(mDeviceInfo, cmdBufferInfo->device) : nullptr;
-        if (!deviceInfo || (!deviceInfo->emulateTextureEtc2 && !deviceInfo->emulateTextureAstc)) {
-            vk->vkCmdWaitEvents(commandBuffer, eventCount, pEvents, srcStageMask, dstStageMask,
-                                memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount,
-                                pBufferMemoryBarriers, imageMemoryBarrierCount,
-                                pImageMemoryBarriers);
-            return;
-        }
-
-        std::vector<VkImageMemoryBarrier> waitImageBarriers;
-        std::vector<std::pair<CompressedImageInfo*, VkImageMemoryBarrier>> barriersToDecompress;
-
-        for (uint32_t i = 0; i < imageMemoryBarrierCount; i++) {
-            const VkImageMemoryBarrier& srcBarrier = pImageMemoryBarriers[i];
-            auto* imageInfo = gfxstream::base::find(mImageInfo, srcBarrier.image);
-            bool needGpuDecompression = false;
-            if (imageInfo && imageInfo->compressInfo) {
-                needGpuDecompression =
-                    !imageInfo->compressInfo->isAstc() || !deviceInfo->useAstcCpuDecompression;
-            }
-            if (!needGpuDecompression) {
-                waitImageBarriers.push_back(srcBarrier);
-                continue;
-            }
-
-            if (imageInfo->compressInfo->willDecompress(srcBarrier)) {
-                barriersToDecompress.emplace_back(imageInfo->compressInfo.get(), srcBarrier);
-            } else {
-                imageInfo->compressInfo->decompressIfNeeded(
-                    vk, commandBuffer, srcStageMask, dstStageMask, srcBarrier, waitImageBarriers);
-            }
-        }
-
-        VkPipelineStageFlags waitDstStageMask =
-            barriersToDecompress.empty() ? dstStageMask
-                                         : (dstStageMask | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-        vk->vkCmdWaitEvents(commandBuffer, eventCount, pEvents, srcStageMask, waitDstStageMask,
+        vk->vkCmdWaitEvents(commandBuffer, eventCount, pEvents, srcStageMask, dstStageMask,
                             memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount,
-                            pBufferMemoryBarriers, waitImageBarriers.size(),
-                            waitImageBarriers.data());
-
-        bool needRebind = false;
-        std::vector<VkImageMemoryBarrier> unusedBarriers;
-        for (const auto& [compressInfo, srcBarrier] : barriersToDecompress) {
-            needRebind |= compressInfo->decompressIfNeeded(
-                vk, commandBuffer, srcStageMask, dstStageMask, srcBarrier, unusedBarriers);
-        }
-
-        if (needRebind && cmdBufferInfo->computePipeline) {
-            vk->vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                  cmdBufferInfo->computePipeline);
-            if (!cmdBufferInfo->currentDescriptorSets.empty()) {
-                vk->vkCmdBindDescriptorSets(
-                    commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, cmdBufferInfo->descriptorLayout,
-                    cmdBufferInfo->firstSet, cmdBufferInfo->currentDescriptorSets.size(),
-                    cmdBufferInfo->currentDescriptorSets.data(),
-                    cmdBufferInfo->dynamicOffsets.size(), cmdBufferInfo->dynamicOffsets.data());
-            }
-        }
+                            pBufferMemoryBarriers, imageMemoryBarrierCount, pImageMemoryBarriers);
     }
 
     void on_vkCmdWaitEvents2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
@@ -9259,16 +9195,15 @@ class VkDecoderGlobalState::Impl {
             std::lock_guard<std::mutex> lock(mMutex);
             auto* cmdBufferInfo = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
             if (cmdBufferInfo) {
+                cmdBufferInfo->descriptorLayout = layout;
+
                 cmdBufferInfo->allDescriptorSets.insert(pDescriptorSets,
                                                         pDescriptorSets + descriptorSetCount);
-                if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
-                    cmdBufferInfo->descriptorLayout = layout;
-                    cmdBufferInfo->firstSet = firstSet;
-                    cmdBufferInfo->currentDescriptorSets.assign(
-                        pDescriptorSets, pDescriptorSets + descriptorSetCount);
-                    cmdBufferInfo->dynamicOffsets.assign(pDynamicOffsets,
-                                                         pDynamicOffsets + dynamicOffsetCount);
-                }
+                cmdBufferInfo->firstSet = firstSet;
+                cmdBufferInfo->currentDescriptorSets.assign(pDescriptorSets,
+                                                            pDescriptorSets + descriptorSetCount);
+                cmdBufferInfo->dynamicOffsets.assign(pDynamicOffsets,
+                                                     pDynamicOffsets + dynamicOffsetCount);
             }
         }
     }

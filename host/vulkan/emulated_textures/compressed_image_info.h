@@ -19,7 +19,6 @@
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "emulated_textures/astc_texture.h"
@@ -83,8 +82,6 @@ class CompressedImageInfo {
     // Returns whether image decompression happened.
     // Note: the global lock must be held when calling this method, because we call into
     // GpuDecompressionPipelineManager.
-    bool willDecompress(const VkImageMemoryBarrier& targetBarrier) const;
-
     bool decompressIfNeeded(VulkanDispatch* vk, VkCommandBuffer commandBuffer,
                             VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask,
                             const VkImageMemoryBarrier& targetBarrier,
@@ -129,26 +126,6 @@ class CompressedImageInfo {
     }
 
    private:
-    struct SubresourceViewKey {
-        uint32_t mipLevel;
-        uint32_t baseLayer;
-        uint32_t layerCount;
-
-        bool operator==(const SubresourceViewKey& other) const {
-            return mipLevel == other.mipLevel && baseLayer == other.baseLayer &&
-                   layerCount == other.layerCount;
-        }
-    };
-
-    struct SubresourceViewKeyHash {
-        size_t operator()(const SubresourceViewKey& key) const {
-            size_t h = key.mipLevel;
-            h = h * 31 + key.baseLayer;
-            h = h * 31 + key.layerCount;
-            return h;
-        }
-    };
-
     // Returns a vector of image barriers for the compressed mipmap images and the decompressed
     // image.
     std::vector<VkImageMemoryBarrier> getImageBarriers(const VkImageMemoryBarrier& srcBarrier);
@@ -158,9 +135,6 @@ class CompressedImageInfo {
     // Initializes the compute shader pipeline to decompress the image.
     // No-op if this was already called successfully.
     VkResult initializeDecompressionPipeline(VulkanDispatch* vk, VkDevice device);
-
-    VkDescriptorSet getDecompDescriptorSet(VulkanDispatch* vk, uint32_t mipLevel,
-                                           uint32_t baseLayer, uint32_t layerCount);
 
     // Runs the decompression shader
     void decompress(VulkanDispatch* vk, VkCommandBuffer commandBuffer,
@@ -210,9 +184,7 @@ class CompressedImageInfo {
     GpuDecompressionPipelineManager* mPipelineManager = nullptr;
     GpuDecompressionPipeline* mDecompPipeline = nullptr;
     std::vector<VkDescriptorSet> mDecompDescriptorSets;
-    std::unordered_map<SubresourceViewKey, VkDescriptorSet, SubresourceViewKeyHash>
-        mSubresourceDecompDescriptorSets;
-    std::vector<VkDescriptorPool> mDecompDescriptorPools;
+    VkDescriptorPool mDecompDescriptorPool = VK_NULL_HANDLE;
     std::vector<VkImageView> mCompressedMipmapsImageViews;
     std::vector<VkImageView> mOutputImageViews;
     bool mDecompPipelineInitialized = false;
