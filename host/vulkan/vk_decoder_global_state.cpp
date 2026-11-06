@@ -343,8 +343,8 @@ class VkDecoderGlobalState::Impl {
         mDisableSparseBindingSupport = false;
 #ifdef CONFIG_AEMU
         if (!m_vkEmulation->getFeatures().BypassVulkanDeviceFeatureOverrides.enabled()) {
-            // TODO(b/407982047) Disable sparse binding features on Android
-            // These are not supported widely on real devices and causes crashes
+            // Sparse binding features are disabled on Android as they lack widespread
+            // physical device support and can cause host crashes. See b/407982047 for context.
             GFXSTREAM_INFO("Disabling sparse binding feature support");
             mDisableSparseBindingSupport = true;
         }
