@@ -30,6 +30,17 @@ struct ShaderData {
     const size_t size;     // size of the code in bytes
 };
 
+struct Etc2PushConstant {
+    uint32_t compFormat;
+    uint32_t baseLayer;
+};
+
+struct AstcPushConstant {
+    uint32_t blockSize[2];
+    uint32_t baseLayer;
+    uint32_t smallBlock;
+};
+
 // Holds the Vulkan resources for the GPU decompression pipeline of a given emulated texture format.
 // GpuDecompressionPipeline should be reused, use GpuDecompressionPipelineManager for that.
 class GpuDecompressionPipeline {
@@ -104,36 +115,16 @@ class GpuDecompressionPipelineManager {
     GpuDecompressionPipelineManager& operator=(const GpuDecompressionPipelineManager&) = delete;
 
    private:
-    struct PipelineKey {
-        VkFormat format;
-        VkImageType imageType;
-        AstcDecoder astcDecoder;
-
-        bool operator==(const PipelineKey& other) const {
-            return format == other.format && imageType == other.imageType &&
-                   astcDecoder == other.astcDecoder;
-        }
-    };
-
-    struct PipelineKeyHash {
-        size_t operator()(const PipelineKey& key) const {
-            size_t h = static_cast<size_t>(key.format);
-            h = h * 31 + static_cast<size_t>(key.imageType);
-            h = h * 31 + static_cast<size_t>(key.astcDecoder);
-            return h;
-        }
-    };
-
     VkDescriptorSetLayout getDescriptorSetLayout();
-    VkPipelineLayout getPipelineLayout();
+    VkPipelineLayout getPipelineLayout(VkFormat format);
 
-    std::unordered_map<PipelineKey, std::unique_ptr<GpuDecompressionPipeline>, PipelineKeyHash>
-        mPipelines;
+    std::unordered_map<const ShaderData*, std::unique_ptr<GpuDecompressionPipeline>> mPipelines;
 
     VulkanDispatch* mVk = nullptr;
     VkDevice mDevice = VK_NULL_HANDLE;
     VkDescriptorSetLayout mDescriptorSetLayout = VK_NULL_HANDLE;
-    VkPipelineLayout mPipelineLayout = VK_NULL_HANDLE;
+    VkPipelineLayout mAstcPipelineLayout = VK_NULL_HANDLE;
+    VkPipelineLayout mEtc2PipelineLayout = VK_NULL_HANDLE;
 };
 
 }  // namespace vk
