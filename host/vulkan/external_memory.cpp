@@ -57,7 +57,6 @@ bool ExternalMemory::modeSupported(const ExternalMemory::Mode mode,
     std::vector<const char*> extRequired;
     getDeviceExtensionsForMode(mode, extRequired);
     if (mode == Mode::HostAllocation) {
-        // TODO(b/469094646): Check this during the initial gpu selection
         // Host allocation mode is designed for software renderers and only supported
         // if there is only a single type of memory. Some drivers may still report
         // invalid memory indices due to bugs in the extension's implementation, but
