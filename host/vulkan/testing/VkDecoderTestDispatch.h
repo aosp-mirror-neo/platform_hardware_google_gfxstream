@@ -45,6 +45,13 @@ class VkDecoderTestDispatch {
                                                  pAllocateInfo, pCommandBuffers);
     }
 
+    VkResult vkAllocateDescriptorSets(VkDevice device,
+                                      const VkDescriptorSetAllocateInfo* pAllocateInfo,
+                                      VkDescriptorSet* pDescriptorSets) {
+        return mDgs->on_vkAllocateDescriptorSets(mBp, kInvalidSnapshotApiCallHandle, device,
+                                                 pAllocateInfo, pDescriptorSets);
+    }
+
     VkResult vkAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* pAllocateInfo,
                               const VkAllocationCallbacks* pAllocator, VkDeviceMemory* pMemory) {
         return mDgs->on_vkAllocateMemory(mBp, kInvalidSnapshotApiCallHandle, device, pAllocateInfo,
@@ -69,6 +76,28 @@ class VkDecoderTestDispatch {
         return mDgs->on_vkBindImageMemory(mBp, kInvalidSnapshotApiCallHandle, device,
                                           unbox_VkImage(image), unbox_VkDeviceMemory(memory),
                                           memoryOffset);
+    }
+
+    void vkCmdBindDescriptorSets(VkCommandBuffer commandBuffer,
+                                 VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout,
+                                 uint32_t firstSet, uint32_t descriptorSetCount,
+                                 const VkDescriptorSet* pDescriptorSets,
+                                 uint32_t dynamicOffsetCount, const uint32_t* pDynamicOffsets) {
+        std::vector<VkDescriptorSet> unboxedSets(descriptorSetCount);
+        for (uint32_t i = 0; i < descriptorSetCount; ++i) {
+            unboxedSets[i] =
+                pDescriptorSets[i] ? unbox_VkDescriptorSet(pDescriptorSets[i]) : VK_NULL_HANDLE;
+        }
+        mDgs->on_vkCmdBindDescriptorSets(mBp, kInvalidSnapshotApiCallHandle, commandBuffer,
+                                         pipelineBindPoint, unbox_VkPipelineLayout(layout),
+                                         firstSet, descriptorSetCount, unboxedSets.data(),
+                                         dynamicOffsetCount, pDynamicOffsets);
+    }
+
+    void vkCmdBindPipeline(VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint,
+                           VkPipeline pipeline) {
+        mDgs->on_vkCmdBindPipeline(mBp, kInvalidSnapshotApiCallHandle, commandBuffer,
+                                   pipelineBindPoint, unbox_VkPipeline(pipeline));
     }
 
     void vkCmdBlitImage(VkCommandBuffer commandBuffer, VkImage srcImage,
@@ -96,6 +125,12 @@ class VkDecoderTestDispatch {
                                 dstImageLayout, regionCount, pRegions);
     }
 
+    void vkCmdDispatch(VkCommandBuffer commandBuffer, uint32_t groupCountX, uint32_t groupCountY,
+                       uint32_t groupCountZ) {
+        mVk->vkCmdDispatch(unbox_VkCommandBuffer(commandBuffer), groupCountX, groupCountY,
+                           groupCountZ);
+    }
+
     void vkCmdPipelineBarrier(VkCommandBuffer commandBuffer, VkPipelineStageFlags srcStageMask,
                               VkPipelineStageFlags dstStageMask, VkDependencyFlags dependencyFlags,
                               uint32_t memoryBarrierCount, const VkMemoryBarrier* pMemoryBarriers,
@@ -113,6 +148,37 @@ class VkDecoderTestDispatch {
                                const VkDependencyInfo* pDependencyInfo) {
         mDgs->on_vkCmdPipelineBarrier2(mBp, kInvalidSnapshotApiCallHandle, commandBuffer,
                                        pDependencyInfo);
+    }
+
+    void vkCmdPushConstants(VkCommandBuffer commandBuffer, VkPipelineLayout layout,
+                            VkShaderStageFlags stageFlags, uint32_t offset, uint32_t size,
+                            const void* pValues) {
+        mVk->vkCmdPushConstants(unbox_VkCommandBuffer(commandBuffer),
+                                unbox_VkPipelineLayout(layout), stageFlags, offset, size, pValues);
+    }
+
+    void vkCmdSetEvent(VkCommandBuffer commandBuffer, VkEvent event,
+                       VkPipelineStageFlags stageMask) {
+        mDgs->on_vkCmdSetEvent(mBp, kInvalidSnapshotApiCallHandle, commandBuffer,
+                               unbox_VkEvent(event), stageMask);
+    }
+
+    void vkCmdWaitEvents(VkCommandBuffer commandBuffer, uint32_t eventCount, const VkEvent* pEvents,
+                         VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask,
+                         uint32_t memoryBarrierCount, const VkMemoryBarrier* pMemoryBarriers,
+                         uint32_t bufferMemoryBarrierCount,
+                         const VkBufferMemoryBarrier* pBufferMemoryBarriers,
+                         uint32_t imageMemoryBarrierCount,
+                         const VkImageMemoryBarrier* pImageMemoryBarriers) {
+        std::vector<VkEvent> unboxedEvents(eventCount);
+        for (uint32_t i = 0; i < eventCount; ++i) {
+            unboxedEvents[i] = pEvents[i] ? unbox_VkEvent(pEvents[i]) : VK_NULL_HANDLE;
+        }
+        mDgs->on_vkCmdWaitEvents(mBp, kInvalidSnapshotApiCallHandle, commandBuffer, eventCount,
+                                 unboxedEvents.data(), srcStageMask, dstStageMask,
+                                 memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount,
+                                 pBufferMemoryBarriers, imageMemoryBarrierCount,
+                                 pImageMemoryBarriers);
     }
 
     void vkCmdCopyImageToBuffer(VkCommandBuffer commandBuffer, VkImage srcImage,
@@ -136,6 +202,17 @@ class VkDecoderTestDispatch {
                                             pAllocator, pCommandPool);
     }
 
+    VkResult vkCreateComputePipelines(VkDevice device, VkPipelineCache pipelineCache,
+                                      uint32_t createInfoCount,
+                                      const VkComputePipelineCreateInfo* pCreateInfos,
+                                      const VkAllocationCallbacks* pAllocator,
+                                      VkPipeline* pPipelines) {
+        return mDgs->on_vkCreateComputePipelines(
+            mBp, kInvalidSnapshotApiCallHandle, device,
+            pipelineCache ? unbox_VkPipelineCache(pipelineCache) : VK_NULL_HANDLE, createInfoCount,
+            pCreateInfos, pAllocator, pPipelines);
+    }
+
     VkResult vkCreateDebugUtilsMessengerEXT(VkInstance instance,
                                             const VkDebugUtilsMessengerCreateInfoEXT* pCreateInfo,
                                             const VkAllocationCallbacks* pAllocator,
@@ -150,10 +227,31 @@ class VkDecoderTestDispatch {
         }
     }
 
+    VkResult vkCreateDescriptorPool(VkDevice device, const VkDescriptorPoolCreateInfo* pCreateInfo,
+                                    const VkAllocationCallbacks* pAllocator,
+                                    VkDescriptorPool* pDescriptorPool) {
+        return mDgs->on_vkCreateDescriptorPool(mBp, kInvalidSnapshotApiCallHandle, device,
+                                               pCreateInfo, pAllocator, pDescriptorPool);
+    }
+
+    VkResult vkCreateDescriptorSetLayout(VkDevice device,
+                                         const VkDescriptorSetLayoutCreateInfo* pCreateInfo,
+                                         const VkAllocationCallbacks* pAllocator,
+                                         VkDescriptorSetLayout* pSetLayout) {
+        return mDgs->on_vkCreateDescriptorSetLayout(mBp, kInvalidSnapshotApiCallHandle, device,
+                                                    pCreateInfo, pAllocator, pSetLayout);
+    }
+
     VkResult vkCreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo* pCreateInfo,
                             const VkAllocationCallbacks* pAllocator, VkDevice* pDevice) {
         return mDgs->on_vkCreateDevice(mBp, kInvalidSnapshotApiCallHandle, physicalDevice,
                                        pCreateInfo, pAllocator, pDevice);
+    }
+
+    VkResult vkCreateEvent(VkDevice device, const VkEventCreateInfo* pCreateInfo,
+                           const VkAllocationCallbacks* pAllocator, VkEvent* pEvent) {
+        return mDgs->on_vkCreateEvent(mBp, kInvalidSnapshotApiCallHandle, device, pCreateInfo,
+                                      pAllocator, pEvent);
     }
 
     VkResult vkCreateImage(VkDevice device, const VkImageCreateInfo* pCreateInfo,
@@ -173,6 +271,20 @@ class VkDecoderTestDispatch {
                               const VkAllocationCallbacks* pAllocator, VkInstance* pInstance) {
         return mDgs->on_vkCreateInstance(mBp, kInvalidSnapshotApiCallHandle, pCreateInfo,
                                          pAllocator, pInstance);
+    }
+
+    VkResult vkCreatePipelineLayout(VkDevice device, const VkPipelineLayoutCreateInfo* pCreateInfo,
+                                    const VkAllocationCallbacks* pAllocator,
+                                    VkPipelineLayout* pPipelineLayout) {
+        return mDgs->on_vkCreatePipelineLayout(mBp, kInvalidSnapshotApiCallHandle, device,
+                                               pCreateInfo, pAllocator, pPipelineLayout);
+    }
+
+    VkResult vkCreateShaderModule(VkDevice device, const VkShaderModuleCreateInfo* pCreateInfo,
+                                  const VkAllocationCallbacks* pAllocator,
+                                  VkShaderModule* pShaderModule) {
+        return mDgs->on_vkCreateShaderModule(mBp, kInvalidSnapshotApiCallHandle, device,
+                                             pCreateInfo, pAllocator, pShaderModule);
     }
 
     void vkDestroyBuffer(VkDevice device, VkBuffer buffer,
@@ -200,8 +312,29 @@ class VkDecoderTestDispatch {
         }
     }
 
+    void vkDestroyDescriptorPool(VkDevice device, VkDescriptorPool descriptorPool,
+                                 const VkAllocationCallbacks* pAllocator) {
+        mDgs->on_vkDestroyDescriptorPool(mBp, kInvalidSnapshotApiCallHandle, device,
+                                         unbox_VkDescriptorPool(descriptorPool), pAllocator);
+        delete_VkDescriptorPool(descriptorPool);
+    }
+
+    void vkDestroyDescriptorSetLayout(VkDevice device, VkDescriptorSetLayout descriptorSetLayout,
+                                      const VkAllocationCallbacks* pAllocator) {
+        mDgs->on_vkDestroyDescriptorSetLayout(mBp, kInvalidSnapshotApiCallHandle, device,
+                                              unbox_VkDescriptorSetLayout(descriptorSetLayout),
+                                              pAllocator);
+        delete_VkDescriptorSetLayout(descriptorSetLayout);
+    }
+
     void vkDestroyDevice(VkDevice device, const VkAllocationCallbacks* pAllocator) {
         mDgs->on_vkDestroyDevice(mBp, kInvalidSnapshotApiCallHandle, device, pAllocator);
+    }
+
+    void vkDestroyEvent(VkDevice device, VkEvent event, const VkAllocationCallbacks* pAllocator) {
+        mDgs->on_vkDestroyEvent(mBp, kInvalidSnapshotApiCallHandle, device, unbox_VkEvent(event),
+                                pAllocator);
+        delete_VkEvent(event);
     }
 
     void vkDestroyImage(VkDevice device, VkImage image, const VkAllocationCallbacks* pAllocator) {
@@ -219,6 +352,27 @@ class VkDecoderTestDispatch {
 
     void vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks* pAllocator) {
         mDgs->on_vkDestroyInstance(mBp, kInvalidSnapshotApiCallHandle, instance, pAllocator);
+    }
+
+    void vkDestroyPipeline(VkDevice device, VkPipeline pipeline,
+                           const VkAllocationCallbacks* pAllocator) {
+        mDgs->on_vkDestroyPipeline(mBp, kInvalidSnapshotApiCallHandle, device,
+                                   unbox_VkPipeline(pipeline), pAllocator);
+        delete_VkPipeline(pipeline);
+    }
+
+    void vkDestroyPipelineLayout(VkDevice device, VkPipelineLayout pipelineLayout,
+                                 const VkAllocationCallbacks* pAllocator) {
+        mDgs->on_vkDestroyPipelineLayout(mBp, kInvalidSnapshotApiCallHandle, device,
+                                         unbox_VkPipelineLayout(pipelineLayout), pAllocator);
+        delete_VkPipelineLayout(pipelineLayout);
+    }
+
+    void vkDestroyShaderModule(VkDevice device, VkShaderModule shaderModule,
+                               const VkAllocationCallbacks* pAllocator) {
+        mDgs->on_vkDestroyShaderModule(mBp, kInvalidSnapshotApiCallHandle, device,
+                                       unbox_VkShaderModule(shaderModule), pAllocator);
+        delete_VkShaderModule(shaderModule);
     }
 
     VkResult vkEndCommandBuffer(VkCommandBuffer commandBuffer) {
@@ -243,7 +397,7 @@ class VkDecoderTestDispatch {
                                       unbox_VkCommandPool(commandPool), commandBufferCount,
                                       pCommandBuffers);
         // Calling delete_VkCommandBuffer is normally done in the decoder, so we have to do it here.
-        for (int i = 0; i < commandBufferCount; ++i) {
+        for (uint32_t i = 0; i < commandBufferCount; ++i) {
             delete_VkCommandBuffer(unboxed_to_boxed_VkCommandBuffer(pCommandBuffers[i]));
         }
     }
@@ -315,6 +469,15 @@ class VkDecoderTestDispatch {
     void vkUnmapMemory(VkDevice device, VkDeviceMemory memory) {
         mDgs->on_vkUnmapMemory(mBp, kInvalidSnapshotApiCallHandle, device,
                                unbox_VkDeviceMemory(memory));
+    }
+
+    void vkUpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
+                                const VkWriteDescriptorSet* pDescriptorWrites,
+                                uint32_t descriptorCopyCount,
+                                const VkCopyDescriptorSet* pDescriptorCopies) {
+        mDgs->on_vkUpdateDescriptorSets(mBp, kInvalidSnapshotApiCallHandle, device,
+                                        descriptorWriteCount, pDescriptorWrites,
+                                        descriptorCopyCount, pDescriptorCopies);
     }
 
    private:
