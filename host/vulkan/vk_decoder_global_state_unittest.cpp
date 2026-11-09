@@ -28,7 +28,7 @@ namespace vk {
 
 // Handles the device-cleanup test needs to inspect after teardown.
 struct CommandBufferCleanupProbe {
-    VkCommandBuffer boxedCmdBuf = VK_NULL_HANDLE;
+    Boxed<VkCommandBuffer> boxedCmdBuf;
     std::shared_ptr<OrderMaintenanceInfo> cmdBufOrder;
 };
 
@@ -45,8 +45,9 @@ struct VkDecoderGlobalStateTestPeer {
     void collectDescriptorPoolIds(gfxstream::base::BumpPool* pool, VkDevice device,
                                   VkDescriptorPool descriptorPool, uint32_t* pPoolIdCount,
                                   uint64_t* pPoolIds) {
-        impl.on_vkCollectDescriptorPoolIdsGOOGLE(pool, kInvalidSnapshotApiCallHandle, device,
-                                                 descriptorPool, pPoolIdCount, pPoolIds);
+        impl.on_vkCollectDescriptorPoolIdsGOOGLE(pool, kInvalidSnapshotApiCallHandle,
+                                                 Boxed<VkDevice>(device), descriptorPool,
+                                                 pPoolIdCount, pPoolIds);
     }
 
     VkDescriptorSet getOrAllocateDescriptorSetFromPoolAndId(
@@ -88,13 +89,13 @@ struct VkDecoderGlobalStateTestPeer {
                                                                   VkDevice unboxedDevice) {
         impl.m_vk = globalVk;
 
-        VkDevice boxedDevice = new_boxed_VkDevice(unboxedDevice, deviceVk);
+        Boxed<VkDevice> boxedDevice = new_boxed_VkDevice(unboxedDevice, deviceVk);
         VkCommandPool unboxedCmdPool = reinterpret_cast<VkCommandPool>(0xa001'0000ULL);
-        VkCommandPool boxedCmdPool = new_boxed_non_dispatchable_VkCommandPool(unboxedCmdPool);
+        Boxed<VkCommandPool> boxedCmdPool =
+            new_boxed_non_dispatchable_VkCommandPool(unboxedCmdPool);
         VkCommandBuffer unboxedCmdBuf = reinterpret_cast<VkCommandBuffer>(0xa002'0000ULL);
-        VkCommandBuffer boxedCmdBuf = new_boxed_VkCommandBuffer(unboxedCmdBuf, deviceVk);
-        BoxedHandleInfo* cmdBufBoxedInfo =
-            sBoxedHandleManager.get(reinterpret_cast<uint64_t>(boxedCmdBuf));
+        Boxed<VkCommandBuffer> boxedCmdBuf = new_boxed_VkCommandBuffer(unboxedCmdBuf, deviceVk);
+        BoxedHandleInfo* cmdBufBoxedInfo = sBoxedHandleManager.get(boxedCmdBuf);
         EXPECT_NE(nullptr, cmdBufBoxedInfo);
         if (cmdBufBoxedInfo) {
             cmdBufBoxedInfo->readStream =
@@ -105,32 +106,33 @@ struct VkDecoderGlobalStateTestPeer {
         probe.cmdBufOrder = ordmaint_VkCommandBuffer(boxedCmdBuf);
 
         VkBuffer unboxedBuffer = reinterpret_cast<VkBuffer>(0xa003'0000ULL);
-        VkBuffer boxedBuffer = new_boxed_non_dispatchable_VkBuffer(unboxedBuffer);
+        Boxed<VkBuffer> boxedBuffer = new_boxed_non_dispatchable_VkBuffer(unboxedBuffer);
         VkDeviceMemory unboxedMem = reinterpret_cast<VkDeviceMemory>(0xa004'0000ULL);
-        VkDeviceMemory boxedMem = new_boxed_non_dispatchable_VkDeviceMemory(unboxedMem);
+        Boxed<VkDeviceMemory> boxedMem = new_boxed_non_dispatchable_VkDeviceMemory(unboxedMem);
         VkDescriptorPool unboxedDescPool = reinterpret_cast<VkDescriptorPool>(0xa005'0000ULL);
-        VkDescriptorPool boxedDescPool =
+        Boxed<VkDescriptorPool> boxedDescPool =
             new_boxed_non_dispatchable_VkDescriptorPool(unboxedDescPool);
         VkDescriptorUpdateTemplate unboxedTemplate =
             reinterpret_cast<VkDescriptorUpdateTemplate>(0xa006'0000ULL);
-        VkDescriptorUpdateTemplate boxedTemplate =
+        Boxed<VkDescriptorUpdateTemplate> boxedTemplate =
             new_boxed_non_dispatchable_VkDescriptorUpdateTemplate(unboxedTemplate);
         VkSamplerYcbcrConversion unboxedYcbcr =
             reinterpret_cast<VkSamplerYcbcrConversion>(0xa007'0000ULL);
-        VkSamplerYcbcrConversion boxedYcbcr =
+        Boxed<VkSamplerYcbcrConversion> boxedYcbcr =
             new_boxed_non_dispatchable_VkSamplerYcbcrConversion(unboxedYcbcr);
         VkShaderModule unboxedShader = reinterpret_cast<VkShaderModule>(0xa008'0000ULL);
-        VkShaderModule boxedShader = new_boxed_non_dispatchable_VkShaderModule(unboxedShader);
+        Boxed<VkShaderModule> boxedShader = new_boxed_non_dispatchable_VkShaderModule(unboxedShader);
         VkPipeline unboxedPipeline = reinterpret_cast<VkPipeline>(0xa009'0000ULL);
-        VkPipeline boxedPipeline = new_boxed_non_dispatchable_VkPipeline(unboxedPipeline);
+        Boxed<VkPipeline> boxedPipeline = new_boxed_non_dispatchable_VkPipeline(unboxedPipeline);
         VkPipelineCache unboxedCache = reinterpret_cast<VkPipelineCache>(0xa00a'0000ULL);
-        VkPipelineCache boxedCache = new_boxed_non_dispatchable_VkPipelineCache(unboxedCache);
+        Boxed<VkPipelineCache> boxedCache = new_boxed_non_dispatchable_VkPipelineCache(unboxedCache);
         VkPipelineLayout unboxedLayout = reinterpret_cast<VkPipelineLayout>(0xa00b'0000ULL);
-        VkPipelineLayout boxedLayout = new_boxed_non_dispatchable_VkPipelineLayout(unboxedLayout);
+        Boxed<VkPipelineLayout> boxedLayout =
+            new_boxed_non_dispatchable_VkPipelineLayout(unboxedLayout);
         VkFramebuffer unboxedFb = reinterpret_cast<VkFramebuffer>(0xa00c'0000ULL);
-        VkFramebuffer boxedFb = new_boxed_non_dispatchable_VkFramebuffer(unboxedFb);
+        Boxed<VkFramebuffer> boxedFb = new_boxed_non_dispatchable_VkFramebuffer(unboxedFb);
         VkRenderPass unboxedRp = reinterpret_cast<VkRenderPass>(0xa00d'0000ULL);
-        VkRenderPass boxedRp = new_boxed_non_dispatchable_VkRenderPass(unboxedRp);
+        Boxed<VkRenderPass> boxedRp = new_boxed_non_dispatchable_VkRenderPass(unboxedRp);
 
         {
             std::lock_guard<std::mutex> lock(impl.mMutex);
@@ -230,12 +232,12 @@ struct VkDecoderGlobalStateTestPeer {
     // Registers `unboxedInstance` with already boxed physical devices, as if
     // the first vkEnumeratePhysicalDevices call had populated them. Returns
     // the boxed instance handle.
-    VkInstance registerInstanceWithPhysicalDevicesForCleanupTest(
+    Boxed<VkInstance> registerInstanceWithPhysicalDevicesForCleanupTest(
         VulkanDispatch* globalVk, VkInstance unboxedInstance,
         const std::vector<VkPhysicalDevice>& unboxedPhysicalDevices,
-        std::vector<VkPhysicalDevice> boxedPhysicalDevices) {
+        std::vector<Boxed<VkPhysicalDevice>> boxedPhysicalDevices) {
         impl.m_vk = globalVk;
-        VkInstance boxedInstance = new_boxed_VkInstance(unboxedInstance, globalVk);
+        Boxed<VkInstance> boxedInstance = new_boxed_VkInstance(unboxedInstance, globalVk);
 
         std::lock_guard<std::mutex> lock(impl.mMutex);
         InstanceInfo& instanceInfo = impl.mInstanceInfo[unboxedInstance];
@@ -247,7 +249,8 @@ struct VkDecoderGlobalStateTestPeer {
         return boxedInstance;
     }
 
-    VkResult enumeratePhysicalDevices(VkInstance boxedInstance, uint32_t* pPhysicalDeviceCount,
+    VkResult enumeratePhysicalDevices(Boxed<VkInstance> boxedInstance,
+                                      uint32_t* pPhysicalDeviceCount,
                                       VkPhysicalDevice* pPhysicalDevices) {
         return impl.on_vkEnumeratePhysicalDevices(nullptr, kInvalidSnapshotApiCallHandle,
                                                   boxedInstance, pPhysicalDeviceCount,
@@ -317,8 +320,8 @@ TEST(VkDecoderGlobalStateDescriptorSetPoolIdTest, UnallocatedAndAllocatedPoolIdH
 
     peer.registerDescriptorPool(pool);
 
-    VkDescriptorSet boxedNullSet = new_boxed_non_dispatchable_VkDescriptorSet(VK_NULL_HANDLE);
-    uint64_t nullPoolId = reinterpret_cast<uint64_t>(boxedNullSet);
+    Boxed<VkDescriptorSet> boxedNullSet = new_boxed_non_dispatchable_VkDescriptorSet(VK_NULL_HANDLE);
+    uint64_t nullPoolId = reinterpret_cast<uint64_t>(boxedNullSet.value());
     bool didAlloc = true;
     EXPECT_EQ(VK_NULL_HANDLE,
               peer.getOrAllocateDescriptorSetFromPoolAndId(
@@ -326,8 +329,8 @@ TEST(VkDecoderGlobalStateDescriptorSetPoolIdTest, UnallocatedAndAllocatedPoolIdH
     EXPECT_FALSE(didAlloc);
     delete_VkDescriptorSet(boxedNullSet);
 
-    VkDescriptorSet boxedValidSet = new_boxed_non_dispatchable_VkDescriptorSet(expectedSet);
-    uint64_t validPoolId = reinterpret_cast<uint64_t>(boxedValidSet);
+    Boxed<VkDescriptorSet> boxedValidSet = new_boxed_non_dispatchable_VkDescriptorSet(expectedSet);
+    uint64_t validPoolId = reinterpret_cast<uint64_t>(boxedValidSet.value());
     didAlloc = true;
     EXPECT_EQ(expectedSet,
               peer.getOrAllocateDescriptorSetFromPoolAndId(
@@ -365,7 +368,7 @@ TEST(VkDecoderGlobalStateDescriptorSetPoolIdTest, CollectDescriptorPoolIdsClamps
 }
 
 TEST(VkDecoderGlobalStateBoxedHandleTest, OrderMaintenanceInfoOutlivesDeletedHandle) {
-    VkCommandBuffer boxed =
+    Boxed<VkCommandBuffer> boxed =
         new_boxed_VkCommandBuffer(reinterpret_cast<VkCommandBuffer>(0x5555'0000), nullptr);
     std::shared_ptr<OrderMaintenanceInfo> order = ordmaint_VkCommandBuffer(boxed);
     ASSERT_NE(nullptr, order);
@@ -383,8 +386,8 @@ TEST(VkDecoderGlobalStateBoxedHandleTest, ConcurrentOrderMaintenanceInfoLookupAn
 
     std::thread reader([&]() {
         while (!done.load(std::memory_order_acquire)) {
-            VkCommandBuffer boxed =
-                reinterpret_cast<VkCommandBuffer>(currentHandle.load(std::memory_order_acquire));
+            Boxed<VkCommandBuffer> boxed =
+                Boxed<VkCommandBuffer>::fromRaw(currentHandle.load(std::memory_order_acquire));
             std::shared_ptr<OrderMaintenanceInfo> order = ordmaint_VkCommandBuffer(boxed);
             if (order) {
                 EXPECT_EQ(0u, __atomic_load_n(&order->sequenceNumber, __ATOMIC_ACQUIRE));
@@ -393,9 +396,9 @@ TEST(VkDecoderGlobalStateBoxedHandleTest, ConcurrentOrderMaintenanceInfoLookupAn
     });
 
     for (int i = 0; i < kIterations; ++i) {
-        VkCommandBuffer boxed =
+        Boxed<VkCommandBuffer> boxed =
             new_boxed_VkCommandBuffer(reinterpret_cast<VkCommandBuffer>(0x5555'0000), nullptr);
-        currentHandle.store(reinterpret_cast<uint64_t>(boxed), std::memory_order_release);
+        currentHandle.store(reinterpret_cast<uint64_t>(boxed.value()), std::memory_order_release);
         delete_VkCommandBuffer(boxed);
     }
 
@@ -411,33 +414,33 @@ TEST(VkDecoderGlobalStateBoxedHandleTest, ConcurrentOrderMaintenanceInfoLookupAn
 TEST(BoxedHandleManagerReverseMapTest, RemoveOldBoxedHandleKeepsReusedUnboxedMapping) {
     VkImage underlying = reinterpret_cast<VkImage>(0x5555'0000);
 
-    VkImage boxedOld = new_boxed_non_dispatchable_VkImage(underlying);
-    ASSERT_NE(VK_NULL_HANDLE, boxedOld);
+    Boxed<VkImage> boxedOld = new_boxed_non_dispatchable_VkImage(underlying);
+    ASSERT_NE(Boxed<VkImage>(), boxedOld);
     EXPECT_EQ(boxedOld, unboxed_to_boxed_non_dispatchable_VkImage(underlying));
 
     // Host destroys the old image and immediately reuses the handle value for a new image, whose
     // boxed handle gets registered before the old boxed handle is deleted.
-    VkImage boxedNew = new_boxed_non_dispatchable_VkImage(underlying);
-    ASSERT_NE(VK_NULL_HANDLE, boxedNew);
+    Boxed<VkImage> boxedNew = new_boxed_non_dispatchable_VkImage(underlying);
+    ASSERT_NE(Boxed<VkImage>(), boxedNew);
     ASSERT_NE(boxedOld, boxedNew);
     EXPECT_EQ(boxedNew, unboxed_to_boxed_non_dispatchable_VkImage(underlying));
 
     delete_VkImage(boxedOld);
-    EXPECT_EQ(nullptr, sBoxedHandleManager.get(reinterpret_cast<uint64_t>(boxedOld)));
+    EXPECT_EQ(nullptr, sBoxedHandleManager.get(boxedOld));
     // The new boxed handle must still be reachable from the (reused) unboxed handle.
     EXPECT_EQ(boxedNew, unboxed_to_boxed_non_dispatchable_VkImage(underlying));
 
     delete_VkImage(boxedNew);
-    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkImage(underlying));
+    EXPECT_EQ(Boxed<VkImage>(), unboxed_to_boxed_non_dispatchable_VkImage(underlying));
 }
 
 TEST(BoxedHandleManagerReverseMapTest, UpdateOldUnboxedDoesNotDropReusedMapping) {
     VkImage underlyingA = reinterpret_cast<VkImage>(0x6666'0000);
     VkImage underlyingB = reinterpret_cast<VkImage>(0x7777'0000);
 
-    VkImage boxed1 = new_boxed_non_dispatchable_VkImage(underlyingA);
+    Boxed<VkImage> boxed1 = new_boxed_non_dispatchable_VkImage(underlyingA);
     // Another boxed handle takes over underlyingA (reuse) before boxed1 is re-pointed.
-    VkImage boxed2 = new_boxed_non_dispatchable_VkImage(underlyingA);
+    Boxed<VkImage> boxed2 = new_boxed_non_dispatchable_VkImage(underlyingA);
     EXPECT_EQ(boxed2, unboxed_to_boxed_non_dispatchable_VkImage(underlyingA));
 
     set_boxed_non_dispatchable_VkImage(boxed1, underlyingB);
@@ -447,34 +450,34 @@ TEST(BoxedHandleManagerReverseMapTest, UpdateOldUnboxedDoesNotDropReusedMapping)
 
     delete_VkImage(boxed1);
     delete_VkImage(boxed2);
-    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkImage(underlyingA));
-    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkImage(underlyingB));
+    EXPECT_EQ(Boxed<VkImage>(), unboxed_to_boxed_non_dispatchable_VkImage(underlyingA));
+    EXPECT_EQ(Boxed<VkImage>(), unboxed_to_boxed_non_dispatchable_VkImage(underlyingB));
 }
 
 TEST(BoxedHandleManagerReverseMapTest, NullUnboxedHandleIsNeverReverseMapped) {
     // Boxing VK_NULL_HANDLE must not register key 0 in the reverse map: it could never be erased
     // (eraseReverseMappingLocked skips 0) and would make lookups of VK_NULL_HANDLE return a
     // stale boxed handle.
-    VkImage boxedNull = new_boxed_non_dispatchable_VkImage(VK_NULL_HANDLE);
-    ASSERT_NE(VK_NULL_HANDLE, boxedNull);
-    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkImage(VK_NULL_HANDLE));
+    Boxed<VkImage> boxedNull = new_boxed_non_dispatchable_VkImage(VK_NULL_HANDLE);
+    ASSERT_NE(Boxed<VkImage>(), boxedNull);
+    EXPECT_EQ(Boxed<VkImage>(), unboxed_to_boxed_non_dispatchable_VkImage(VK_NULL_HANDLE));
 
     VkImage underlying = reinterpret_cast<VkImage>(0x9999'0000);
     set_boxed_non_dispatchable_VkImage(boxedNull, underlying);
     EXPECT_EQ(boxedNull, unboxed_to_boxed_non_dispatchable_VkImage(underlying));
     set_boxed_non_dispatchable_VkImage(boxedNull, VK_NULL_HANDLE);
-    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkImage(underlying));
-    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkImage(VK_NULL_HANDLE));
+    EXPECT_EQ(Boxed<VkImage>(), unboxed_to_boxed_non_dispatchable_VkImage(underlying));
+    EXPECT_EQ(Boxed<VkImage>(), unboxed_to_boxed_non_dispatchable_VkImage(VK_NULL_HANDLE));
 
     delete_VkImage(boxedNull);
-    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkImage(VK_NULL_HANDLE));
+    EXPECT_EQ(Boxed<VkImage>(), unboxed_to_boxed_non_dispatchable_VkImage(VK_NULL_HANDLE));
 }
 
 TEST(BoxedHandleManagerReverseMapTest, DelayedRemoveClearsReverseMapping) {
     VkDevice device = reinterpret_cast<VkDevice>(0x1111'0000);
     VkSampler underlying = reinterpret_cast<VkSampler>(0x8888'0000);
 
-    VkSampler boxed = new_boxed_non_dispatchable_VkSampler(underlying);
+    Boxed<VkSampler> boxed = new_boxed_non_dispatchable_VkSampler(underlying);
     EXPECT_EQ(boxed, unboxed_to_boxed_non_dispatchable_VkSampler(underlying));
 
     delayed_delete_VkSampler(boxed, device, nullptr);
@@ -482,8 +485,8 @@ TEST(BoxedHandleManagerReverseMapTest, DelayedRemoveClearsReverseMapping) {
     EXPECT_EQ(boxed, unboxed_to_boxed_non_dispatchable_VkSampler(underlying));
 
     sBoxedHandleManager.processDelayedRemoves(device);
-    EXPECT_EQ(nullptr, sBoxedHandleManager.get(reinterpret_cast<uint64_t>(boxed)));
-    EXPECT_EQ(VK_NULL_HANDLE, unboxed_to_boxed_non_dispatchable_VkSampler(underlying));
+    EXPECT_EQ(nullptr, sBoxedHandleManager.get(boxed));
+    EXPECT_EQ(Boxed<VkSampler>(), unboxed_to_boxed_non_dispatchable_VkSampler(underlying));
 }
 
 TEST(VkDecoderGlobalStateProcessCleanupLeakTest, DestroyCommandPoolDeletesBoxedCommandBuffers) {
@@ -499,11 +502,10 @@ TEST(VkDecoderGlobalStateProcessCleanupLeakTest, DestroyCommandPoolDeletesBoxedC
 
     VkDevice unboxedDevice = reinterpret_cast<VkDevice>(0xb001'0000ULL);
     VkCommandPool unboxedPool = reinterpret_cast<VkCommandPool>(0xb002'0000ULL);
-    VkCommandPool boxedPool = new_boxed_non_dispatchable_VkCommandPool(unboxedPool);
+    Boxed<VkCommandPool> boxedPool = new_boxed_non_dispatchable_VkCommandPool(unboxedPool);
     VkCommandBuffer unboxedCmdBuf = reinterpret_cast<VkCommandBuffer>(0xb003'0000ULL);
-    VkCommandBuffer boxedCmdBuf = new_boxed_VkCommandBuffer(unboxedCmdBuf, &deviceVk);
-    BoxedHandleInfo* cmdBufBoxedInfo =
-        sBoxedHandleManager.get(reinterpret_cast<uint64_t>(boxedCmdBuf));
+    Boxed<VkCommandBuffer> boxedCmdBuf = new_boxed_VkCommandBuffer(unboxedCmdBuf, &deviceVk);
+    BoxedHandleInfo* cmdBufBoxedInfo = sBoxedHandleManager.get(boxedCmdBuf);
     ASSERT_NE(nullptr, cmdBufBoxedInfo);
     cmdBufBoxedInfo->readStream =
         std::make_unique<VulkanMemReadingStream>(nullptr, gfxstream::host::FeatureSet{});
@@ -528,7 +530,7 @@ TEST(VkDecoderGlobalStateProcessCleanupLeakTest, DestroyCommandPoolDeletesBoxedC
 
     EXPECT_EQ(1, sDestroyedPools);
     EXPECT_TRUE(cmdBufferInfos.empty());
-    EXPECT_EQ(nullptr, sBoxedHandleManager.get(reinterpret_cast<uint64_t>(boxedCmdBuf)));
+    EXPECT_EQ(nullptr, sBoxedHandleManager.get(boxedCmdBuf));
     EXPECT_EQ(1, cmdBufOrder.use_count());
     EXPECT_EQ(baselineHandles, sBoxedHandleManager.getHandlesCount());
 }
@@ -597,7 +599,7 @@ TEST(VkDecoderGlobalStateProcessCleanupLeakTest, DeviceCleanupDeletesAllExtracte
     peer.destroyDeviceObjects(deviceObjects);
 
     EXPECT_EQ(14, sDestroyCalls);
-    EXPECT_EQ(nullptr, sBoxedHandleManager.get(reinterpret_cast<uint64_t>(probe.boxedCmdBuf)));
+    EXPECT_EQ(nullptr, sBoxedHandleManager.get(probe.boxedCmdBuf));
     ASSERT_NE(nullptr, probe.cmdBufOrder);
     EXPECT_EQ(1, probe.cmdBufOrder.use_count());
     EXPECT_EQ(baselineHandles, sBoxedHandleManager.getHandlesCount());
@@ -620,11 +622,11 @@ TEST(VkDecoderGlobalStateProcessCleanupLeakTest,
         reinterpret_cast<VkPhysicalDevice>(0xd002'0000ULL),
         reinterpret_cast<VkPhysicalDevice>(0xd003'0000ULL),
     };
-    const std::vector<VkPhysicalDevice> boxedPhysicalDevices = {
+    const std::vector<Boxed<VkPhysicalDevice>> boxedPhysicalDevices = {
         new_boxed_VkPhysicalDevice(unboxedPhysicalDevices[0], &globalVk),
         new_boxed_VkPhysicalDevice(unboxedPhysicalDevices[1], &globalVk),
     };
-    VkInstance boxedInstance = peer.registerInstanceWithPhysicalDevicesForCleanupTest(
+    Boxed<VkInstance> boxedInstance = peer.registerInstanceWithPhysicalDevicesForCleanupTest(
         &globalVk, unboxedInstance, unboxedPhysicalDevices, boxedPhysicalDevices);
     EXPECT_EQ(2u, peer.physicalDeviceInfoCount());
 
@@ -639,7 +641,7 @@ TEST(VkDecoderGlobalStateProcessCleanupLeakTest,
     count = 1;
     EXPECT_EQ(VK_INCOMPLETE, peer.enumeratePhysicalDevices(boxedInstance, &count, out));
     EXPECT_EQ(1u, count);
-    EXPECT_EQ(boxedPhysicalDevices[0], out[0]);
+    EXPECT_EQ(boxedPhysicalDevices[0].value(), out[0]);
     EXPECT_EQ(VK_NULL_HANDLE, out[1]);
 
     // Repeated enumeration on the same instance returns the same boxed
@@ -649,8 +651,8 @@ TEST(VkDecoderGlobalStateProcessCleanupLeakTest,
         count = 2;
         EXPECT_EQ(VK_SUCCESS, peer.enumeratePhysicalDevices(boxedInstance, &count, out));
         EXPECT_EQ(2u, count);
-        EXPECT_EQ(boxedPhysicalDevices[0], out[0]);
-        EXPECT_EQ(boxedPhysicalDevices[1], out[1]);
+        EXPECT_EQ(boxedPhysicalDevices[0].value(), out[0]);
+        EXPECT_EQ(boxedPhysicalDevices[1].value(), out[1]);
     }
     EXPECT_EQ(baselineHandles + 3, sBoxedHandleManager.getHandlesCount());
 
@@ -660,11 +662,10 @@ TEST(VkDecoderGlobalStateProcessCleanupLeakTest,
     peer.destroyInstanceObjects(instanceObjects);
 
     EXPECT_EQ(1, sDestroyedInstances);
-    for (VkPhysicalDevice boxedPhysicalDevice : boxedPhysicalDevices) {
-        EXPECT_EQ(nullptr,
-                  sBoxedHandleManager.get(reinterpret_cast<uint64_t>(boxedPhysicalDevice)));
+    for (Boxed<VkPhysicalDevice> boxedPhysicalDevice : boxedPhysicalDevices) {
+        EXPECT_EQ(nullptr, sBoxedHandleManager.get(boxedPhysicalDevice));
     }
-    EXPECT_EQ(nullptr, sBoxedHandleManager.get(reinterpret_cast<uint64_t>(boxedInstance)));
+    EXPECT_EQ(nullptr, sBoxedHandleManager.get(boxedInstance));
     EXPECT_EQ(baselineHandles, sBoxedHandleManager.getHandlesCount());
 }
 
