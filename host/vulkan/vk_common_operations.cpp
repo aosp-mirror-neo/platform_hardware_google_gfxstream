@@ -3903,7 +3903,6 @@ bool VkEmulation::readColorBufferPixelsScaledCpu(uint32_t colorBufferHandle, int
     }
 
     // TODO(b/447601952): handle RGB format inside readToBytes to avoid extra copy
-    // TODO(b/460393431): Resize the image on the GPU and readback smaller data
     std::vector<uint8_t> readback_r8g8b8a8;
     readback_r8g8b8a8.resize(readbackPixelsSize);
     if (!readColorBufferToBytesLocked(colorBufferHandle, 0, 0, readbackWidth, readbackHeight,
