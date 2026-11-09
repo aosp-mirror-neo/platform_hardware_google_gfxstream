@@ -248,13 +248,15 @@ class VkDecoderSnapshot::Impl {
                 mReconstruction.addHandleDependency(
                     (const uint64_t*)pMemory, 1,
                     (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkImage(
-                        dedicatedAllocateInfo->image));
+                        dedicatedAllocateInfo->image)
+                        .value());
             }
             if (dedicatedAllocateInfo->buffer) {
                 mReconstruction.addHandleDependency(
                     (const uint64_t*)pMemory, 1,
                     (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkBuffer(
-                        dedicatedAllocateInfo->buffer));
+                        dedicatedAllocateInfo->buffer)
+                        .value());
             }
         }
         mReconstruction.setApiTrace(apiCallHandle, apiCallPacket, apiCallPacketSize);
@@ -308,10 +310,10 @@ class VkDecoderSnapshot::Impl {
         mReconstruction.setApiTrace(apiCallHandle, apiCallPacket, apiCallPacketSize);
         mReconstruction.addHandleDependency(
             (const uint64_t*)(&handle), 1,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDeviceMemory(memory));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDeviceMemory(memory).value());
         mReconstruction.addHandleDependency(
             (const uint64_t*)(&handle), 1,
-            (uint64_t)(uintptr_t)(unboxed_to_boxed_non_dispatchable_VkBuffer(buffer)));
+            (uint64_t)(uintptr_t)(unboxed_to_boxed_non_dispatchable_VkBuffer(buffer).value()));
     }
     void vkBindImageMemory(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
                            const uint8_t* apiCallPacket, size_t apiCallPacketSize,
@@ -328,10 +330,10 @@ class VkDecoderSnapshot::Impl {
         mReconstruction.setApiTrace(apiCallHandle, apiCallPacket, apiCallPacketSize);
         mReconstruction.addHandleDependency(
             (const uint64_t*)(&handle), 1,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDeviceMemory(memory));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDeviceMemory(memory).value());
         mReconstruction.addHandleDependency(
             (const uint64_t*)(&handle), 1,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkImage(image));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkImage(image).value());
     }
     void vkGetBufferMemoryRequirements(gfxstream::base::BumpPool* pool,
                                        VkSnapshotApiCallHandle apiCallHandle,
@@ -512,7 +514,8 @@ class VkDecoderSnapshot::Impl {
         mReconstruction.addHandleDependency((const uint64_t*)pView, 1, (uint64_t)(uintptr_t)device);
         mReconstruction.addHandleDependency(
             (const uint64_t*)pView, 1,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkImage(pCreateInfo->image));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkImage(pCreateInfo->image)
+                .value());
         mReconstruction.setApiTrace(apiCallHandle, apiCallPacket, apiCallPacketSize);
         mReconstruction.forEachHandleAddApi((const uint64_t*)pView, 1, apiCallHandle,
                                             VkReconstruction::CREATED);
@@ -557,7 +560,8 @@ class VkDecoderSnapshot::Impl {
         // Note: special implementation
         std::lock_guard<std::mutex> lock(mReconstructionMutex);
         mReconstruction.removeGrandChildren(
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkCommandPool(commandPool));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkCommandPool(commandPool)
+                .value());
     }
     void vkAllocateCommandBuffers(gfxstream::base::BumpPool* pool,
                                   VkSnapshotApiCallHandle apiCallHandle,
@@ -574,7 +578,8 @@ class VkDecoderSnapshot::Impl {
         mReconstruction.addHandleDependency(
             (const uint64_t*)pCommandBuffers, pAllocateInfo->commandBufferCount,
             (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkCommandPool(
-                pAllocateInfo->commandPool));
+                pAllocateInfo->commandPool)
+                .value());
         mReconstruction.setApiTrace(apiCallHandle, apiCallPacket, apiCallPacketSize);
         mReconstruction.forEachHandleAddApi((const uint64_t*)pCommandBuffers,
                                             pAllocateInfo->commandBufferCount, apiCallHandle,
@@ -631,10 +636,10 @@ class VkDecoderSnapshot::Impl {
         std::lock_guard<std::mutex> lock(mReconstructionMutex);
         mReconstruction.addApiCallDependencyOnVkObject(
             apiCallHandle,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkBuffer(srcBuffer));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkBuffer(srcBuffer).value());
         mReconstruction.addApiCallDependencyOnVkObject(
             apiCallHandle,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkBuffer(dstBuffer));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkBuffer(dstBuffer).value());
     }
     void vkCmdCopyImage(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
                         const uint8_t* apiCallPacket, size_t apiCallPacketSize,
@@ -650,10 +655,10 @@ class VkDecoderSnapshot::Impl {
         std::lock_guard<std::mutex> lock(mReconstructionMutex);
         mReconstruction.addApiCallDependencyOnVkObject(
             apiCallHandle,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkBuffer(srcBuffer));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkBuffer(srcBuffer).value());
         mReconstruction.addApiCallDependencyOnVkObject(
             apiCallHandle,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkImage(dstImage));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkImage(dstImage).value());
     }
     void vkCmdCopyImageToBuffer(gfxstream::base::BumpPool* pool,
                                 VkSnapshotApiCallHandle apiCallHandle, const uint8_t* apiCallPacket,
@@ -663,10 +668,10 @@ class VkDecoderSnapshot::Impl {
         std::lock_guard<std::mutex> lock(mReconstructionMutex);
         mReconstruction.addApiCallDependencyOnVkObject(
             apiCallHandle,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkImage(srcImage));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkImage(srcImage).value());
         mReconstruction.addApiCallDependencyOnVkObject(
             apiCallHandle,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkBuffer(dstBuffer));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkBuffer(dstBuffer).value());
     }
     void vkCmdUpdateBuffer(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
                            const uint8_t* apiCallPacket, size_t apiCallPacketSize,
@@ -690,12 +695,14 @@ class VkDecoderSnapshot::Impl {
         for (uint32_t i = 0; i < bufferMemoryBarrierCount; ++i) {
             mReconstruction.addApiCallDependencyOnVkObject(
                 apiCallHandle, (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkBuffer(
-                                   pBufferMemoryBarriers[i].buffer));
+                                   pBufferMemoryBarriers[i].buffer)
+                                   .value());
         }
         for (uint32_t i = 0; i < imageMemoryBarrierCount; ++i) {
             mReconstruction.addApiCallDependencyOnVkObject(
                 apiCallHandle, (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkImage(
-                                   pImageMemoryBarriers[i].image));
+                                   pImageMemoryBarriers[i].image)
+                                   .value());
         }
     }
     void vkCmdBeginQuery(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
@@ -772,7 +779,8 @@ class VkDecoderSnapshot::Impl {
         mReconstruction.addHandleDependency((const uint64_t*)pView, 1, (uint64_t)(uintptr_t)device);
         mReconstruction.addHandleDependency(
             (const uint64_t*)pView, 1,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkBuffer(pCreateInfo->buffer));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkBuffer(pCreateInfo->buffer)
+                .value());
         mReconstruction.setApiTrace(apiCallHandle, apiCallPacket, apiCallPacketSize);
         mReconstruction.forEachHandleAddApi((const uint64_t*)pView, 1, apiCallHandle,
                                             VkReconstruction::CREATED);
@@ -989,8 +997,9 @@ class VkDecoderSnapshot::Impl {
         // Note: special implementation
         if (input_result != VK_SUCCESS) return;
         std::lock_guard<std::mutex> lock(mReconstructionMutex);
-        mReconstruction.removeDescendantsOfHandle((
-            uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDescriptorPool(descriptorPool));
+        mReconstruction.removeDescendantsOfHandle(
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDescriptorPool(descriptorPool)
+                .value());
     }
     void vkAllocateDescriptorSets(gfxstream::base::BumpPool* pool,
                                   VkSnapshotApiCallHandle apiCallHandle,
@@ -1010,7 +1019,8 @@ class VkDecoderSnapshot::Impl {
         mReconstruction.addHandleDependency(
             (const uint64_t*)pDescriptorSets, pAllocateInfo->descriptorSetCount,
             (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDescriptorPool(
-                pAllocateInfo->descriptorPool));
+                pAllocateInfo->descriptorPool)
+                .value());
         mReconstruction.setApiTrace(apiCallHandle, apiCallPacket, apiCallPacketSize);
         mReconstruction.forEachHandleAddApi((const uint64_t*)pDescriptorSets,
                                             pAllocateInfo->descriptorSetCount, apiCallHandle,
@@ -1041,7 +1051,7 @@ class VkDecoderSnapshot::Impl {
         std::lock_guard<std::mutex> lock(mReconstructionMutex);
         mReconstruction.addApiCallDependencyOnVkObject(
             apiCallHandle,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkPipeline(pipeline));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkPipeline(pipeline).value());
     }
     void vkCmdBindDescriptorSets(gfxstream::base::BumpPool* pool,
                                  VkSnapshotApiCallHandle apiCallHandle,
@@ -1109,12 +1119,14 @@ class VkDecoderSnapshot::Impl {
                 mReconstruction.addHandleDependency(
                     (const uint64_t*)(pPipelines + i), 1,
                     (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkShaderModule(
-                        pCreateInfos[i].pStages[j].module));
+                        pCreateInfos[i].pStages[j].module)
+                        .value());
             }
             mReconstruction.addHandleDependency(
                 (const uint64_t*)(pPipelines + i), 1,
                 (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkRenderPass(
-                    pCreateInfos[i].renderPass));
+                    pCreateInfos[i].renderPass)
+                    .value());
         }
         mReconstruction.setApiTrace(apiCallHandle, apiCallPacket, apiCallPacketSize);
         mReconstruction.forEachHandleAddApi((const uint64_t*)pPipelines, createInfoCount,
@@ -1137,13 +1149,15 @@ class VkDecoderSnapshot::Impl {
         mReconstruction.addHandleDependency(
             (const uint64_t*)pFramebuffer, 1,
             (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkRenderPass(
-                pCreateInfo->renderPass));
+                pCreateInfo->renderPass)
+                .value());
         if ((pCreateInfo->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT) == 0) {
             for (uint32_t i = 0; i < pCreateInfo->attachmentCount; ++i) {
                 mReconstruction.addHandleDependency(
                     (const uint64_t*)pFramebuffer, 1,
                     (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkImageView(
-                        pCreateInfo->pAttachments[i]));
+                        pCreateInfo->pAttachments[i])
+                        .value());
             }
         }
         mReconstruction.setApiTrace(apiCallHandle, apiCallPacket, apiCallPacketSize);
@@ -1240,7 +1254,8 @@ class VkDecoderSnapshot::Impl {
         for (uint32_t i = 0; i < bindingCount; ++i) {
             mReconstruction.addApiCallDependencyOnVkObject(
                 apiCallHandle,
-                (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkBuffer(pBuffers[i]));
+                (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkBuffer(pBuffers[i])
+                    .value());
         }
     }
     void vkCmdDraw(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
@@ -1293,7 +1308,8 @@ class VkDecoderSnapshot::Impl {
         std::lock_guard<std::mutex> lock(mReconstructionMutex);
         mReconstruction.addApiCallDependencyOnVkObject(
             apiCallHandle, (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkFramebuffer(
-                               pRenderPassBegin->framebuffer));
+                               pRenderPassBegin->framebuffer)
+                               .value());
     }
     void vkCmdNextSubpass(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
                           const uint8_t* apiCallPacket, size_t apiCallPacketSize,
@@ -1328,11 +1344,12 @@ class VkDecoderSnapshot::Impl {
             mReconstruction.addHandleDependency(
                 (const uint64_t*)&handle, 1,
                 (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDeviceMemory(
-                    pBindInfos[i].memory));
+                    pBindInfos[i].memory)
+                    .value());
             mReconstruction.addHandleDependency(
                 (const uint64_t*)&handle, 1,
-                (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkImage(
-                    pBindInfos[i].image));
+                (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkImage(pBindInfos[i].image)
+                    .value());
         }
     }
     void vkGetDeviceGroupPeerMemoryFeatures(gfxstream::base::BumpPool* pool,
@@ -1570,7 +1587,8 @@ class VkDecoderSnapshot::Impl {
         std::lock_guard<std::mutex> lock(mReconstructionMutex);
         mReconstruction.addApiCallDependencyOnVkObject(
             apiCallHandle, (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkFramebuffer(
-                               pRenderPassBegin->framebuffer));
+                               pRenderPassBegin->framebuffer)
+                               .value());
     }
     void vkCmdNextSubpass2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
                            const uint8_t* apiCallPacket, size_t apiCallPacketSize,
@@ -2208,11 +2226,12 @@ class VkDecoderSnapshot::Impl {
             mReconstruction.addHandleDependency(
                 (const uint64_t*)&handle, 1,
                 (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDeviceMemory(
-                    pBindInfos[i].memory));
+                    pBindInfos[i].memory)
+                    .value());
             mReconstruction.addHandleDependency(
                 (const uint64_t*)&handle, 1,
-                (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkImage(
-                    pBindInfos[i].image));
+                (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkImage(pBindInfos[i].image)
+                    .value());
         }
     }
 #endif
@@ -2809,7 +2828,7 @@ class VkDecoderSnapshot::Impl {
         mReconstruction.addHandles((const uint64_t*)(&handle), 1);
         mReconstruction.addHandleDependency(
             (const uint64_t*)(&handle), 1,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDeviceMemory(memory));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDeviceMemory(memory).value());
         mReconstruction.forEachHandleAddApi((const uint64_t*)(&handle), 1, apiCallHandle,
                                             VkReconstruction::CREATED);
         mReconstruction.setCreatedHandlesForApi(apiCallHandle, (const uint64_t*)(&handle), 1);
@@ -2835,7 +2854,8 @@ class VkDecoderSnapshot::Impl {
                                             (uint64_t)(uintptr_t)device);
         mReconstruction.addHandleDependency(
             (const uint64_t*)(&handle), 1,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDescriptorSet(descriptorSet));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDescriptorSet(descriptorSet)
+                .value());
         mReconstruction.addHandleDependency((const uint64_t*)(&handle), 1, imageInfoCount,
                                             pImageInfos);
         mReconstruction.addHandleDependency((const uint64_t*)(&handle), 1, bufferInfoCount,
@@ -2988,7 +3008,7 @@ class VkDecoderSnapshot::Impl {
         mReconstruction.addHandles((const uint64_t*)(&handle), 1);
         mReconstruction.addHandleDependency(
             (const uint64_t*)(&handle), 1,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDeviceMemory(memory));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDeviceMemory(memory).value());
         mReconstruction.forEachHandleAddApi((const uint64_t*)(&handle), 1, apiCallHandle,
                                             VkReconstruction::CREATED);
         mReconstruction.setCreatedHandlesForApi(apiCallHandle, (const uint64_t*)(&handle), 1);
@@ -3015,7 +3035,8 @@ class VkDecoderSnapshot::Impl {
                                             (uint64_t)(uintptr_t)device);
         mReconstruction.addHandleDependency(
             (const uint64_t*)(&handle), 1,
-            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDescriptorSet(descriptorSet));
+            (uint64_t)(uintptr_t)unboxed_to_boxed_non_dispatchable_VkDescriptorSet(descriptorSet)
+                .value());
         mReconstruction.addHandleDependency((const uint64_t*)(&handle), 1, imageInfoCount,
                                             pImageInfos);
         mReconstruction.addHandleDependency((const uint64_t*)(&handle), 1, bufferInfoCount,
