@@ -19,7 +19,7 @@ objc_library(
         # objc_library enables by default.
         "-fno-objc-arc",
     ],
-    local_defines = GFXSTREAM_HOST_DEFINES,
+    defines = GFXSTREAM_HOST_DEFINES,
     sdk_frameworks = [
         "IOSurface",
         "AppKit",
