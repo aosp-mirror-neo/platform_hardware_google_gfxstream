@@ -32,9 +32,11 @@
 #include <algorithm>
 #include <climits>
 #include <functional>
+#include <limits>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -344,8 +346,8 @@ class VkDecoderGlobalState::Impl {
         mDisableSparseBindingSupport = false;
 #ifdef CONFIG_AEMU
         if (!m_vkEmulation->getFeatures().BypassVulkanDeviceFeatureOverrides.enabled()) {
-            // TODO(b/407982047) Disable sparse binding features on Android
-            // These are not supported widely on real devices and causes crashes
+            // Sparse binding features are disabled on Android as they lack widespread
+            // physical device support and can cause host crashes. See b/407982047 for context.
             GFXSTREAM_INFO("Disabling sparse binding feature support");
             mDisableSparseBindingSupport = true;
         }
@@ -427,14 +429,14 @@ class VkDecoderGlobalState::Impl {
     void loadEvents(gfxstream::Stream* stream) REQUIRES(mMutex) {
         const uint32_t sz = stream->getBe32();
 
-        std::unordered_map<VkQueue, QueueInfo*> q2Info;
+        std::unordered_map<Boxed<VkQueue>, QueueInfo*> q2Info;
         for (auto& [unboxed_queue, queueinfo] : mQueueInfo) {
             q2Info[queueinfo.boxed] = &queueinfo;
         }
         for (uint32_t i = 0; i < sz; ++i) {
-            const VkEvent boxed_event = reinterpret_cast<VkEvent>(stream->getBe64());
+            const Boxed<VkEvent> boxed_event = Boxed<VkEvent>::fromRaw(stream->getBe64());
             const VkEvent unboxed_event = unbox_VkEvent(boxed_event);
-            const VkQueue boxed_queue = reinterpret_cast<VkQueue>(stream->getBe64());
+            const Boxed<VkQueue> boxed_queue = Boxed<VkQueue>::fromRaw(stream->getBe64());
             const uint64_t flags = stream->getBe64();
             const bool isFromHost = stream->getBe32() ? true : false;
 
@@ -480,8 +482,8 @@ class VkDecoderGlobalState::Impl {
         stream->putBe32(sz);
         for (const auto& [event, eventInfo] : mEventInfo) {
             if (eventInfo.isSignaled) {
-                stream->putBe64(reinterpret_cast<uint64_t>(eventInfo.boxed));
-                stream->putBe64(reinterpret_cast<uint64_t>(eventInfo.boxed_queue));
+                stream->putBe64(reinterpret_cast<uint64_t>(eventInfo.boxed.value()));
+                stream->putBe64(reinterpret_cast<uint64_t>(eventInfo.boxed_queue.value()));
                 stream->putBe64(eventInfo.flags);
                 stream->putBe32(eventInfo.isFromHost ? 1 : 0);
             }
@@ -498,7 +500,7 @@ class VkDecoderGlobalState::Impl {
         stream->putBe32(sz);
         for (const auto& [semaphore, semaphoreInfo] : mSemaphoreInfo) {
             if (semaphoreInfo.isSignaled) {
-                stream->putBe64(reinterpret_cast<uint64_t>(semaphoreInfo.boxed));
+                stream->putBe64(reinterpret_cast<uint64_t>(semaphoreInfo.boxed.value()));
             }
         }
     }
@@ -506,7 +508,8 @@ class VkDecoderGlobalState::Impl {
     void loadSemaphores(gfxstream::Stream* stream) REQUIRES(mMutex) {
         const uint32_t sz = stream->getBe32();
         for (uint32_t i = 0; i < sz; ++i) {
-            const VkSemaphore boxed_semaphore = reinterpret_cast<VkSemaphore>(stream->getBe64());
+            const Boxed<VkSemaphore> boxed_semaphore =
+                Boxed<VkSemaphore>::fromRaw(stream->getBe64());
             const VkSemaphore unboxed_semaphore = unbox_VkSemaphore(boxed_semaphore);
 
             SemaphoreInfo& semaphoreInfo = mSemaphoreInfo[unboxed_semaphore];
@@ -524,8 +527,8 @@ class VkDecoderGlobalState::Impl {
         if (!cmdBufferInfo) {
             GFXSTREAM_WARNING("Failed to find unboxed command buffer: 0x%llx boxed 0x%llx",
                               reinterpret_cast<unsigned long long>(commandBuffer),
-                              reinterpret_cast<unsigned long long>(
-                                  unboxed_to_boxed_VkCommandBuffer(commandBuffer)));
+                              static_cast<unsigned long long>(
+                                  reinterpret_cast<uint64_t>(unboxed_to_boxed_VkCommandBuffer(commandBuffer).value())));
             return;
         }
         for (auto event : cmdBufferInfo->eventsSet) {
@@ -540,7 +543,7 @@ class VkDecoderGlobalState::Impl {
             auto* eventInfo = gfxstream::base::find(mEventInfo, event);
             if (eventInfo) {
                 eventInfo->isSignaled = false;
-                eventInfo->boxed_queue = VK_NULL_HANDLE;
+                eventInfo->boxed_queue = Boxed<VkQueue>();
                 eventInfo->flags = 0;
             }
         }
@@ -635,7 +638,7 @@ class VkDecoderGlobalState::Impl {
 
         GFXSTREAM_DEBUG("snapshot save: setup internal structures");
         {
-            std::unordered_map<VkDevice, uint32_t> deviceToContextId;
+            std::unordered_map<Boxed<VkDevice>, uint32_t> deviceToContextId;
             for (const auto& [device, deviceInfo] : mDeviceInfo) {
                 if (!deviceInfo.virtioGpuContextId) {
                     GFXSTREAM_FATAL("VkDevice:%p missing context id.", device);
@@ -644,7 +647,7 @@ class VkDecoderGlobalState::Impl {
             }
             stream->putBe64(static_cast<uint64_t>(deviceToContextId.size()));
             for (const auto [device, contextId] : deviceToContextId) {
-                stream->putBe64(reinterpret_cast<uint64_t>(device));
+                stream->putBe64(reinterpret_cast<uint64_t>(device.value()));
                 stream->putBe32(contextId);
             }
         }
@@ -653,7 +656,7 @@ class VkDecoderGlobalState::Impl {
         {
             stream->putBe64(static_cast<uint64_t>(mInstanceInfo.size()));
             for (const auto& [instance, instanceInfo] : mInstanceInfo) {
-                stream->putBe64(reinterpret_cast<uint64_t>(instanceInfo.boxed));
+                stream->putBe64(reinterpret_cast<uint64_t>(instanceInfo.boxed.value()));
                 stream->putBe32(reinterpret_cast<uint32_t>(instanceInfo.contextId));
             }
         }
@@ -666,8 +669,8 @@ class VkDecoderGlobalState::Impl {
         GFXSTREAM_DEBUG("snapshot save: mapped memory and host blob ids");
         stream->putBe32(static_cast<uint32_t>(mMemoryInfo.size()));
         for (const auto& it : mMemoryInfo) {
-            stream->putBe64(reinterpret_cast<uint64_t>(
-                unboxed_to_boxed_non_dispatchable_VkDeviceMemory(it.first)));
+            stream->putBe64(
+                reinterpret_cast<uint64_t>(unboxed_to_boxed_non_dispatchable_VkDeviceMemory(it.first).value()));
 
             bool hasPtr = it.second.ptr != nullptr;
             stream->putByte(hasPtr ? 1 : 0);
@@ -686,7 +689,7 @@ class VkDecoderGlobalState::Impl {
         // snapshot buffers before images so that on load, loadImageContent (vkCmdCopyBufferToImage)
         // is always the final write to any unified/shared VkDeviceMemory.
         GFXSTREAM_DEBUG("snapshot save: buffers");
-        std::vector<VkBuffer> sortedBoxedBuffers;
+        std::vector<Boxed<VkBuffer>> sortedBoxedBuffers;
         for (const auto& bufferIte : mBufferInfo) {
             sortedBoxedBuffers.push_back(
                 unboxed_to_boxed_non_dispatchable_VkBuffer(bufferIte.first));
@@ -695,7 +698,8 @@ class VkDecoderGlobalState::Impl {
         for (const auto& boxedBuffer : sortedBoxedBuffers) {
             auto unboxedBuffer = try_unbox_VkBuffer(boxedBuffer);
             if (unboxedBuffer == VK_NULL_HANDLE) {
-                GFXSTREAM_ERROR("Failed to unbox VkBuffer %p when saving snapshot.", boxedBuffer);
+                GFXSTREAM_ERROR("Failed to unbox VkBuffer %p when saving snapshot.",
+                                boxedBuffer.value());
                 return false;
             }
             const BufferInfo& bufferInfo = mBufferInfo[unboxedBuffer];
@@ -716,7 +720,7 @@ class VkDecoderGlobalState::Impl {
         }
 
         GFXSTREAM_DEBUG("snapshot save: image content");
-        std::vector<VkImage> sortedBoxedImages;
+        std::vector<Boxed<VkImage>> sortedBoxedImages;
         for (const auto& imageIte : mImageInfo) {
             sortedBoxedImages.push_back(unboxed_to_boxed_non_dispatchable_VkImage(imageIte.first));
         }
@@ -726,14 +730,16 @@ class VkDecoderGlobalState::Impl {
         for (const auto& boxedImage : sortedBoxedImages) {
             auto unboxedImage = try_unbox_VkImage(boxedImage);
             if (unboxedImage == VK_NULL_HANDLE) {
-                GFXSTREAM_ERROR("Failed to unbox VkImage %p when saving snapshot.", boxedImage);
+                GFXSTREAM_ERROR("Failed to unbox VkImage %p when saving snapshot.",
+                                boxedImage.value());
                 return false;
             }
             const ImageInfo& imageInfo = mImageInfo[unboxedImage];
+            const VkDeviceMemory memory = imageInfo.getBoundMemory();
 
             // Color buffer is saved in ColorBufferVk already
             const bool hasContentToSave =
-                (imageInfo.memory != VK_NULL_HANDLE) && !isMemoryBoundToColorBuffer(imageInfo.memory);
+                (memory != VK_NULL_HANDLE) && !isMemoryBoundToColorBuffer(memory);
             stream->putBe32(hasContentToSave ? 1 : 0);
             if (!hasContentToSave) {
                 continue;
@@ -741,8 +747,9 @@ class VkDecoderGlobalState::Impl {
 
             uint32_t layoutVal = static_cast<uint32_t>(imageInfo.layout);
             if (!isValidImageLayoutForSnapshot(layoutVal)) {
-                GFXSTREAM_ERROR("Snapshot save: image %p layout %s [%u] is invalid", boxedImage,
-                                string_VkImageLayout(imageInfo.layout), layoutVal);
+                GFXSTREAM_ERROR("Snapshot save: image %p layout %s [%u] is invalid",
+                                boxedImage.value(), string_VkImageLayout(imageInfo.layout),
+                                layoutVal);
                 return false;
             }
             // Vulkan command playback doesn't recover image layout. We need to do it here.
@@ -759,7 +766,7 @@ class VkDecoderGlobalState::Impl {
 
         // snapshot descriptors
         GFXSTREAM_DEBUG("snapshot save: descriptors");
-        std::vector<VkDescriptorPool> sortedBoxedDescriptorPools;
+        std::vector<Boxed<VkDescriptorPool>> sortedBoxedDescriptorPools;
         for (const auto& descriptorPoolIte : mDescriptorPoolInfo) {
             auto boxed =
                 unboxed_to_boxed_non_dispatchable_VkDescriptorPool(descriptorPoolIte.first);
@@ -775,15 +782,24 @@ class VkDecoderGlobalState::Impl {
             // Boxed VkDescriptorSet handles whose contents are serialized for this
             // pool, one record each.
             auto boxedSetsToSave = poolInfo.preallocatedBoxedSets;
-            if (!m_vkEmulation->getFeatures().VulkanBatchedDescriptorSetUpdate.enabled()) {
+            if (!mBatchedDescriptorSetUpdateEnabled) {
                 // Without batched updates there are no pre-minted slots, so
                 // serialize the sets that are currently allocated instead.
                 boxedSetsToSave.clear();
                 for (auto it : poolInfo.allocatedSetsUnboxedToBoxed) {
                     auto boxedSet = it.second;
-                    boxedSetsToSave.push_back((uint64_t)boxedSet);
+                    boxedSetsToSave.push_back(reinterpret_cast<uint64_t>(boxedSet.value()));
                 }
                 sort(boxedSetsToSave.begin(), boxedSetsToSave.end());
+            } else if (!poolInfo.nonPreallocatedBoxedSets.empty()) {
+                std::vector<uint64_t> extraBoxedSets;
+                extraBoxedSets.reserve(poolInfo.nonPreallocatedBoxedSets.size());
+                for (Boxed<VkDescriptorSet> boxedSet : poolInfo.nonPreallocatedBoxedSets) {
+                    extraBoxedSets.push_back(reinterpret_cast<uint64_t>(boxedSet.value()));
+                }
+                std::sort(extraBoxedSets.begin(), extraBoxedSets.end());
+                boxedSetsToSave.insert(boxedSetsToSave.end(), extraBoxedSets.begin(),
+                                       extraBoxedSets.end());
             }
             int dcount = boxedSetsToSave.size();
             GFXSTREAM_DEBUG("snapshot save: %d descriptor sets for this pool", dcount);
@@ -803,10 +819,10 @@ class VkDecoderGlobalState::Impl {
 
                 const DescriptorSetInfo& descriptorSetInfo =
                     mDescriptorSetInfo[(VkDescriptorSet)setHandleInfo->underlying];
-                VkDescriptorSetLayout boxedLayout =
+                Boxed<VkDescriptorSetLayout> boxedLayout =
                     unboxed_to_boxed_non_dispatchable_VkDescriptorSetLayout(
                         descriptorSetInfo.unboxedLayout);
-                stream->putBe64((uint64_t)boxedLayout);
+                stream->putBe64(reinterpret_cast<uint64_t>(boxedLayout.value()));
                 // Count all valid descriptors.
                 //
                 // There is a use case where user can create an image, write it to a descriptor,
@@ -841,10 +857,8 @@ class VkDecoderGlobalState::Impl {
                 std::vector<std::pair<int, int>> validWriteIndices;
                 for (int bindingIdx = 0; bindingIdx < (int)descriptorSetInfo.allWrites.size();
                      bindingIdx++) {
-                    for (int bindingElemIdx = 0;
-                         bindingElemIdx < (int)descriptorSetInfo.allWrites[bindingIdx].size();
-                         bindingElemIdx++) {
-                        const auto& entry = descriptorSetInfo.allWrites[bindingIdx][bindingElemIdx];
+                    for (const auto& [bindingElemIdx, entry] :
+                         descriptorSetInfo.allWrites[bindingIdx]) {
                         if (entry.writeType == DescriptorSetInfo::DescriptorWriteType::Empty) {
                             continue;
                         }
@@ -863,13 +877,15 @@ class VkDecoderGlobalState::Impl {
                         if (!isValid) {
                             continue;
                         }
-                        validWriteIndices.push_back(std::make_pair(bindingIdx, bindingElemIdx));
+                        validWriteIndices.push_back(
+                            std::make_pair(bindingIdx, (int)bindingElemIdx));
                     }
                 }
+                std::sort(validWriteIndices.begin(), validWriteIndices.end());
                 stream->putBe64(validWriteIndices.size());
                 // Save all valid descriptors
                 for (const auto& idx : validWriteIndices) {
-                    const auto& entry = descriptorSetInfo.allWrites[idx.first][idx.second];
+                    const auto& entry = descriptorSetInfo.allWrites[idx.first].at(idx.second);
                     stream->putBe32(idx.first);
                     stream->putBe32(idx.second);
                     stream->putBe32(entry.writeType);
@@ -883,10 +899,12 @@ class VkDecoderGlobalState::Impl {
                                 descriptorTypeContainsImage(entry.descriptorType)
                                     ? unboxed_to_boxed_non_dispatchable_VkImageView(
                                           imageInfo.imageView)
+                                          .value()
                                     : VK_NULL_HANDLE;
                             imageInfo.sampler =
                                 descriptorTypeContainsSampler(entry.descriptorType)
                                     ? unboxed_to_boxed_non_dispatchable_VkSampler(imageInfo.sampler)
+                                          .value()
                                     : VK_NULL_HANDLE;
                             stream->write(&imageInfo, sizeof(imageInfo));
                         } break;
@@ -894,13 +912,15 @@ class VkDecoderGlobalState::Impl {
                             VkDescriptorBufferInfo bufferInfo = entry.bufferInfo;
                             // Get the unboxed version
                             bufferInfo.buffer =
-                                unboxed_to_boxed_non_dispatchable_VkBuffer(bufferInfo.buffer);
+                                unboxed_to_boxed_non_dispatchable_VkBuffer(bufferInfo.buffer)
+                                    .value();
                             stream->write(&bufferInfo, sizeof(bufferInfo));
                         } break;
                         case DescriptorSetInfo::DescriptorWriteType::BufferView: {
                             // Get the unboxed version
                             VkBufferView bufferView =
-                                unboxed_to_boxed_non_dispatchable_VkBufferView(entry.bufferView);
+                                unboxed_to_boxed_non_dispatchable_VkBufferView(entry.bufferView)
+                                    .value();
                             stream->write(&bufferView, sizeof(bufferView));
                         } break;
                         case DescriptorSetInfo::DescriptorWriteType::InlineUniformBlock: {
@@ -985,7 +1005,7 @@ class VkDecoderGlobalState::Impl {
             for (uint64_t i = 0; i < count; i++) {
                 const uint64_t device = stream->getBe64();
                 const uint32_t contextId = stream->getBe32();
-                (*mSnapshotLoadVkDeviceToVirtioCpuContextId)[reinterpret_cast<VkDevice>(device)] =
+                (*mSnapshotLoadVkDeviceToVirtioCpuContextId)[Boxed<VkDevice>::fromRaw(device)] =
                     contextId;
             }
         }
@@ -997,7 +1017,7 @@ class VkDecoderGlobalState::Impl {
             for (uint64_t i = 0; i < count; i++) {
                 const uint64_t boxed_instance = stream->getBe64();
                 const uint64_t contextId = stream->getBe32();
-                mSnapshotLoadBoxedInstance2ContextId[reinterpret_cast<VkInstance>(boxed_instance)] =
+                mSnapshotLoadBoxedInstance2ContextId[Boxed<VkInstance>::fromRaw(boxed_instance)] =
                     contextId;
             }
         }
@@ -1046,7 +1066,8 @@ class VkDecoderGlobalState::Impl {
             GFXSTREAM_DEBUG("snapshot load: mapped memory and host blob ids");
             uint32_t memoryCount = stream->getBe32();
             for (uint32_t i = 0; i < memoryCount; i++) {
-                VkDeviceMemory boxedMemory = reinterpret_cast<VkDeviceMemory>(stream->getBe64());
+                Boxed<VkDeviceMemory> boxedMemory =
+                    Boxed<VkDeviceMemory>::fromRaw(stream->getBe64());
                 VkDeviceMemory unboxedMemory = try_unbox_VkDeviceMemory(boxedMemory);
                 auto it = (unboxedMemory != VK_NULL_HANDLE) ? mMemoryInfo.find(unboxedMemory)
                                                             : mMemoryInfo.end();
@@ -1054,7 +1075,7 @@ class VkDecoderGlobalState::Impl {
                     GFXSTREAM_WARNING(
                         "Snapshot load: cannot find memory handle for VkDeviceMemory:%p, "
                         "skipping memory info restore.",
-                        boxedMemory);
+                        boxedMemory.value());
                     bool hasPtr = stream->getByte() != 0;
                     if (hasPtr) {
                         VkDeviceSize size = stream->getBe64();
@@ -1073,7 +1094,7 @@ class VkDecoderGlobalState::Impl {
                         GFXSTREAM_ERROR(
                             "Snapshot load failure: memory size does not match for "
                             "VkDeviceMemory:%p",
-                            boxedMemory);
+                            boxedMemory.value());
                         return false;
                     }
                 }
@@ -1128,7 +1149,7 @@ class VkDecoderGlobalState::Impl {
             // snapshot buffers before images so that loadImageContent (vkCmdCopyBufferToImage)
             // is always the final write to any unified/shared VkDeviceMemory.
             GFXSTREAM_DEBUG("snapshot load: buffers");
-            std::vector<VkBuffer> sortedBoxedBuffers;
+            std::vector<Boxed<VkBuffer>> sortedBoxedBuffers;
             for (const auto& bufferIte : mBufferInfo) {
                 sortedBoxedBuffers.push_back(
                     unboxed_to_boxed_non_dispatchable_VkBuffer(bufferIte.first));
@@ -1137,7 +1158,8 @@ class VkDecoderGlobalState::Impl {
             for (const auto& boxedBuffer : sortedBoxedBuffers) {
                 auto unboxedBuffer = try_unbox_VkBuffer(boxedBuffer);
                 if (unboxedBuffer == VK_NULL_HANDLE) {
-                    GFXSTREAM_ERROR("Failed to unbox VkBuffer %p when loading snapshot.", boxedBuffer);
+                    GFXSTREAM_ERROR("Failed to unbox VkBuffer %p when loading snapshot.",
+                                    boxedBuffer.value());
                     return false;
                 }
                 const BufferInfo& bufferInfo = mBufferInfo[unboxedBuffer];
@@ -1146,7 +1168,9 @@ class VkDecoderGlobalState::Impl {
                     continue;
                 }
                 if (bufferInfo.memory == VK_NULL_HANDLE) {
-                    GFXSTREAM_ERROR("Snapshot load failure: buffer %p has content to load but no memory.", boxedBuffer);
+                    GFXSTREAM_ERROR(
+                        "Snapshot load failure: buffer %p has content to load but no memory.",
+                        boxedBuffer.value());
                     return false;
                 }
                 // TODO: add a special case for host mapped memory
@@ -1160,7 +1184,7 @@ class VkDecoderGlobalState::Impl {
             }
 
             GFXSTREAM_DEBUG("snapshot load: image content");
-            std::vector<VkImage> sortedBoxedImages;
+            std::vector<Boxed<VkImage>> sortedBoxedImages;
             for (const auto& imageIte : mImageInfo) {
                 sortedBoxedImages.push_back(
                     unboxed_to_boxed_non_dispatchable_VkImage(imageIte.first));
@@ -1169,8 +1193,8 @@ class VkDecoderGlobalState::Impl {
             for (const auto& boxedImage : sortedBoxedImages) {
                 auto unboxedImage = try_unbox_VkImage(boxedImage);
                 if (unboxedImage == VK_NULL_HANDLE) {
-                    GFXSTREAM_ERROR(
-                        "Failed to unbox VkImage %p when loading snapshot.", boxedImage);
+                    GFXSTREAM_ERROR("Failed to unbox VkImage %p when loading snapshot.",
+                                    boxedImage.value());
                     return false;
                 }
 
@@ -1181,11 +1205,12 @@ class VkDecoderGlobalState::Impl {
                     continue;
                 }
 
-                if (imageInfo.memory == VK_NULL_HANDLE || isMemoryBoundToColorBuffer(imageInfo.memory)) {
+                const VkDeviceMemory memory = imageInfo.getBoundMemory();
+                if (memory == VK_NULL_HANDLE || isMemoryBoundToColorBuffer(memory)) {
                     // Color buffer should have been handled by ColorBufferVk already
                     // and saved with 'hasContentToSave' set to false.
                     GFXSTREAM_ERROR("Cannot load image %p with content in the snapshot",
-                                    boxedImage);
+                                    boxedImage.value());
                     return false;
                 }
 
@@ -1202,7 +1227,8 @@ class VkDecoderGlobalState::Impl {
                 if (!isValidImageLayoutForSnapshot(layoutRead)) {
                     // We check this when saving the layout, so it should never happen here unless
                     // the stream is corrupted.
-                    GFXSTREAM_ERROR("Snapshot load: image %p layout %s [%u] is invalid", boxedImage,
+                    GFXSTREAM_ERROR("Snapshot load: image %p layout %s [%u] is invalid",
+                                    boxedImage.value(),
                                     string_VkImageLayout(static_cast<VkImageLayout>(layoutRead)),
                                     layoutRead);
                     return false;
@@ -1220,15 +1246,17 @@ class VkDecoderGlobalState::Impl {
             // snapshot descriptors
             GFXSTREAM_DEBUG("snapshot load: descriptors");
             gfxstream::base::BumpPool bumpPool;
-            std::vector<VkDescriptorPool> sortedBoxedDescriptorPools;
+            std::vector<Boxed<VkDescriptorPool>> sortedBoxedDescriptorPools;
             for (const auto& descriptorPoolIte : mDescriptorPoolInfo) {
                 auto boxed =
                     unboxed_to_boxed_non_dispatchable_VkDescriptorPool(descriptorPoolIte.first);
                 sortedBoxedDescriptorPools.push_back(boxed);
             }
             sort(sortedBoxedDescriptorPools.begin(), sortedBoxedDescriptorPools.end());
-            const bool needToUnboxDescriptorSet =
-                !(m_vkEmulation->getFeatures().VulkanBatchedDescriptorSetUpdate.enabled());
+            // writeDescriptorSets constructed below store boxed dstSet handles, and pendingAlloc
+            // is false for already-replayed sets (including nonPreallocatedBoxedSets when batched
+            // updates are enabled), so always unbox dstSet to setsToUpdate[i].
+            const bool needToUnboxDescriptorSet = true;
             for (const auto& boxedDescriptorPool : sortedBoxedDescriptorPools) {
                 auto unboxedDescriptorPool = unbox_VkDescriptorPool(boxedDescriptorPool);
                 DescriptorPoolInfo& poolInfo = mDescriptorPoolInfo[unboxedDescriptorPool];
@@ -1237,6 +1265,7 @@ class VkDecoderGlobalState::Impl {
                 // Boxed VkDescriptorSet handles whose contents are restored for
                 // this pool (passed as the "pool ids" of the commit below).
                 std::vector<uint64_t> boxedSetsToRestore;
+                std::vector<uint32_t> pendingAlloc;
                 std::vector<VkWriteDescriptorSet> writeDescriptorSets;
                 std::vector<uint32_t> writeStartingIndices;
                 // Boxed sets that save() wrote a record for (and that were
@@ -1265,15 +1294,23 @@ class VkDecoderGlobalState::Impl {
                     savedBoxedSets.insert(boxedSet);
                     GFXSTREAM_DEBUG("snapshot load: 0x%llx descriptor set for this pool",
                                     (unsigned long long)boxedSet);
-                    VkDescriptorSetLayout boxedLayout = (VkDescriptorSetLayout)stream->getBe64();
+                    Boxed<VkDescriptorSetLayout> boxedLayout =
+                        Boxed<VkDescriptorSetLayout>::fromRaw(stream->getBe64());
                     VkDescriptorSetLayout unboxedLayout =
                         try_unbox_VkDescriptorSetLayout(boxedLayout);
                     BoxedHandleInfo* setHandleInfo = sBoxedHandleManager.get(boxedSet);
-                    bool setValid = (setHandleInfo != nullptr && setHandleInfo->underlying != 0 &&
-                                     (boxedLayout == VK_NULL_HANDLE ||
-                                      unboxedLayout != VK_NULL_HANDLE));
+                    const bool isPreallocatedSlot =
+                        mBatchedDescriptorSetUpdateEnabled &&
+                        !poolInfo.nonPreallocatedBoxedSets.count(
+                            Boxed<VkDescriptorSet>::fromRaw(boxedSet));
+                    const bool layoutValid = (!boxedLayout || unboxedLayout != VK_NULL_HANDLE);
+                    bool setValid = (setHandleInfo != nullptr &&
+                                     (setHandleInfo->underlying != 0 ||
+                                      (isPreallocatedSlot && unboxedLayout != VK_NULL_HANDLE)) &&
+                                     layoutValid);
                     if (setValid) {
                         boxedSetsToRestore.push_back(boxedSet);
+                        pendingAlloc.push_back(setHandleInfo->underlying == 0 ? 1u : 0u);
                         writeStartingIndices.push_back(writeDescriptorSets.size());
                         layouts.push_back(unboxedLayout);
                     }
@@ -1300,8 +1337,8 @@ class VkDecoderGlobalState::Impl {
                                 writeDescriptorSet.pImageInfo = tmpImageInfos.back().get();
                                 VkDescriptorImageInfo& imageInfo = *tmpImageInfos.back();
                                 stream->read(&imageInfo, sizeof(imageInfo));
-                                VkImageView boxedImageView = imageInfo.imageView;
-                                VkSampler boxedSampler = imageInfo.sampler;
+                                Boxed<VkImageView> boxedImageView(imageInfo.imageView);
+                                Boxed<VkSampler> boxedSampler(imageInfo.sampler);
                                 imageInfo.imageView =
                                     descriptorTypeContainsImage(descriptorType)
                                         ? try_unbox_VkImageView(boxedImageView)
@@ -1311,11 +1348,9 @@ class VkDecoderGlobalState::Impl {
                                         ? try_unbox_VkSampler(boxedSampler)
                                         : VK_NULL_HANDLE;
                                 if ((descriptorTypeContainsImage(descriptorType) &&
-                                     boxedImageView != VK_NULL_HANDLE &&
-                                     imageInfo.imageView == VK_NULL_HANDLE) ||
+                                     boxedImageView && imageInfo.imageView == VK_NULL_HANDLE) ||
                                     (descriptorTypeContainsSampler(descriptorType) &&
-                                     boxedSampler != VK_NULL_HANDLE &&
-                                     imageInfo.sampler == VK_NULL_HANDLE)) {
+                                     boxedSampler && imageInfo.sampler == VK_NULL_HANDLE)) {
                                     writeValid = false;
                                 }
                             } break;
@@ -1325,10 +1360,9 @@ class VkDecoderGlobalState::Impl {
                                 writeDescriptorSet.pBufferInfo = tmpBufferInfos.back().get();
                                 VkDescriptorBufferInfo& bufferInfo = *tmpBufferInfos.back();
                                 stream->read(&bufferInfo, sizeof(bufferInfo));
-                                VkBuffer boxedBuffer = bufferInfo.buffer;
+                                Boxed<VkBuffer> boxedBuffer(bufferInfo.buffer);
                                 bufferInfo.buffer = try_unbox_VkBuffer(boxedBuffer);
-                                if (boxedBuffer != VK_NULL_HANDLE &&
-                                    bufferInfo.buffer == VK_NULL_HANDLE) {
+                                if (boxedBuffer && bufferInfo.buffer == VK_NULL_HANDLE) {
                                     writeValid = false;
                                 }
                             } break;
@@ -1337,10 +1371,9 @@ class VkDecoderGlobalState::Impl {
                                 writeDescriptorSet.pTexelBufferView = tmpBufferViews.back().get();
                                 VkBufferView& bufferView = *tmpBufferViews.back();
                                 stream->read(&bufferView, sizeof(bufferView));
-                                VkBufferView boxedBufferView = bufferView;
+                                Boxed<VkBufferView> boxedBufferView(bufferView);
                                 bufferView = try_unbox_VkBufferView(boxedBufferView);
-                                if (boxedBufferView != VK_NULL_HANDLE &&
-                                    bufferView == VK_NULL_HANDLE) {
+                                if (boxedBufferView && bufferView == VK_NULL_HANDLE) {
                                     writeValid = false;
                                 }
                             } break;
@@ -1385,21 +1418,24 @@ class VkDecoderGlobalState::Impl {
                     }
                 }
                 std::vector<uint32_t> whichPool(boxedSetsToRestore.size(), 0);
-                // no need to allocate descriptors as this is not batched
-                // all the descriptors are already allocated
-                std::vector<uint32_t> pendingAlloc(boxedSetsToRestore.size(), false);
 
                 const auto& device = poolInfo.device;
                 const auto& deviceInfo = gfxstream::base::find(mDeviceInfo, device);
                 VulkanDispatch* dvk = dispatch_VkDevice(deviceInfo->boxed);
-                if (!m_vkEmulation->getFeatures().VulkanBatchedDescriptorSetUpdate.enabled()) {
+                if (!mBatchedDescriptorSetUpdateEnabled ||
+                    !poolInfo.nonPreallocatedBoxedSets.empty()) {
                     // Replay may have recreated descriptor sets that were no longer
                     // allocated when the snapshot was saved. Drop them so that the
                     // pool accounting matches the saved state.
                     std::vector<VkDescriptorSet> staleUnboxedSets;
                     for (const auto& [allocedUnboxedSet, allocedBoxedSet] :
                          poolInfo.allocatedSetsUnboxedToBoxed) {
-                        if (savedBoxedSets.find((uint64_t)allocedBoxedSet) ==
+                        if (mBatchedDescriptorSetUpdateEnabled &&
+                            !poolInfo.nonPreallocatedBoxedSets.count(allocedBoxedSet)) {
+                            continue;
+                        }
+                        if (savedBoxedSets.find(
+                                reinterpret_cast<uint64_t>(allocedBoxedSet.value())) ==
                             savedBoxedSets.end()) {
                             staleUnboxedSets.push_back(allocedUnboxedSet);
                         }
@@ -1417,13 +1453,14 @@ class VkDecoderGlobalState::Impl {
                         }
                     }
                     for (VkDescriptorSet staleSet : staleUnboxedSets) {
-                        VkDescriptorSet boxedStaleSet =
+                        Boxed<VkDescriptorSet> boxedStaleSet =
                             poolInfo.allocatedSetsUnboxedToBoxed[staleSet];
                         if (auto* setInfo = gfxstream::base::find(mDescriptorSetInfo, staleSet)) {
                             removeDescriptorSetAllocationLocked(poolInfo, setInfo->bindings);
                         }
                         mDescriptorSetInfo.erase(staleSet);
                         poolInfo.allocatedSetsUnboxedToBoxed.erase(staleSet);
+                        poolInfo.nonPreallocatedBoxedSets.erase(boxedStaleSet);
                         delete_VkDescriptorSet(boxedStaleSet);
                     }
                 }
@@ -1443,7 +1480,7 @@ class VkDecoderGlobalState::Impl {
             std::vector<VkFence> unsignaledFencesBoxed(fenceCount);
             stream->read(unsignaledFencesBoxed.data(), fenceCount * sizeof(VkFence));
             for (VkFence boxedFence : unsignaledFencesBoxed) {
-                VkFence unboxedFence = unbox_VkFence(boxedFence);
+                VkFence unboxedFence = unbox_VkFence(Boxed<VkFence>(boxedFence));
                 auto it = mFenceInfo.find(unboxedFence);
                 if (it == mFenceInfo.end()) {
                     GFXSTREAM_ERROR("Snapshot load failure: unrecognized VkFence");
@@ -1492,13 +1529,13 @@ class VkDecoderGlobalState::Impl {
     }
 
     PFN_vkVoidFunction on_vkGetInstanceProcAddr(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
-                                                VkInstance, const char*) {
+                                                Boxed<VkInstance>, const char*) {
         // Guest can not use host function pointers.
         return nullptr;
     }
 
     PFN_vkVoidFunction on_vkGetDeviceProcAddr(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
-                                              VkDevice, const char*) {
+                                              Boxed<VkDevice>, const char*) {
         // Guest can not use host function pointers.
         return nullptr;
     }
@@ -1682,7 +1719,7 @@ class VkDecoderGlobalState::Impl {
         }
 #endif
         // Box it up
-        VkInstance boxed = new_boxed_VkInstance(*pInstance, nullptr);
+        Boxed<VkInstance> boxed = new_boxed_VkInstance(*pInstance, nullptr);
         init_vulkan_dispatch_from_instance(m_vk, *pInstance, dispatch_VkInstance(boxed));
         info.boxed = boxed;
 
@@ -1715,13 +1752,13 @@ class VkDecoderGlobalState::Impl {
         VALIDATE_NEW_HANDLE_INFO_ENTRY(mInstanceInfo, *pInstance);
         mInstanceInfo[*pInstance] = std::move(info);
 
-        *pInstance = (VkInstance)boxed;
+        *pInstance = boxed.value();
 
         if (vkCleanupEnabled() && m_vkEmulation->getGlobalState()) {
             m_vkEmulation->getGlobalState()->registerProcessCleanupCallback(
                 unbox_VkInstance(boxed), contextId, [this, boxed] {
                     if (snapshotsEnabled()) {
-                        snapshot()->vkDestroyInstance(nullptr, kInvalidSnapshotApiCallHandle, nullptr, 0, boxed, nullptr);
+                        snapshot()->vkDestroyInstance(nullptr, kInvalidSnapshotApiCallHandle, nullptr, 0, boxed.value(), nullptr);
                     }
                     vkDestroyInstanceImpl(unbox_VkInstance(boxed));
                 });
@@ -1770,7 +1807,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyInstance(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                              VkInstance boxed_instance, const VkAllocationCallbacks*) {
+                              Boxed<VkInstance> boxed_instance, const VkAllocationCallbacks*) {
         auto instance = try_unbox_VkInstance(boxed_instance);
         if (instance == VK_NULL_HANDLE) {
             return;
@@ -1908,7 +1945,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkEnumeratePhysicalDevices(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                           VkInstance boxed_instance,
+                                           Boxed<VkInstance> boxed_instance,
                                            uint32_t* pPhysicalDeviceCount,
                                            VkPhysicalDevice* pPhysicalDevices) {
         auto instance = unbox_VkInstance(boxed_instance);
@@ -1932,7 +1969,7 @@ class VkDecoderGlobalState::Impl {
             }
         }
 
-        const std::vector<VkPhysicalDevice>& boxedPhysicalDevices =
+        const std::vector<Boxed<VkPhysicalDevice>>& boxedPhysicalDevices =
             instanceInfo->boxedPhysicalDevices;
         const uint32_t availableCount = static_cast<uint32_t>(boxedPhysicalDevices.size());
 
@@ -1952,14 +1989,16 @@ class VkDecoderGlobalState::Impl {
         // number copied here.
         const uint32_t requestedCount = *pPhysicalDeviceCount;
         const uint32_t writtenCount = std::min(requestedCount, availableCount);
-        std::copy_n(boxedPhysicalDevices.begin(), writtenCount, pPhysicalDevices);
+        for (uint32_t i = 0; i < writtenCount; ++i) {
+            pPhysicalDevices[i] = boxedPhysicalDevices[i].value();
+        }
         *pPhysicalDeviceCount = writtenCount;
 
         return writtenCount < availableCount ? VK_INCOMPLETE : VK_SUCCESS;
     }
 
     void on_vkGetPhysicalDeviceFeatures(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                        VkPhysicalDevice boxed_physicalDevice,
+                                        Boxed<VkPhysicalDevice> boxed_physicalDevice,
                                         VkPhysicalDeviceFeatures* pFeatures) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
         auto vk = dispatch_VkPhysicalDevice(boxed_physicalDevice);
@@ -1983,7 +2022,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkGetPhysicalDeviceFeatures2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                         VkPhysicalDevice boxed_physicalDevice,
+                                         Boxed<VkPhysicalDevice> boxed_physicalDevice,
                                          VkPhysicalDeviceFeatures2* pFeatures) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
         auto vk = dispatch_VkPhysicalDevice(boxed_physicalDevice);
@@ -2039,16 +2078,7 @@ class VkDecoderGlobalState::Impl {
                 vk_find_struct<VkPhysicalDeviceProtectedMemoryFeatures>(pFeatures);
             VkPhysicalDevicePipelineProtectedAccessFeatures* pipelineAccessFeatures =
                 vk_find_struct<VkPhysicalDevicePipelineProtectedAccessFeatures>(pFeatures);
-            VkPhysicalDeviceHostImageCopyFeaturesEXT* hostImageCopyFeatures =
-                vk_find_struct<VkPhysicalDeviceHostImageCopyFeaturesEXT>(pFeatures);
 
-            // TODO(b/569943457): Implement support for host image copy extension
-            if (hostImageCopyFeatures) {
-                hostImageCopyFeatures->hostImageCopy = VK_FALSE;
-            }
-            if (vulkan14Features) {
-                vulkan14Features->hostImageCopy = VK_FALSE;
-            }
             if (m_vkEmulation->isShaderFloatControls2Disabled()) {
                 vk_util::clearShaderFloatControls2Features(pFeatures);
             }
@@ -2091,6 +2121,23 @@ class VkDecoderGlobalState::Impl {
             }
         }
 
+        // Host image copies need the guest to send the memory referenced by pHostPointer in
+        // VkHostPointerResolveGOOGLE. Older guests send guest addresses instead, so hide the
+        // feature from them regardless of BypassVulkanDeviceFeatureOverrides.
+        if (!instanceInfo->hasGuestCapability(
+                VK_GUEST_CAPABILITY_HOST_POINTER_RESOLVE_BIT_GOOGLE)) {
+            VkPhysicalDeviceHostImageCopyFeatures* hostImageCopyFeatures =
+                vk_find_struct<VkPhysicalDeviceHostImageCopyFeatures>(pFeatures);
+            if (hostImageCopyFeatures != nullptr) {
+                hostImageCopyFeatures->hostImageCopy = VK_FALSE;
+            }
+            VkPhysicalDeviceVulkan14Features* vulkan14Features =
+                vk_find_struct<VkPhysicalDeviceVulkan14Features>(pFeatures);
+            if (vulkan14Features != nullptr) {
+                vulkan14Features->hostImageCopy = VK_FALSE;
+            }
+        }
+
         if (mDisableSparseBindingSupport && pFeatures->features.sparseBinding) {
             pFeatures->features.sparseBinding = VK_FALSE;
             pFeatures->features.sparseResidencyBuffer = VK_FALSE;
@@ -2106,7 +2153,7 @@ class VkDecoderGlobalState::Impl {
 
     VkResult on_vkGetPhysicalDeviceImageFormatProperties(
         gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-        VkPhysicalDevice boxed_physicalDevice, VkFormat format, VkImageType type,
+        Boxed<VkPhysicalDevice> boxed_physicalDevice, VkFormat format, VkImageType type,
         VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags,
         VkImageFormatProperties* pImageFormatProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
@@ -2141,7 +2188,7 @@ class VkDecoderGlobalState::Impl {
 
     VkResult on_vkGetPhysicalDeviceImageFormatProperties2(
         gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-        VkPhysicalDevice boxed_physicalDevice,
+        Boxed<VkPhysicalDevice> boxed_physicalDevice,
         const VkPhysicalDeviceImageFormatInfo2* pImageFormatInfo,
         VkImageFormatProperties2* pImageFormatProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
@@ -2267,7 +2314,7 @@ class VkDecoderGlobalState::Impl {
 
     void on_vkGetPhysicalDeviceFormatProperties(gfxstream::base::BumpPool* pool,
                                                 VkSnapshotApiCallHandle,
-                                                VkPhysicalDevice boxed_physicalDevice,
+                                                Boxed<VkPhysicalDevice> boxed_physicalDevice,
                                                 VkFormat format,
                                                 VkFormatProperties* pFormatProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
@@ -2282,7 +2329,7 @@ class VkDecoderGlobalState::Impl {
 
     void on_vkGetPhysicalDeviceFormatProperties2(gfxstream::base::BumpPool* pool,
                                                  VkSnapshotApiCallHandle,
-                                                 VkPhysicalDevice boxed_physicalDevice,
+                                                 Boxed<VkPhysicalDevice> boxed_physicalDevice,
                                                  VkFormat format,
                                                  VkFormatProperties2* pFormatProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
@@ -2358,7 +2405,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkGetPhysicalDeviceProperties(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                          VkPhysicalDevice boxed_physicalDevice,
+                                          Boxed<VkPhysicalDevice> boxed_physicalDevice,
                                           VkPhysicalDeviceProperties* pProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
         auto vk = dispatch_VkPhysicalDevice(boxed_physicalDevice);
@@ -2369,7 +2416,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkGetPhysicalDeviceProperties2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                           VkPhysicalDevice boxed_physicalDevice,
+                                           Boxed<VkPhysicalDevice> boxed_physicalDevice,
                                            VkPhysicalDeviceProperties2* pProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
         auto vk = dispatch_VkPhysicalDevice(boxed_physicalDevice);
@@ -2418,7 +2465,7 @@ class VkDecoderGlobalState::Impl {
 
     void on_vkGetPhysicalDeviceQueueFamilyProperties(
         gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-        VkPhysicalDevice boxed_physicalDevice, uint32_t* pQueueFamilyPropertyCount,
+        Boxed<VkPhysicalDevice> boxed_physicalDevice, uint32_t* pQueueFamilyPropertyCount,
         VkQueueFamilyProperties* pQueueFamilyProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
 
@@ -2448,7 +2495,7 @@ class VkDecoderGlobalState::Impl {
 
     void on_vkGetPhysicalDeviceQueueFamilyProperties2(
         gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-        VkPhysicalDevice boxed_physicalDevice, uint32_t* pQueueFamilyPropertyCount,
+        Boxed<VkPhysicalDevice> boxed_physicalDevice, uint32_t* pQueueFamilyPropertyCount,
         VkQueueFamilyProperties2* pQueueFamilyProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
         auto vk = dispatch_VkPhysicalDevice(boxed_physicalDevice);
@@ -2502,7 +2549,7 @@ class VkDecoderGlobalState::Impl {
 
     void on_vkGetPhysicalDeviceMemoryProperties(
         gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-        VkPhysicalDevice boxed_physicalDevice,
+        Boxed<VkPhysicalDevice> boxed_physicalDevice,
         VkPhysicalDeviceMemoryProperties* pMemoryProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
 
@@ -2520,7 +2567,7 @@ class VkDecoderGlobalState::Impl {
 
     void on_vkGetPhysicalDeviceMemoryProperties2(
         gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-        VkPhysicalDevice boxed_physicalDevice,
+        Boxed<VkPhysicalDevice> boxed_physicalDevice,
         VkPhysicalDeviceMemoryProperties2* pMemoryProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
         auto vk = dispatch_VkPhysicalDevice(boxed_physicalDevice);
@@ -2562,9 +2609,18 @@ class VkDecoderGlobalState::Impl {
             vk_find_struct<VkPhysicalDeviceMemoryBudgetPropertiesEXT>(pMemoryProperties));
     }
 
+    bool physicalDeviceHasGuestCapability(VkPhysicalDevice physicalDevice,
+                                          VkGuestCapabilityFlagBitsGOOGLE capability) {
+        std::lock_guard<std::mutex> lock(mMutex);
+        const auto* physdevInfo = gfxstream::base::find(mPhysdevInfo, physicalDevice);
+        if (!physdevInfo) return false;
+        const auto* instanceInfo = gfxstream::base::find(mInstanceInfo, physdevInfo->instance);
+        return instanceInfo && instanceInfo->hasGuestCapability(capability);
+    }
+
     VkResult on_vkEnumerateDeviceExtensionProperties(gfxstream::base::BumpPool* pool,
                                                      VkSnapshotApiCallHandle,
-                                                     VkPhysicalDevice boxed_physicalDevice,
+                                                     Boxed<VkPhysicalDevice> boxed_physicalDevice,
                                                      const char* pLayerName,
                                                      uint32_t* pPropertyCount,
                                                      VkExtensionProperties* pProperties) {
@@ -2603,6 +2659,19 @@ class VkDecoderGlobalState::Impl {
                                       allowedDeviceExtensions.end();
                            }),
             properties.end());
+
+        // Host image copies are not supported for guests that do not resolve pHostPointer, see
+        // on_vkGetPhysicalDeviceFeatures2().
+        if (!physicalDeviceHasGuestCapability(
+                physicalDevice, VK_GUEST_CAPABILITY_HOST_POINTER_RESOLVE_BIT_GOOGLE)) {
+            properties.erase(
+                std::remove_if(properties.begin(), properties.end(),
+                               [](const VkExtensionProperties& extension) {
+                                   return strcmp(extension.extensionName,
+                                                 VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0;
+                               }),
+                properties.end());
+        }
 
         // In AndroidAHB mode, guest dmabufs are backed by AHardwareBuffers whose layout is
         // chosen by gralloc, so native DRM format modifiers can't be honored. Hide the
@@ -2690,7 +2759,7 @@ class VkDecoderGlobalState::Impl {
 
     VkResult on_vkCreateDevice(gfxstream::base::BumpPool* pool,
                                VkSnapshotApiCallHandle apiCallHandle,
-                               VkPhysicalDevice boxed_physicalDevice,
+                               Boxed<VkPhysicalDevice> boxed_physicalDevice,
                                const VkDeviceCreateInfo* pCreateInfo, const VkAllocationCallbacks*,
                                VkDevice* pDevice) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
@@ -2840,10 +2909,23 @@ class VkDecoderGlobalState::Impl {
             }
         }
 
-        if (!m_vkEmulation->getFeatures().BypassVulkanDeviceFeatureOverrides.enabled()) {
-            VkPhysicalDeviceHostImageCopyFeatures* hostImageCopyFeatures =
+        // Host image copies are not reported to guests that do not resolve pHostPointer,
+        // see on_vkGetPhysicalDeviceFeatures2() and on_vkEnumerateDeviceExtensionProperties().
+        if (!physicalDeviceHasGuestCapability(
+                physicalDevice, VK_GUEST_CAPABILITY_HOST_POINTER_RESOLVE_BIT_GOOGLE)) {
+            for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i) {
+                const char* extName = pCreateInfo->ppEnabledExtensionNames
+                                          ? pCreateInfo->ppEnabledExtensionNames[i]
+                                          : nullptr;
+                if (extName && strcmp(extName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0) {
+                    GFXSTREAM_INFO("%s: Unsupported %s extension is requested!", __func__,
+                                   VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
+                    return VK_ERROR_EXTENSION_NOT_PRESENT;
+                }
+            }
+            const VkPhysicalDeviceHostImageCopyFeatures* hostImageCopyFeatures =
                 vk_find_struct<VkPhysicalDeviceHostImageCopyFeatures>(&createInfoFiltered);
-            VkPhysicalDeviceVulkan14Features* vulkan14Features =
+            const VkPhysicalDeviceVulkan14Features* vulkan14Features =
                 vk_find_struct<VkPhysicalDeviceVulkan14Features>(&createInfoFiltered);
             if ((hostImageCopyFeatures != nullptr && hostImageCopyFeatures->hostImageCopy) ||
                 (vulkan14Features != nullptr && vulkan14Features->hostImageCopy)) {
@@ -3063,7 +3145,7 @@ class VkDecoderGlobalState::Impl {
         }
 
         // First, get the dispatch table.
-        VkDevice boxedDevice = new_boxed_VkDevice(*pDevice, nullptr);
+        Boxed<VkDevice> boxedDevice = new_boxed_VkDevice(*pDevice, nullptr);
 
         if (mLogging) {
             GFXSTREAM_INFO("%s: init vulkan dispatch from device", __func__);
@@ -3102,7 +3184,7 @@ class VkDecoderGlobalState::Impl {
             }
             auto contextIdIt = mSnapshotLoadVkDeviceToVirtioCpuContextId->find(boxedDevice);
             if (contextIdIt == mSnapshotLoadVkDeviceToVirtioCpuContextId->end()) {
-                GFXSTREAM_ERROR("Missing context id for VkDevice:%p", boxedDevice);
+                GFXSTREAM_ERROR("Missing context id for VkDevice:%p", boxedDevice.value());
                 setSnapshotLoadError();
                 return VK_ERROR_INITIALIZATION_FAILED;
             }
@@ -3152,7 +3234,7 @@ class VkDecoderGlobalState::Impl {
                     GFXSTREAM_INFO("%s: get device queue (end)", __func__);
                 }
                 auto boxedQueue = new_boxed_VkQueue(physicalQueue, dispatch);
-                extraHandles.push_back((uint64_t)boxedQueue);
+                extraHandles.push_back(reinterpret_cast<uint64_t>(boxedQueue.value()));
 
                 VALIDATE_NEW_HANDLE_INFO_ENTRY(mQueueInfo, physicalQueue);
                 QueueInfo& physicalQueueInfo = mQueueInfo[physicalQueue];
@@ -3191,7 +3273,7 @@ class VkDecoderGlobalState::Impl {
                         VkQueue virtualQueue = reinterpret_cast<VkQueue>(virtualQueue64);
 
                         auto boxedVirtualQueue = new_boxed_VkQueue(virtualQueue, dispatch);
-                        extraHandles.push_back((uint64_t)boxedVirtualQueue);
+                        extraHandles.push_back(reinterpret_cast<uint64_t>(boxedVirtualQueue.value()));
 
                         VALIDATE_NEW_HANDLE_INFO_ENTRY(mQueueInfo, virtualQueue);
                         QueueInfo& virtualQueueInfo = mQueueInfo[virtualQueue];
@@ -3216,7 +3298,7 @@ class VkDecoderGlobalState::Impl {
         m_vkEmulation->getDeviceLostHelper().onDeviceCreated(std::move(deviceWithQueues));
 
         // Box the device.
-        *pDevice = (VkDevice)deviceInfo.boxed;
+        *pDevice = deviceInfo.boxed.value();
 
         if (mLogging) {
             GFXSTREAM_INFO("%s: (end)", __func__);
@@ -3226,7 +3308,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkGetDeviceQueue(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
-                             VkDevice boxed_device, uint32_t queueFamilyIndex, uint32_t queueIndex,
+                             Boxed<VkDevice> boxed_device, uint32_t queueFamilyIndex, uint32_t queueIndex,
                              VkQueue* pQueue) {
         VkDeviceQueueInfo2 info2 = {
             .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
@@ -3238,7 +3320,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkGetDeviceQueue2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
-                              VkDevice boxed_device, const VkDeviceQueueInfo2* pQueueInfo,
+                              Boxed<VkDevice> boxed_device, const VkDeviceQueueInfo2* pQueueInfo,
                               VkQueue* pQueue) {
         auto device = unbox_VkDevice(boxed_device);
 
@@ -3283,12 +3365,12 @@ class VkDecoderGlobalState::Impl {
             return;
         }
 
-        *pQueue = queueInfo->boxed;
+        *pQueue = queueInfo->boxed.value();
     }
 
     void on_vkGetPhysicalDeviceSparseImageFormatProperties(
         gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
-        VkPhysicalDevice boxed_physicalDevice, VkFormat format, VkImageType type,
+        Boxed<VkPhysicalDevice> boxed_physicalDevice, VkFormat format, VkImageType type,
         VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageTiling tiling,
         uint32_t* pPropertyCount, VkSparseImageFormatProperties* pProperties) {
         if (mDisableSparseBindingSupport) {
@@ -3304,7 +3386,7 @@ class VkDecoderGlobalState::Impl {
 
     void on_vkGetPhysicalDeviceSparseImageFormatProperties2(
         gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
-        VkPhysicalDevice boxed_physicalDevice,
+        Boxed<VkPhysicalDevice> boxed_physicalDevice,
         const VkPhysicalDeviceSparseImageFormatInfo2* pFormatInfo, uint32_t* pPropertyCount,
         VkSparseImageFormatProperties2* pProperties) {
         if (mDisableSparseBindingSupport) {
@@ -3320,7 +3402,7 @@ class VkDecoderGlobalState::Impl {
 
     void on_vkGetPhysicalDeviceSparseImageFormatProperties2KHR(
         gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
-        VkPhysicalDevice boxed_physicalDevice,
+        Boxed<VkPhysicalDevice> boxed_physicalDevice,
         const VkPhysicalDeviceSparseImageFormatInfo2* pFormatInfo, uint32_t* pPropertyCount,
         VkSparseImageFormatProperties2* pProperties) {
         if (mDisableSparseBindingSupport) {
@@ -3336,7 +3418,7 @@ class VkDecoderGlobalState::Impl {
 
     void on_vkGetDeviceBufferMemoryRequirements(gfxstream::base::BumpPool* pool,
                                                 VkSnapshotApiCallHandle apiCallHandle,
-                                                VkDevice boxed_device,
+                                                Boxed<VkDevice> boxed_device,
                                                 const VkDeviceBufferMemoryRequirements* pInfo,
                                                 VkMemoryRequirements2* pMemoryRequirements) {
         auto device = unbox_VkDevice(boxed_device);
@@ -3684,7 +3766,7 @@ class VkDecoderGlobalState::Impl {
 
     void on_vkGetDeviceImageMemoryRequirements(gfxstream::base::BumpPool* pool,
                                                VkSnapshotApiCallHandle apiCallHandle,
-                                               VkDevice boxed_device,
+                                               Boxed<VkDevice> boxed_device,
                                                const VkDeviceImageMemoryRequirements* pInfo,
                                                VkMemoryRequirements2* pMemoryRequirements) {
         auto device = unbox_VkDevice(boxed_device);
@@ -3792,7 +3874,7 @@ class VkDecoderGlobalState::Impl {
             if (fenceInfo.device == device) {
                 destroyFenceWithExclusiveInfo(device, deviceDispatch, deviceInfo, fence, fenceInfo,
                                               /*allowExternalFenceRecycling=*/false);
-                delete_VkFence(fenceInfo.boxed.value());
+                delete_VkFence(fenceInfo.boxed);
                 fenceInfoIt = fenceInfos.erase(fenceInfoIt);
             } else {
                 ++fenceInfoIt;
@@ -3841,7 +3923,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyDevice(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                            VkDevice boxed_device, const VkAllocationCallbacks*) {
+                            Boxed<VkDevice> boxed_device, const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
 
         processDelayedRemovesForDevice(device);
@@ -3852,7 +3934,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreateBuffer(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                               VkDevice boxed_device, const VkBufferCreateInfo* pCreateInfo,
+                               Boxed<VkDevice> boxed_device, const VkBufferCreateInfo* pCreateInfo,
                                const VkAllocationCallbacks*, VkBuffer* pBuffer) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -3899,8 +3981,8 @@ class VkDecoderGlobalState::Impl {
             bufInfo.device = device;
             bufInfo.usage = pCreateInfo->usage;
             bufInfo.size = pCreateInfo->size;
-            *pBuffer = new_boxed_non_dispatchable_VkBuffer(*pBuffer);
-            bufInfo.boxed = *pBuffer;
+            bufInfo.boxed = new_boxed_non_dispatchable_VkBuffer(*pBuffer);
+            *pBuffer = bufInfo.boxed.value();
         }
 
         return result;
@@ -3935,7 +4017,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyBuffer(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                            VkDevice boxed_device, VkBuffer buffer, const VkAllocationCallbacks*) {
+                            Boxed<VkDevice> boxed_device, VkBuffer buffer, const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
 
@@ -3972,7 +4054,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkBindBufferMemory(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                   VkDevice boxed_device, VkBuffer buffer, VkDeviceMemory memory,
+                                   Boxed<VkDevice> boxed_device, VkBuffer buffer, VkDeviceMemory memory,
                                    VkDeviceSize memoryOffset) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -3988,7 +4070,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkBindBufferMemory2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                    VkDevice boxed_device, uint32_t bindInfoCount,
+                                    Boxed<VkDevice> boxed_device, uint32_t bindInfoCount,
                                     const VkBindBufferMemoryInfo* pBindInfos) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -4014,7 +4096,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkBindBufferMemory2KHR(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                       VkDevice boxed_device, uint32_t bindInfoCount,
+                                       Boxed<VkDevice> boxed_device, uint32_t bindInfoCount,
                                        const VkBindBufferMemoryInfo* pBindInfos) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -4036,7 +4118,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreateImage(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                              VkDevice boxed_device, const VkImageCreateInfo* pCreateInfo,
+                              Boxed<VkDevice> boxed_device, const VkImageCreateInfo* pCreateInfo,
                               const VkAllocationCallbacks*, VkImage* pImage, bool boxImage = true) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -4160,10 +4242,12 @@ class VkDecoderGlobalState::Impl {
             imageInfo.externalHandleTypes = extMemCreateInfo->handleTypes;
         }
 #ifdef __ANDROID__
-        // Deferred image layout, see ImageInfo::DeferredLayoutInfo. Only for AHB-external
-        // images we are not already backing another way: the ANB path owns its own buffer, and for
-        // compressed images updateImageMemoryRequirementsLocked() overwrites them anyway.
-        if ((imageInfo.externalHandleTypes &
+        // Deferred image layout, see ImageInfo::DeferredLayoutInfo. Only for supported 1-mip,
+        // 1-layer AHB-external images we are not already backing another way: the ANB path owns
+        // its own buffer, and for compressed images updateImageMemoryRequirementsLocked()
+        // overwrites them anyway.
+        if (m_vkEmulation && IsDeferredLayoutAhbSupported(pCreateInfo) &&
+            (imageInfo.externalHandleTypes &
              VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID) &&
             !imageInfo.anbInfo && !imageInfo.compressInfo) {
             VkMemoryRequirements probeReqs = {};
@@ -4173,8 +4257,13 @@ class VkDecoderGlobalState::Impl {
             // would be a regression. Some drivers report size=0 (linear) or memoryTypeBits=0
             // (optimal) until the AHB is bound.
             if (probeReqs.size == 0 || probeReqs.memoryTypeBits == 0) {
-                AHardwareBuffer* rawAhb = allocAhb(pCreateInfo);
-                if (rawAhb) {
+                if (auto cached = m_vkEmulation->findCachedDeferredLayout(pCreateInfo)) {
+                    imageInfo.deferredLayout.size = cached->size;
+                    imageInfo.deferredLayout.alignment =
+                        probeReqs.alignment ? probeReqs.alignment : cached->alignment;
+                    imageInfo.deferredLayout.memoryTypeBits = cached->memoryTypeBits;
+                    imageInfo.deferredLayout.rowPitch = cached->rowPitch;
+                } else if (AHardwareBuffer* rawAhb = m_vkEmulation->allocAhb(pCreateInfo)) {
                     VkAndroidHardwareBufferPropertiesANDROID ahbProps = {
                         .sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID,
                         .pNext = nullptr,
@@ -4182,27 +4271,23 @@ class VkDecoderGlobalState::Impl {
                     VkResult propsRes =
                         vk->vkGetAndroidHardwareBufferPropertiesANDROID(device, rawAhb, &ahbProps);
                     if (propsRes == VK_SUCCESS && ahbProps.allocationSize > 0) {
-                        imageInfo.deferredLayout.ahb =
-                            std::shared_ptr<AHardwareBuffer>(rawAhb, [](AHardwareBuffer* b) {
-                                if (b) AHardwareBuffer_release(b);
-                            });
-                        imageInfo.deferredLayout.size = ahbProps.allocationSize;
-                        // The driver reported no alignment either; the AHB satisfies its own.
-                        imageInfo.deferredLayout.alignment =
-                            probeReqs.alignment ? probeReqs.alignment : 1;
-                        imageInfo.deferredLayout.memoryTypeBits = ahbProps.memoryTypeBits;
-                        // The driver will also refuse to report rowPitch for this image; the AHB
-                        // knows its own stride (in pixels), so derive the byte pitch from it.
                         AHardwareBuffer_Desc ahbDesc = {};
                         AHardwareBuffer_describe(rawAhb, &ahbDesc);
                         const uint32_t bytesPerPixel =
                             vk_util::ahbFormatBytesPerPixel(ahbDesc.format);
-                        imageInfo.deferredLayout.rowPitch =
-                            static_cast<VkDeviceSize>(ahbDesc.stride) * bytesPerPixel;
-                        // Also offer this AHB to a same-shaped ColorBuffer's own allocation,
-                        // which otherwise pays for a second AHardwareBuffer_allocate() for what
-                        // is usually the very same image a moment later (see the guest's
-                        // vkCreateImage -> vkGetImageSubresourceLayout -> CreateBlob sequence).
+                        const CachedAhbLayout layout = {
+                            .size = ahbProps.allocationSize,
+                            .alignment = probeReqs.alignment ? probeReqs.alignment : 1,
+                            .memoryTypeBits = ahbProps.memoryTypeBits,
+                            .rowPitch = static_cast<VkDeviceSize>(ahbDesc.stride) * bytesPerPixel,
+                        };
+                        imageInfo.deferredLayout.size = layout.size;
+                        imageInfo.deferredLayout.alignment = layout.alignment;
+                        imageInfo.deferredLayout.memoryTypeBits = layout.memoryTypeBits;
+                        imageInfo.deferredLayout.rowPitch = layout.rowPitch;
+                        m_vkEmulation->recordCachedDeferredLayout(pCreateInfo, layout);
+                        // Transfer single ownership of rawAhb so a matching ColorBuffer allocation
+                        // can adopt it instead of calling AHardwareBuffer_allocate() a second time.
                         m_vkEmulation->stashPendingDeferredLayoutAhb(pCreateInfo, rawAhb);
                         GFXSTREAM_INFO(
                             "DL-AHB tracked image=%p size=%llu typeBits=0x%x rowPitch=%llu "
@@ -4226,14 +4311,23 @@ class VkDecoderGlobalState::Impl {
 #endif
 
         if (boxImage) {
-            *pImage = new_boxed_non_dispatchable_VkImage(*pImage);
-            imageInfo.boxed = *pImage;
+            imageInfo.boxed = new_boxed_non_dispatchable_VkImage(*pImage);
+            *pImage = imageInfo.boxed.value();
         }
         return createRes;
     }
 
     void destroyImageWithExclusiveInfo(VkDevice device, VulkanDispatch* deviceDispatch,
                                        VkImage image, ImageInfo& imageInfo) {
+        if (auto* shadowed = std::get_if<ImageInfo::ShadowedImageMemory>(&imageInfo.memoryState)) {
+            if (shadowed->linearImage != VK_NULL_HANDLE) {
+                deviceDispatch->vkDestroyImage(device, shadowed->linearImage, nullptr);
+            }
+            if (shadowed->optimalImageMemory != VK_NULL_HANDLE) {
+                deviceDispatch->vkFreeMemory(device, shadowed->optimalImageMemory, nullptr);
+            }
+            imageInfo.memoryState = std::monostate{};
+        }
         if (!imageInfo.anbInfo) {
             if (!imageInfo.compressInfo || image != imageInfo.compressInfo->outputImage()) {
                 deviceDispatch->vkDestroyImage(device, image, nullptr);
@@ -4260,10 +4354,13 @@ class VkDecoderGlobalState::Impl {
                                      ImageInfo* imageInfo, MemoryInfo* memoryInfo,
                                      VkDeviceMemory memory, VkDeviceSize memoryOffset)
         REQUIRES(mMutex) {
-        imageInfo->memory = memory;
+        if (!std::holds_alternative<ImageInfo::ShadowedImageMemory>(imageInfo->memoryState)) {
+            imageInfo->memoryState = ImageInfo::NormalImageMemory{.memory = memory};
+        }
         imageInfo->memoryOffset = memoryOffset;
         if (imageInfo->imageCreateInfoShallow.tiling == VK_IMAGE_TILING_OPTIMAL &&
-            !imageInfo->anbInfo) {
+            !imageInfo->anbInfo &&
+            !std::holds_alternative<ImageInfo::ShadowedImageMemory>(imageInfo->memoryState)) {
             VkMemoryRequirements memReqs = {};
             if (vk && vk->vkGetImageMemoryRequirements) {
                 vk->vkGetImageMemoryRequirements(device, image, &memReqs);
@@ -4282,9 +4379,10 @@ class VkDecoderGlobalState::Impl {
         if (imageInfoIt == mImageInfo.end()) return;
         auto& imageInfo = imageInfoIt->second;
 
+        VkDeviceMemory boundMemory = imageInfo.getBoundMemory();
         destroyImageWithExclusiveInfo(device, deviceDispatch, image, imageInfo);
-        if (imageInfo.memory != VK_NULL_HANDLE) {
-            auto* memoryInfo = gfxstream::base::find(mMemoryInfo, imageInfo.memory);
+        if (boundMemory != VK_NULL_HANDLE) {
+            auto* memoryInfo = gfxstream::base::find(mMemoryInfo, boundMemory);
             if (memoryInfo) {
                 unbindFromOptimalImageLocked(memoryInfo, image);
             }
@@ -4294,7 +4392,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyImage(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                           VkDevice boxed_device, VkImage image, const VkAllocationCallbacks*) {
+                           Boxed<VkDevice> boxed_device, VkImage image, const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
 
@@ -4304,7 +4402,7 @@ class VkDecoderGlobalState::Impl {
 
     VkResult performBindImageMemoryDeferredAhb(gfxstream::base::BumpPool* pool,
                                                VkSnapshotApiCallHandle apiCallHandle,
-                                               VkDevice boxed_device,
+                                               Boxed<VkDevice> boxed_device,
                                                const VkBindImageMemoryInfo* bimi) {
         auto original_underlying_image = bimi->image;
         auto original_boxed_image = unboxed_to_boxed_non_dispatchable_VkImage(original_underlying_image);
@@ -4353,8 +4451,295 @@ class VkDecoderGlobalState::Impl {
         return VK_SUCCESS;
     }
 
+    // See `ImageInfo::ShadowedImageMemory`.
+    bool needsShadowImageBindLocked(VulkanDispatch* vk, VkDevice device,
+                                    const MemoryInfo* memoryInfo, VkImage image,
+                                    const ImageInfo* imageInfo) REQUIRES(mMutex) {
+        if (!memoryInfo->boundColorBuffer.has_value()) {
+            return false;
+        }
+
+        auto colorBufferInfoOpt = m_vkEmulation->getColorBufferInfo(*memoryInfo->boundColorBuffer);
+        if (!colorBufferInfoOpt) {
+            return false;
+        }
+        auto& colorBufferInfo = *colorBufferInfoOpt;
+
+        const bool colorBufferIsLinearlyTiled =
+            (colorBufferInfo.memoryProperty & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 ||
+            colorBufferInfo.imageCreateInfoShallow.tiling == VK_IMAGE_TILING_LINEAR;
+
+        VkMemoryRequirements imageMemoryRequirements{};
+        vk->vkGetImageMemoryRequirements(device, image, &imageMemoryRequirements);
+
+        const bool guestSuppliedMemorySupportsImageUsages =
+            memoryInfo->memoryIndex < VK_MAX_MEMORY_TYPES &&
+            (imageMemoryRequirements.memoryTypeBits & (1u << memoryInfo->memoryIndex)) != 0;
+        const bool guestSuppliedImageIsLinearlyTiled =
+            imageInfo->imageCreateInfoShallow.tiling == VK_IMAGE_TILING_LINEAR;
+
+        if (guestSuppliedMemorySupportsImageUsages &&
+            (!colorBufferIsLinearlyTiled || guestSuppliedImageIsLinearlyTiled)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    // See `ImageInfo::ShadowedImageMemory`.
+    bool performShadowImageBindLocked(VulkanDispatch* vk, VkDevice device,
+                                      const DeviceInfo* deviceInfo,
+                                      const MemoryInfo* memoryInfo, VkImage* image,
+                                      ImageInfo** imageInfo, VkDeviceMemory memory,
+                                      VkDeviceSize memoryOffset) REQUIRES(mMutex) {
+        VkExternalMemoryHandleTypeFlags externalHandleTypes =
+            (*imageInfo)->externalHandleTypes |
+            static_cast<VkExternalMemoryHandleTypeFlags>(
+                m_vkEmulation->getDefaultExternalMemoryHandleType());
+        if (m_vkEmulation->supportsDmaBuf()) {
+            externalHandleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        }
+        if (memoryInfo->boundColorBuffer.has_value()) {
+            auto cbInfoOpt = m_vkEmulation->getColorBufferInfo(*memoryInfo->boundColorBuffer);
+            if (cbInfoOpt && cbInfoOpt->memory.handleInfo &&
+                cbInfoOpt->memory.handleInfo->streamHandleType == STREAM_HANDLE_TYPE_MEM_DMABUF) {
+                externalHandleTypes |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+            }
+        }
+
+        const auto* physicalDeviceInfo =
+            gfxstream::base::find(mPhysdevInfo, deviceInfo->physicalDevice);
+        const auto* instanceInfo =
+            physicalDeviceInfo ? gfxstream::base::find(mInstanceInfo, physicalDeviceInfo->instance)
+                               : nullptr;
+        VulkanDispatch* ivk = (instanceInfo && instanceInfo->boxed)
+                                  ? dispatch_VkInstance(instanceInfo->boxed)
+                                  : m_vk;
+
+        const bool guestSuppliedImageHasColorAttachmentUsage =
+            ((*imageInfo)->imageCreateInfoShallow.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
+        VkFormatProperties formatProps = {};
+        if (ivk && ivk->vkGetPhysicalDeviceFormatProperties) {
+            ivk->vkGetPhysicalDeviceFormatProperties(deviceInfo->physicalDevice,
+                                                     (*imageInfo)->imageCreateInfoShallow.format,
+                                                     &formatProps);
+        }
+        const bool hostSupportsLinearColorAttachment =
+            (formatProps.linearTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+        const bool canReplaceWithLinearImage =
+            !snapshotsEnabled() &&
+            (*imageInfo)->imageCreateInfoShallow.imageType == VK_IMAGE_TYPE_2D &&
+            (*imageInfo)->imageCreateInfoShallow.mipLevels == 1 &&
+            (*imageInfo)->imageCreateInfoShallow.arrayLayers == 1 &&
+            (*imageInfo)->imageCreateInfoShallow.samples == VK_SAMPLE_COUNT_1_BIT &&
+            (!guestSuppliedImageHasColorAttachmentUsage || hostSupportsLinearColorAttachment);
+        if (canReplaceWithLinearImage) {
+            VkExternalMemoryImageCreateInfo extImageCi = {
+                .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+                .pNext = nullptr,
+                .handleTypes = externalHandleTypes,
+            };
+            VkImageCreateInfo linearCi = (*imageInfo)->imageCreateInfoShallow;
+            linearCi.pNext = &extImageCi;
+            linearCi.tiling = VK_IMAGE_TILING_LINEAR;
+
+            VkImage replacementImage = VK_NULL_HANDLE;
+            if (vk->vkCreateImage(device, &linearCi, nullptr, &replacementImage) == VK_SUCCESS) {
+                VkMemoryRequirements linearReqs{};
+                vk->vkGetImageMemoryRequirements(device, replacementImage, &linearReqs);
+                if (memoryInfo->memoryIndex < VK_MAX_MEMORY_TYPES &&
+                    (linearReqs.memoryTypeBits & (1u << memoryInfo->memoryIndex)) != 0 &&
+                    linearReqs.alignment > 0 &&
+                    (memoryOffset % linearReqs.alignment) == 0 &&
+                    memoryOffset <= memoryInfo->size &&
+                    linearReqs.size <= (memoryInfo->size - memoryOffset) &&
+                    vk->vkBindImageMemory(device, replacementImage, memory, memoryOffset) ==
+                        VK_SUCCESS) {
+                    Boxed<VkImage> boxedImage = (*imageInfo)->boxed;
+                    if (!boxedImage) {
+                        boxedImage = unboxed_to_boxed_non_dispatchable_VkImage(*image);
+                    }
+                    ImageInfo movedInfo = std::move(**imageInfo);
+                    movedInfo.imageCreateInfoShallow.tiling = VK_IMAGE_TILING_LINEAR;
+                    movedInfo.memoryState = ImageInfo::NormalImageMemory{.memory = memory};
+                    vk->vkDestroyImage(device, *image, nullptr);
+                    mImageInfo.erase(*image);
+                    mImageInfo[replacementImage] = std::move(movedInfo);
+                    if (boxedImage) {
+                        set_boxed_non_dispatchable_VkImage(boxedImage, replacementImage);
+                    }
+                    *image = replacementImage;
+                    *imageInfo = gfxstream::base::find(mImageInfo, *image);
+                    return true;
+                }
+                vk->vkDestroyImage(device, replacementImage, nullptr);
+            }
+        }
+
+        VkMemoryDedicatedRequirements optimalDedicatedReqs = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
+            .pNext = nullptr,
+        };
+        VkMemoryRequirements2 optimalReqs2 = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+            .pNext = &optimalDedicatedReqs,
+        };
+        VkMemoryRequirements imageMemoryRequirements{};
+        const VkImageMemoryRequirementsInfo2 reqsInfo2 = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+            .pNext = nullptr,
+            .image = *image,
+        };
+        if (vk->vkGetImageMemoryRequirements2) {
+            vk->vkGetImageMemoryRequirements2(device, &reqsInfo2, &optimalReqs2);
+            imageMemoryRequirements = optimalReqs2.memoryRequirements;
+        } else if (vk->vkGetImageMemoryRequirements2KHR) {
+            vk->vkGetImageMemoryRequirements2KHR(device, &reqsInfo2, &optimalReqs2);
+            imageMemoryRequirements = optimalReqs2.memoryRequirements;
+        } else {
+            vk->vkGetImageMemoryRequirements(device, *image, &imageMemoryRequirements);
+        }
+
+        std::optional<uint32_t> optimalMemTypeIdx;
+        if (physicalDeviceInfo && physicalDeviceInfo->memoryPropertiesHelper) {
+            const auto& hostMemProps =
+                physicalDeviceInfo->memoryPropertiesHelper->getHostMemoryProperties();
+            for (uint32_t i = 0; i < hostMemProps.memoryTypeCount; ++i) {
+                if ((imageMemoryRequirements.memoryTypeBits & (1u << i)) != 0 &&
+                    (hostMemProps.memoryTypes[i].propertyFlags &
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+                    optimalMemTypeIdx = i;
+                    break;
+                }
+            }
+        }
+        if (!optimalMemTypeIdx.has_value()) {
+            for (uint32_t i = 0; i < VK_MAX_MEMORY_TYPES; ++i) {
+                if (imageMemoryRequirements.memoryTypeBits & (1u << i)) {
+                    optimalMemTypeIdx = i;
+                    break;
+                }
+            }
+        }
+        if (!optimalMemTypeIdx.has_value()) {
+            GFXSTREAM_ERROR(
+                "performShadowImageBindLocked: no suitable memory type for optimalImage "
+                "(memoryTypeBits=0x%x)",
+                imageMemoryRequirements.memoryTypeBits);
+            return false;
+        }
+
+        ImageInfo::ShadowedImageMemory shadowed = {
+            .linearImage = VK_NULL_HANDLE,
+            .linearImageMemory = memory,
+            .linearImageLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+            .optimalImage = *image,
+            .optimalImageMemory = VK_NULL_HANDLE,
+        };
+
+        VkExternalMemoryImageCreateInfo extImageCi = {
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            .pNext = nullptr,
+            .handleTypes = externalHandleTypes,
+        };
+        VkImageCreateInfo linearImageCi = (*imageInfo)->imageCreateInfoShallow;
+        linearImageCi.pNext = &extImageCi;
+        linearImageCi.flags = 0;
+        linearImageCi.mipLevels = 1;
+        linearImageCi.arrayLayers = 1;
+        linearImageCi.samples = VK_SAMPLE_COUNT_1_BIT;
+        linearImageCi.tiling = VK_IMAGE_TILING_LINEAR;
+        linearImageCi.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        linearImageCi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        linearImageCi.queueFamilyIndexCount = 0;
+        linearImageCi.pQueueFamilyIndices = nullptr;
+        linearImageCi.initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
+        VkResult createLinearRes =
+            vk->vkCreateImage(device, &linearImageCi, nullptr, &shadowed.linearImage);
+        if (createLinearRes != VK_SUCCESS) {
+            GFXSTREAM_ERROR(
+                "performShadowImageBindLocked: vkCreateImage(linearImage) failed: %s [%d]",
+                string_VkResult(createLinearRes), createLinearRes);
+            return false;
+        }
+
+        VkMemoryRequirements linearImageMemoryRequirements{};
+        vk->vkGetImageMemoryRequirements(device, shadowed.linearImage,
+                                         &linearImageMemoryRequirements);
+        if (memoryInfo->memoryIndex >= VK_MAX_MEMORY_TYPES ||
+            (linearImageMemoryRequirements.memoryTypeBits & (1u << memoryInfo->memoryIndex)) == 0 ||
+            linearImageMemoryRequirements.alignment == 0 ||
+            (memoryOffset % linearImageMemoryRequirements.alignment) != 0 ||
+            memoryOffset > memoryInfo->size ||
+            linearImageMemoryRequirements.size > (memoryInfo->size - memoryOffset)) {
+            GFXSTREAM_ERROR(
+                "performShadowImageBindLocked: linearImage memory requirements mismatch "
+                "(reqSize=%llu, reqAlignment=%llu, reqTypeBits=0x%x, memSize=%llu, memOffset=%llu, "
+                "memTypeIndex=%u)",
+                (unsigned long long)linearImageMemoryRequirements.size,
+                (unsigned long long)linearImageMemoryRequirements.alignment,
+                linearImageMemoryRequirements.memoryTypeBits,
+                (unsigned long long)memoryInfo->size, (unsigned long long)memoryOffset,
+                memoryInfo->memoryIndex);
+            vk->vkDestroyImage(device, shadowed.linearImage, nullptr);
+            return false;
+        }
+
+        VkResult bindLinearRes = vk->vkBindImageMemory(
+            device, shadowed.linearImage, shadowed.linearImageMemory, memoryOffset);
+        if (bindLinearRes != VK_SUCCESS) {
+            GFXSTREAM_ERROR(
+                "performShadowImageBindLocked: vkBindImageMemory(linearImage) failed: %s [%d]",
+                string_VkResult(bindLinearRes), bindLinearRes);
+            vk->vkDestroyImage(device, shadowed.linearImage, nullptr);
+            return false;
+        }
+
+        const VkMemoryDedicatedAllocateInfo dedicatedAllocInfo = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .image = shadowed.optimalImage,
+            .buffer = VK_NULL_HANDLE,
+        };
+        const bool useDedicatedAlloc = optimalDedicatedReqs.requiresDedicatedAllocation ||
+                                       optimalDedicatedReqs.prefersDedicatedAllocation;
+        const VkMemoryAllocateInfo optimalAllocInfo = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .pNext = useDedicatedAlloc ? &dedicatedAllocInfo : nullptr,
+            .allocationSize = imageMemoryRequirements.size,
+            .memoryTypeIndex = *optimalMemTypeIdx,
+        };
+        VkResult allocOptimalRes = vk->vkAllocateMemory(device, &optimalAllocInfo, nullptr,
+                                                        &shadowed.optimalImageMemory);
+        if (allocOptimalRes != VK_SUCCESS) {
+            GFXSTREAM_ERROR(
+                "performShadowImageBindLocked: vkAllocateMemory(optimalImageMemory, size=%llu, "
+                "typeIndex=%u) failed: %s [%d]",
+                (unsigned long long)optimalAllocInfo.allocationSize,
+                optimalAllocInfo.memoryTypeIndex, string_VkResult(allocOptimalRes),
+                allocOptimalRes);
+            vk->vkDestroyImage(device, shadowed.linearImage, nullptr);
+            return false;
+        }
+
+        VkResult bindOptimalRes =
+            vk->vkBindImageMemory(device, shadowed.optimalImage, shadowed.optimalImageMemory, 0);
+        if (bindOptimalRes != VK_SUCCESS) {
+            GFXSTREAM_ERROR(
+                "performShadowImageBindLocked: vkBindImageMemory(optimalImage) failed: %s [%d]",
+                string_VkResult(bindOptimalRes), bindOptimalRes);
+            vk->vkDestroyImage(device, shadowed.linearImage, nullptr);
+            vk->vkFreeMemory(device, shadowed.optimalImageMemory, nullptr);
+            return false;
+        }
+
+        (*imageInfo)->memoryState = shadowed;
+        return true;
+    }
+
     VkResult performBindImageMemory(gfxstream::base::BumpPool* pool,
-                                    VkSnapshotApiCallHandle apiCallHandle, VkDevice boxed_device,
+                                    VkSnapshotApiCallHandle apiCallHandle,
+                                    Boxed<VkDevice> boxed_device,
                                     const VkBindImageMemoryInfo* bimi) EXCLUDES(mMutex) {
         auto image = bimi->image;
         auto memory = bimi->memory;
@@ -4370,10 +4755,6 @@ class VkDecoderGlobalState::Impl {
 
         VALIDATE_REQUIRED_HANDLE(image);
         VALIDATE_REQUIRED_HANDLE(memory);
-        VkResult result = vk->vkBindImageMemory(device, image, memory, memoryOffset);
-        if (result != VK_SUCCESS) {
-            return result;
-        }
 
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -4385,6 +4766,21 @@ class VkDecoderGlobalState::Impl {
 
         auto* imageInfo = gfxstream::base::find(mImageInfo, image);
         if (!imageInfo) return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+        if (needsShadowImageBindLocked(vk, device, memoryInfo, image, imageInfo)) {
+            if (!performShadowImageBindLocked(vk, device, deviceInfo, memoryInfo, &image,
+                                              &imageInfo, memory, memoryOffset)) {
+                return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            }
+            const_cast<VkBindImageMemoryInfo*>(bimi)->image = image;
+        } else {
+            VkResult result = vk->vkBindImageMemory(device, image, memory, memoryOffset);
+            if (result != VK_SUCCESS) {
+                return result;
+            }
+            imageInfo->memoryState = ImageInfo::NormalImageMemory{.memory = memory};
+        }
+
         imageInfo->boundColorBuffer = memoryInfo->boundColorBuffer;
         if (imageInfo->boundColorBuffer) {
             deviceInfo->debugUtilsHelper.addDebugLabel(image, "ColorBuffer:%d",
@@ -4400,10 +4796,10 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkBindImageMemory(gfxstream::base::BumpPool* pool,
-                                  VkSnapshotApiCallHandle apiCallHandle, VkDevice boxed_device,
+                                  VkSnapshotApiCallHandle apiCallHandle, Boxed<VkDevice> boxed_device,
                                   VkImage image, VkDeviceMemory memory, VkDeviceSize memoryOffset)
         EXCLUDES(mMutex) {
-        const VkBindImageMemoryInfo bimi = {
+        VkBindImageMemoryInfo bimi = {
             .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
             .pNext = nullptr,
             .image = image,
@@ -4414,7 +4810,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkBindImageMemory2(gfxstream::base::BumpPool* pool,
-                                   VkSnapshotApiCallHandle apiCallHandle, VkDevice boxed_device,
+                                   VkSnapshotApiCallHandle apiCallHandle, Boxed<VkDevice> boxed_device,
                                    uint32_t bindInfoCount, const VkBindImageMemoryInfo* pBindInfos)
         EXCLUDES(mMutex) {
 #ifdef CONFIG_AEMU
@@ -4453,6 +4849,14 @@ class VkDecoderGlobalState::Impl {
                 if (imageInfo->compressInfo) {
                     needEmulation = true;
                     break;
+                }
+
+                if (pBindInfos[i].memory != VK_NULL_HANDLE) {
+                    auto* memoryInfo = gfxstream::base::find(mMemoryInfo, pBindInfos[i].memory);
+                    if (memoryInfo && memoryInfo->boundColorBuffer.has_value()) {
+                        needEmulation = true;
+                        break;
+                    }
                 }
             }
         }
@@ -4499,7 +4903,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreateImageView(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                  VkDevice boxed_device, const VkImageViewCreateInfo* pCreateInfo,
+                                  Boxed<VkDevice> boxed_device, const VkImageViewCreateInfo* pCreateInfo,
                                   const VkAllocationCallbacks*, VkImageView* pView) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -4557,8 +4961,8 @@ class VkDecoderGlobalState::Impl {
                                                        *imageViewInfo.boundColorBuffer);
         }
 
-        *pView = new_boxed_non_dispatchable_VkImageView(*pView);
-        imageViewInfo.boxed = *pView;
+        imageViewInfo.boxed = new_boxed_non_dispatchable_VkImageView(*pView);
+        *pView = imageViewInfo.boxed.value();
         return result;
     }
 
@@ -4579,7 +4983,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyImageView(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                               VkDevice boxed_device, VkImageView imageView,
+                               Boxed<VkDevice> boxed_device, VkImageView imageView,
                                const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -4589,7 +4993,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreateBufferView(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                   VkDevice boxed_device, const VkBufferViewCreateInfo* pCreateInfo,
+                                   Boxed<VkDevice> boxed_device, const VkBufferViewCreateInfo* pCreateInfo,
                                    const VkAllocationCallbacks*, VkBufferView* pView) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -4604,8 +5008,8 @@ class VkDecoderGlobalState::Impl {
         auto& bufferViewInfo = mBufferViewInfo[*pView];
         bufferViewInfo.device = device;
 
-        *pView = new_boxed_non_dispatchable_VkBufferView(*pView);
-        bufferViewInfo.boxed = *pView;
+        bufferViewInfo.boxed = new_boxed_non_dispatchable_VkBufferView(*pView);
+        *pView = bufferViewInfo.boxed.value();
         return result;
     }
 
@@ -4627,7 +5031,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyBufferView(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                VkDevice boxed_device, VkBufferView bufferView,
+                                Boxed<VkDevice> boxed_device, VkBufferView bufferView,
                                 const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -4637,7 +5041,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreateSampler(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                VkDevice boxed_device, const VkSamplerCreateInfo* pCreateInfo,
+                                Boxed<VkDevice> boxed_device, const VkSamplerCreateInfo* pCreateInfo,
                                 const VkAllocationCallbacks*, VkSampler* pSampler) {
         if (pCreateInfo->borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT ||
             pCreateInfo->borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT) {
@@ -4675,8 +5079,8 @@ class VkDecoderGlobalState::Impl {
              pCreateInfo->borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT ||
              pCreateInfo->borderColor == VK_BORDER_COLOR_INT_CUSTOM_EXT);
 
-        *pSampler = new_boxed_non_dispatchable_VkSampler(*pSampler);
-        samplerInfo.boxed = *pSampler;
+        samplerInfo.boxed = new_boxed_non_dispatchable_VkSampler(*pSampler);
+        *pSampler = samplerInfo.boxed.value();
 
         return result;
     }
@@ -4707,7 +5111,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroySampler(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                             VkDevice boxed_device, VkSampler sampler,
+                             Boxed<VkDevice> boxed_device, VkSampler sampler,
                              const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -4760,7 +5164,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreateSemaphore(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                  VkDevice boxed_device, const VkSemaphoreCreateInfo* pCreateInfo,
+                                  Boxed<VkDevice> boxed_device, const VkSemaphoreCreateInfo* pCreateInfo,
                                   const VkAllocationCallbacks*, VkSemaphore* pSemaphore) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -4839,14 +5243,14 @@ class VkDecoderGlobalState::Impl {
         semaphoreInfo.isTimelineSemaphore = timelineSemaphore;
         semaphoreInfo.lastSignalValue = initialValue;
 
-        *pSemaphore = new_boxed_non_dispatchable_VkSemaphore(*pSemaphore);
-        semaphoreInfo.boxed = *pSemaphore;
+        semaphoreInfo.boxed = new_boxed_non_dispatchable_VkSemaphore(*pSemaphore);
+        *pSemaphore = semaphoreInfo.boxed.value();
 
         return res;
     }
 
     VkResult on_vkCreateFence(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                              VkDevice boxed_device, const VkFenceCreateInfo* pCreateInfo,
+                              Boxed<VkDevice> boxed_device, const VkFenceCreateInfo* pCreateInfo,
                               const VkAllocationCallbacks*, VkFence* pFence) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -4898,8 +5302,8 @@ class VkDecoderGlobalState::Impl {
             fenceInfo.device = device;
             fenceInfo.vk = vk;
 
-            *pFence = new_boxed_non_dispatchable_VkFence(*pFence);
-            fenceInfo.boxed = Boxed<VkFence>(*pFence);
+            fenceInfo.boxed = new_boxed_non_dispatchable_VkFence(*pFence);
+            *pFence = fenceInfo.boxed.value();
             fenceInfo.external = exportSyncFd;
 
             if (localCreateInfo.flags & VK_FENCE_CREATE_SIGNALED_BIT) {
@@ -4913,7 +5317,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkGetFenceStatus(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
-                                 VkDevice boxed_device, VkFence fence) {
+                                 Boxed<VkDevice> boxed_device, VkFence fence) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
         {
@@ -4929,7 +5333,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkWaitForFences(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
-                                VkDevice boxed_device, uint32_t fenceCount, const VkFence* pFences,
+                                Boxed<VkDevice> boxed_device, uint32_t fenceCount, const VkFence* pFences,
                                 VkBool32 waitAll, uint64_t timeout) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -4939,7 +5343,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkResetFences(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                              VkDevice boxed_device, uint32_t fenceCount, const VkFence* pFences) {
+                              Boxed<VkDevice> boxed_device, uint32_t fenceCount, const VkFence* pFences) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
 
@@ -5053,7 +5457,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkImportSemaphoreFdKHR(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                       VkDevice boxed_device,
+                                       Boxed<VkDevice> boxed_device,
                                        const VkImportSemaphoreFdInfoKHR* pImportSemaphoreFdInfo) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -5102,7 +5506,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkGetSemaphoreFdKHR(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                    VkDevice boxed_device,
+                                    Boxed<VkDevice> boxed_device,
                                     const VkSemaphoreGetFdInfoKHR* pGetFdInfo, int* pFd) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -5127,7 +5531,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkGetSemaphoreGOOGLE(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                     VkDevice boxed_device, VkSemaphore semaphore,
+                                     Boxed<VkDevice> boxed_device, VkSemaphore semaphore,
                                      uint64_t syncId) {
         if (!m_vkEmulation->getFeatures().VulkanExternalSync.enabled()) {
             return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -5215,7 +5619,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroySemaphore(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                               VkDevice boxed_device, VkSemaphore semaphore,
+                               Boxed<VkDevice> boxed_device, VkSemaphore semaphore,
                                const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -5273,7 +5677,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkWaitSemaphores(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                 VkDevice boxed_device, const VkSemaphoreWaitInfo* pWaitInfo,
+                                 Boxed<VkDevice> boxed_device, const VkSemaphoreWaitInfo* pWaitInfo,
                                  uint64_t timeout) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -5432,7 +5836,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkSignalSemaphore(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                  VkDevice boxed_device, const VkSemaphoreSignalInfo* pSignalInfo) {
+                                  Boxed<VkDevice> boxed_device, const VkSemaphoreSignalInfo* pSignalInfo) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
 
@@ -5511,7 +5915,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyFence(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                           VkDevice boxed_device, VkFence fence, const VkAllocationCallbacks*) {
+                           Boxed<VkDevice> boxed_device, VkFence fence, const VkAllocationCallbacks*) {
         if (fence == VK_NULL_HANDLE) return;
 
         auto device = unbox_VkDevice(boxed_device);
@@ -5522,7 +5926,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreateDescriptorSetLayout(gfxstream::base::BumpPool* pool,
-                                            VkSnapshotApiCallHandle, VkDevice boxed_device,
+                                            VkSnapshotApiCallHandle, Boxed<VkDevice> boxed_device,
                                             const VkDescriptorSetLayoutCreateInfo* pCreateInfo,
                                             const VkAllocationCallbacks*,
                                             VkDescriptorSetLayout* pSetLayout) {
@@ -5536,12 +5940,20 @@ class VkDecoderGlobalState::Impl {
             VALIDATE_NEW_HANDLE_INFO_ENTRY(mDescriptorSetLayoutInfo, *pSetLayout);
             auto& info = mDescriptorSetLayoutInfo[*pSetLayout];
             info.device = device;
-            *pSetLayout = new_boxed_non_dispatchable_VkDescriptorSetLayout(*pSetLayout);
-            info.boxed = *pSetLayout;
+            info.boxed = new_boxed_non_dispatchable_VkDescriptorSetLayout(*pSetLayout);
+            *pSetLayout = info.boxed.value();
 
             info.createInfo = *pCreateInfo;
+            const auto* bindingFlagsCi =
+                vk_find_struct<VkDescriptorSetLayoutBindingFlagsCreateInfo>(pCreateInfo);
             for (uint32_t i = 0; i < pCreateInfo->bindingCount; ++i) {
                 info.bindings.push_back(pCreateInfo->pBindings[i]);
+                VkDescriptorBindingFlags flags =
+                    (bindingFlagsCi && bindingFlagsCi->bindingCount > i &&
+                     bindingFlagsCi->pBindingFlags)
+                        ? bindingFlagsCi->pBindingFlags[i]
+                        : 0;
+                info.bindingFlags.push_back(flags);
             }
         }
 
@@ -5568,7 +5980,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyDescriptorSetLayout(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                         VkDevice boxed_device,
+                                         Boxed<VkDevice> boxed_device,
                                          VkDescriptorSetLayout descriptorSetLayout,
                                          const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
@@ -5579,7 +5991,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreateDescriptorPool(gfxstream::base::BumpPool* pool,
-                                       VkSnapshotApiCallHandle apiCallHandle, VkDevice boxed_device,
+                                       VkSnapshotApiCallHandle apiCallHandle, Boxed<VkDevice> boxed_device,
                                        const VkDescriptorPoolCreateInfo* pCreateInfo,
                                        const VkAllocationCallbacks*,
                                        VkDescriptorPool* pDescriptorPool) {
@@ -5593,8 +6005,8 @@ class VkDecoderGlobalState::Impl {
             VALIDATE_NEW_HANDLE_INFO_ENTRY(mDescriptorPoolInfo, *pDescriptorPool);
             auto& info = mDescriptorPoolInfo[*pDescriptorPool];
             info.device = device;
-            *pDescriptorPool = new_boxed_non_dispatchable_VkDescriptorPool(*pDescriptorPool);
-            info.boxed = *pDescriptorPool;
+            info.boxed = new_boxed_non_dispatchable_VkDescriptorPool(*pDescriptorPool);
+            *pDescriptorPool = info.boxed.value();
             info.createInfo = *pCreateInfo;
             info.maxSets = pCreateInfo->maxSets;
             info.usedSets = 0;
@@ -5607,10 +6019,10 @@ class VkDecoderGlobalState::Impl {
                 info.pools.push_back(state);
             }
 
-            if (m_vkEmulation->getFeatures().VulkanBatchedDescriptorSetUpdate.enabled()) {
+            if (mBatchedDescriptorSetUpdateEnabled) {
                 for (uint32_t i = 0; i < pCreateInfo->maxSets; ++i) {
                     info.preallocatedBoxedSets.push_back(
-                        (uint64_t)new_boxed_non_dispatchable_VkDescriptorSet(VK_NULL_HANDLE));
+                        reinterpret_cast<uint64_t>(new_boxed_non_dispatchable_VkDescriptorSet(VK_NULL_HANDLE).value()));
                 }
                 if (snapshotsEnabled() && apiCallHandle != kInvalidSnapshotApiCallHandle) {
                     mSnapshot.addOrderedBoxedHandlesCreatedByCall(
@@ -5631,15 +6043,17 @@ class VkDecoderGlobalState::Impl {
             auto unboxedSet = it.first;
             auto boxedSet = it.second;
             descriptorSetInfos.erase(unboxedSet);
-            if (!mBatchedDescriptorSetUpdateEnabled) {
+            if (!mBatchedDescriptorSetUpdateEnabled ||
+                descriptorPoolInfo.nonPreallocatedBoxedSets.count(boxedSet)) {
                 delete_VkDescriptorSet(boxedSet);
             }
         }
+        descriptorPoolInfo.nonPreallocatedBoxedSets.clear();
 
         if (mBatchedDescriptorSetUpdateEnabled) {
             if (isDestroy) {
                 for (auto boxedSet : descriptorPoolInfo.preallocatedBoxedSets) {
-                    delete_VkDescriptorSet((VkDescriptorSet)boxedSet);
+                    delete_VkDescriptorSet(Boxed<VkDescriptorSet>::fromRaw(boxedSet));
                 }
             } else {
                 for (auto boxedSet : descriptorPoolInfo.preallocatedBoxedSets) {
@@ -5681,7 +6095,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyDescriptorPool(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                    VkDevice boxed_device, VkDescriptorPool descriptorPool,
+                                    Boxed<VkDevice> boxed_device, VkDescriptorPool descriptorPool,
                                     const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -5700,7 +6114,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkResetDescriptorPool(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                      VkDevice boxed_device, VkDescriptorPool descriptorPool,
+                                      Boxed<VkDevice> boxed_device, VkDescriptorPool descriptorPool,
                                       VkDescriptorPoolResetFlags flags) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -5714,9 +6128,27 @@ class VkDecoderGlobalState::Impl {
         return VK_SUCCESS;
     }
 
+    std::vector<VkDescriptorSetLayoutBinding> getEffectiveLayoutBindings(
+        const DescriptorSetLayoutInfo& setLayoutInfo, const uint32_t* variableDescriptorCount) {
+        std::vector<VkDescriptorSetLayoutBinding> bindings = setLayoutInfo.bindings;
+        for (size_t i = 0; i < bindings.size(); ++i) {
+            if (i < setLayoutInfo.bindingFlags.size() &&
+                (setLayoutInfo.bindingFlags[i] &
+                 VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT)) {
+                bindings[i].descriptorCount =
+                    variableDescriptorCount
+                        ? std::min(*variableDescriptorCount, bindings[i].descriptorCount)
+                        : 0;
+            }
+        }
+        return bindings;
+    }
+
     void initDescriptorSetInfoLocked(VkDevice device, VkDescriptorPool pool,
                                      VkDescriptorSetLayout setLayout, uint64_t boxedDescriptorSet,
-                                     VkDescriptorSet descriptorSet) REQUIRES(mMutex) {
+                                     VkDescriptorSet descriptorSet,
+                                     const uint32_t* variableDescriptorCount = nullptr)
+        REQUIRES(mMutex) {
         auto* poolInfo = gfxstream::base::find(mDescriptorPoolInfo, pool);
         if (!poolInfo) {
             GFXSTREAM_FATAL("Cannot find info for VkDescriptorPool:%p", pool);
@@ -5733,26 +6165,26 @@ class VkDecoderGlobalState::Impl {
         setInfo.device = device;
         setInfo.pool = pool;
         setInfo.unboxedLayout = setLayout;
-        setInfo.bindings = setLayoutInfo->bindings;
+        setInfo.bindings = getEffectiveLayoutBindings(*setLayoutInfo, variableDescriptorCount);
         for (size_t i = 0; i < setInfo.bindings.size(); i++) {
             VkDescriptorSetLayoutBinding dslBinding = setInfo.bindings[i];
             int bindingIdx = dslBinding.binding;
             if ((int)setInfo.allWrites.size() <= bindingIdx) {
                 setInfo.allWrites.resize(bindingIdx + 1);
+                setInfo.bindingDescriptorCounts.resize(bindingIdx + 1, 0);
+                setInfo.bindingDescriptorTypes.resize(bindingIdx + 1, VK_DESCRIPTOR_TYPE_MAX_ENUM);
             }
-            setInfo.allWrites[bindingIdx].resize(dslBinding.descriptorCount);
-            for (auto& write : setInfo.allWrites[bindingIdx]) {
-                write.descriptorType = dslBinding.descriptorType;
-                write.dstArrayElement = 0;
-            }
+            setInfo.bindingDescriptorCounts[bindingIdx] = dslBinding.descriptorCount;
+            setInfo.bindingDescriptorTypes[bindingIdx] = dslBinding.descriptorType;
         }
 
-        poolInfo->allocatedSetsUnboxedToBoxed[descriptorSet] = (VkDescriptorSet)boxedDescriptorSet;
+        poolInfo->allocatedSetsUnboxedToBoxed[descriptorSet] =
+            Boxed<VkDescriptorSet>::fromRaw(boxedDescriptorSet);
         applyDescriptorSetAllocationLocked(*poolInfo, setInfo.bindings);
     }
 
     VkResult on_vkAllocateDescriptorSets(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                         VkDevice boxed_device,
+                                         Boxed<VkDevice> boxed_device,
                                          const VkDescriptorSetAllocateInfo* pAllocateInfo,
                                          VkDescriptorSet* pDescriptorSets) {
         auto device = unbox_VkDevice(boxed_device);
@@ -5760,7 +6192,7 @@ class VkDecoderGlobalState::Impl {
 
         std::lock_guard<std::mutex> lock(mMutex);
 
-        if (m_vkEmulation->getFeatures().VulkanBatchedDescriptorSetUpdate.enabled()) {
+        if (mBatchedDescriptorSetUpdateEnabled) {
             auto allocValidationRes = validateDescriptorSetAllocLocked(pAllocateInfo);
             if (allocValidationRes != VK_SUCCESS) return allocValidationRes;
         }
@@ -5772,12 +6204,26 @@ class VkDecoderGlobalState::Impl {
                 gfxstream::base::find(mDescriptorPoolInfo, pAllocateInfo->descriptorPool);
             if (!poolInfo) return res;
 
+            const auto* varDescCountAllocInfo =
+                vk_find_struct<VkDescriptorSetVariableDescriptorCountAllocateInfo>(pAllocateInfo);
+
             for (uint32_t i = 0; i < pAllocateInfo->descriptorSetCount; ++i) {
                 auto unboxed = pDescriptorSets[i];
-                pDescriptorSets[i] = new_boxed_non_dispatchable_VkDescriptorSet(pDescriptorSets[i]);
+                Boxed<VkDescriptorSet> boxed =
+                    new_boxed_non_dispatchable_VkDescriptorSet(unboxed);
+                pDescriptorSets[i] = boxed.value();
+                if (mBatchedDescriptorSetUpdateEnabled) {
+                    poolInfo->nonPreallocatedBoxedSets.insert(boxed);
+                }
+                const uint32_t* varCount =
+                    (varDescCountAllocInfo && varDescCountAllocInfo->descriptorSetCount > i &&
+                     varDescCountAllocInfo->pDescriptorCounts)
+                        ? &varDescCountAllocInfo->pDescriptorCounts[i]
+                        : nullptr;
                 initDescriptorSetInfoLocked(device, pAllocateInfo->descriptorPool,
                                             pAllocateInfo->pSetLayouts[i],
-                                            (uint64_t)(pDescriptorSets[i]), unboxed);
+                                            reinterpret_cast<uint64_t>(boxed.value()), unboxed,
+                                            varCount);
             }
         }
 
@@ -5785,7 +6231,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkFreeDescriptorSets(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                     VkDevice boxed_device, VkDescriptorPool descriptorPool,
+                                     Boxed<VkDevice> boxed_device, VkDescriptorPool descriptorPool,
                                      uint32_t descriptorSetCount,
                                      const VkDescriptorSet* pDescriptorSets) {
         auto device = unbox_VkDevice(boxed_device);
@@ -5809,9 +6255,10 @@ class VkDecoderGlobalState::Impl {
                     poolInfo->allocatedSetsUnboxedToBoxed, pDescriptorSets[i]);
                 if (!descSetAllocedEntry) continue;
 
-                auto handleInfo = sBoxedHandleManager.get((uint64_t)*descSetAllocedEntry);
+                auto handleInfo = sBoxedHandleManager.get(*descSetAllocedEntry);
                 if (handleInfo) {
-                    if (m_vkEmulation->getFeatures().VulkanBatchedDescriptorSetUpdate.enabled()) {
+                    if (mBatchedDescriptorSetUpdateEnabled &&
+                        poolInfo->nonPreallocatedBoxedSets.erase(*descSetAllocedEntry) == 0) {
                         handleInfo->underlying = reinterpret_cast<uint64_t>(VK_NULL_HANDLE);
                     } else {
                         delete_VkDescriptorSet(*descSetAllocedEntry);
@@ -5828,7 +6275,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkUpdateDescriptorSets(gfxstream::base::BumpPool* pool,
-                                   VkSnapshotApiCallHandle apiCallHandle, VkDevice boxed_device,
+                                   VkSnapshotApiCallHandle apiCallHandle, Boxed<VkDevice> boxed_device,
                                    uint32_t descriptorWriteCount,
                                    const VkWriteDescriptorSet* pDescriptorWrites,
                                    uint32_t descriptorCopyCount,
@@ -5841,21 +6288,46 @@ class VkDecoderGlobalState::Impl {
                                       descriptorCopyCount, pDescriptorCopies);
     }
 
-    static DescriptorSetInfo::DescriptorWrite* GetDescriptorSetElementEntryWrapping(
-        std::vector<std::vector<DescriptorSetInfo::DescriptorWrite>>& descriptorSetTable,
-        uint32_t& bindingIndex, uint32_t& arrayElementIndex) {
-        while (bindingIndex < descriptorSetTable.size()) {
-            std::vector<DescriptorSetInfo::DescriptorWrite>& bindingTable =
-                descriptorSetTable[bindingIndex];
-            if (arrayElementIndex < bindingTable.size()) {
-                return &bindingTable[arrayElementIndex];
+    static bool ResolveDescriptorSetElementIndexWrapping(const DescriptorSetInfo& descriptorSetInfo,
+                                                         uint32_t& bindingIndex,
+                                                         uint32_t& arrayElementIndex) {
+        while (bindingIndex < descriptorSetInfo.allWrites.size()) {
+            if (arrayElementIndex < descriptorSetInfo.bindingDescriptorCounts[bindingIndex]) {
+                return true;
             }
             // Descriptor writes wrap to the next binding. See
             // https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkWriteDescriptorSet.html
+            arrayElementIndex -= descriptorSetInfo.bindingDescriptorCounts[bindingIndex];
             ++bindingIndex;
-            arrayElementIndex = 0;
         }
-        return nullptr;
+        return false;
+    }
+
+    static DescriptorSetInfo::DescriptorWrite* GetDescriptorSetElementEntryWrapping(
+        DescriptorSetInfo& descriptorSetInfo, uint32_t& bindingIndex, uint32_t& arrayElementIndex) {
+        if (!ResolveDescriptorSetElementIndexWrapping(descriptorSetInfo, bindingIndex,
+                                                      arrayElementIndex)) {
+            return nullptr;
+        }
+        auto& bindingTable = descriptorSetInfo.allWrites[bindingIndex];
+        auto [it, inserted] = bindingTable.try_emplace(arrayElementIndex);
+        if (inserted) {
+            it->second.descriptorType = descriptorSetInfo.bindingDescriptorTypes[bindingIndex];
+            it->second.dstArrayElement = 0;
+        }
+        return &it->second;
+    }
+
+    static const DescriptorSetInfo::DescriptorWrite* FindDescriptorSetElementEntryWrapping(
+        const DescriptorSetInfo& descriptorSetInfo, uint32_t& bindingIndex,
+        uint32_t& arrayElementIndex) {
+        if (!ResolveDescriptorSetElementIndexWrapping(descriptorSetInfo, bindingIndex,
+                                                      arrayElementIndex)) {
+            return nullptr;
+        }
+        const auto& bindingTable = descriptorSetInfo.allWrites[bindingIndex];
+        auto it = bindingTable.find(arrayElementIndex);
+        return (it != bindingTable.end()) ? &it->second : nullptr;
     }
 
     void on_vkUpdateDescriptorSetsImpl(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
@@ -5871,7 +6343,6 @@ class VkDecoderGlobalState::Impl {
                 continue;
             }
             DescriptorSetInfo& descriptorSetInfo = ite->second;
-            auto& table = descriptorSetInfo.allWrites;
             VkDescriptorType descType = descriptorWrite.descriptorType;
             uint32_t dstBinding = descriptorWrite.dstBinding;
             uint32_t dstArrayElement = descriptorWrite.dstArrayElement;
@@ -5880,8 +6351,8 @@ class VkDecoderGlobalState::Impl {
             if (isDescriptorTypeImageInfo(descType)) {
                 for (uint32_t writeElemIdx = 0; writeElemIdx < descriptorCount;
                      ++writeElemIdx, ++dstArrayElement) {
-                    auto* entry =
-                        GetDescriptorSetElementEntryWrapping(table, dstBinding, dstArrayElement);
+                    auto* entry = GetDescriptorSetElementEntryWrapping(descriptorSetInfo,
+                                                                       dstBinding, dstArrayElement);
                     if (entry == nullptr) break;
                     entry->imageInfo = descriptorWrite.pImageInfo[writeElemIdx];
                     entry->writeType = DescriptorSetInfo::DescriptorWriteType::ImageInfo;
@@ -5907,8 +6378,8 @@ class VkDecoderGlobalState::Impl {
             } else if (isDescriptorTypeBufferInfo(descType)) {
                 for (uint32_t writeElemIdx = 0; writeElemIdx < descriptorCount;
                      ++writeElemIdx, ++dstArrayElement) {
-                    auto* entry =
-                        GetDescriptorSetElementEntryWrapping(table, dstBinding, dstArrayElement);
+                    auto* entry = GetDescriptorSetElementEntryWrapping(descriptorSetInfo,
+                                                                       dstBinding, dstArrayElement);
                     if (entry == nullptr) break;
                     entry->bufferInfo = descriptorWrite.pBufferInfo[writeElemIdx];
                     entry->writeType = DescriptorSetInfo::DescriptorWriteType::BufferInfo;
@@ -5922,8 +6393,8 @@ class VkDecoderGlobalState::Impl {
             } else if (isDescriptorTypeBufferView(descType)) {
                 for (uint32_t writeElemIdx = 0; writeElemIdx < descriptorCount;
                      ++writeElemIdx, ++dstArrayElement) {
-                    auto* entry =
-                        GetDescriptorSetElementEntryWrapping(table, dstBinding, dstArrayElement);
+                    auto* entry = GetDescriptorSetElementEntryWrapping(descriptorSetInfo,
+                                                                       dstBinding, dstArrayElement);
                     if (entry == nullptr) break;
                     entry->bufferView = descriptorWrite.pTexelBufferView[writeElemIdx];
                     entry->writeType = DescriptorSetInfo::DescriptorWriteType::BufferView;
@@ -5953,10 +6424,16 @@ class VkDecoderGlobalState::Impl {
                     return;
                 }
 
-                // Inline uniform block descriptors effectively only have a single element.
-                uint32_t zero = 0;
-                auto* entry = GetDescriptorSetElementEntryWrapping(table, dstBinding, zero);
-                if (entry == nullptr) break;
+                // Inline uniform block descriptors have a single element and do not wrap
+                // across consecutive bindings.
+                if (dstBinding >= descriptorSetInfo.allWrites.size() ||
+                    descriptorSetInfo.bindingDescriptorCounts[dstBinding] == 0 ||
+                    !isDescriptorTypeInlineUniformBlock(
+                        descriptorSetInfo.bindingDescriptorTypes[dstBinding])) {
+                    continue;
+                }
+                auto& entryRef = descriptorSetInfo.allWrites[dstBinding][0];
+                auto* entry = &entryRef;
 
                 entry->inlineUniformBlock = *descInlineUniformBlock;
                 if (entry->inlineUniformBlockBuffer.size() <
@@ -5994,65 +6471,72 @@ class VkDecoderGlobalState::Impl {
             DescriptorSetInfo& srcDescriptorSetInfo = srcIte->second;
             DescriptorSetInfo& dstDescriptorSetInfo = dstIte->second;
 
-            auto& srcTable = srcDescriptorSetInfo.allWrites;
-            auto& dstTable = dstDescriptorSetInfo.allWrites;
-
             uint32_t srcBinding = descriptorCopy.srcBinding;
             uint32_t srcArrayElement = descriptorCopy.srcArrayElement;
             uint32_t dstBinding = descriptorCopy.dstBinding;
             uint32_t dstArrayElement = descriptorCopy.dstArrayElement;
             uint32_t descriptorCount = descriptorCopy.descriptorCount;
 
-            uint32_t srcBindingCheck = srcBinding;
-            uint32_t srcArrayElementCheck = srcArrayElement;
-            auto* srcCheckEntry = GetDescriptorSetElementEntryWrapping(srcTable, srcBindingCheck,
-                                                                       srcArrayElementCheck);
-
-            uint32_t dstBindingCheck = dstBinding;
-            uint32_t dstArrayElementCheck = dstArrayElement;
-            auto* dstCheckEntry = GetDescriptorSetElementEntryWrapping(dstTable, dstBindingCheck,
-                                                                       dstArrayElementCheck);
-
-            if (srcCheckEntry && dstCheckEntry &&
-                isDescriptorTypeInlineUniformBlock(srcCheckEntry->descriptorType)) {
-                uint32_t zero1 = 0;
-                uint32_t zero2 = 0;
-                auto* srcEntry =
-                    GetDescriptorSetElementEntryWrapping(srcTable, srcBindingCheck, zero1);
-                auto* dstEntry =
-                    GetDescriptorSetElementEntryWrapping(dstTable, dstBindingCheck, zero2);
-
-                if (srcEntry && dstEntry) {
-                    if (dstEntry->inlineUniformBlockBuffer.size() <
-                        dstArrayElementCheck + descriptorCount) {
-                        dstEntry->inlineUniformBlockBuffer.resize(dstArrayElementCheck +
-                                                                  descriptorCount);
+            const bool srcIsInlineUniformBlock =
+                srcBinding < srcDescriptorSetInfo.allWrites.size() &&
+                isDescriptorTypeInlineUniformBlock(
+                    srcDescriptorSetInfo.bindingDescriptorTypes[srcBinding]);
+            const bool dstIsInlineUniformBlock =
+                dstBinding < dstDescriptorSetInfo.allWrites.size() &&
+                isDescriptorTypeInlineUniformBlock(
+                    dstDescriptorSetInfo.bindingDescriptorTypes[dstBinding]);
+            if (srcIsInlineUniformBlock || dstIsInlineUniformBlock) {
+                if (srcIsInlineUniformBlock && dstIsInlineUniformBlock &&
+                    srcDescriptorSetInfo.bindingDescriptorCounts[srcBinding] > 0 &&
+                    dstDescriptorSetInfo.bindingDescriptorCounts[dstBinding] > 0) {
+                    const auto& srcBindingTable = srcDescriptorSetInfo.allWrites[srcBinding];
+                    auto srcElemIt = srcBindingTable.find(0);
+                    if (srcElemIt != srcBindingTable.end() &&
+                        srcElemIt->second.writeType ==
+                            DescriptorSetInfo::DescriptorWriteType::InlineUniformBlock) {
+                        auto& dstEntry = dstDescriptorSetInfo.allWrites[dstBinding][0];
+                        if (dstEntry.inlineUniformBlockBuffer.size() <
+                            dstArrayElement + descriptorCount) {
+                            dstEntry.inlineUniformBlockBuffer.resize(dstArrayElement +
+                                                                     descriptorCount);
+                        }
+                        if (srcElemIt->second.inlineUniformBlockBuffer.size() > srcArrayElement) {
+                            uint32_t copySize = std::min(
+                                descriptorCount,
+                                (uint32_t)srcElemIt->second.inlineUniformBlockBuffer.size() -
+                                    srcArrayElement);
+                            memmove(
+                                dstEntry.inlineUniformBlockBuffer.data() + dstArrayElement,
+                                srcElemIt->second.inlineUniformBlockBuffer.data() + srcArrayElement,
+                                copySize);
+                        }
+                        dstEntry.writeType =
+                            DescriptorSetInfo::DescriptorWriteType::InlineUniformBlock;
+                        dstEntry.descriptorType = srcElemIt->second.descriptorType;
                     }
-                    if (srcEntry->inlineUniformBlockBuffer.size() > srcArrayElementCheck) {
-                        uint32_t copySize = std::min(
-                            descriptorCount, (uint32_t)srcEntry->inlineUniformBlockBuffer.size() -
-                                                 srcArrayElementCheck);
-                        memcpy(dstEntry->inlineUniformBlockBuffer.data() + dstArrayElementCheck,
-                               srcEntry->inlineUniformBlockBuffer.data() + srcArrayElementCheck,
-                               copySize);
-                    }
-                    dstEntry->writeType =
-                        DescriptorSetInfo::DescriptorWriteType::InlineUniformBlock;
-                    dstEntry->descriptorType = srcEntry->descriptorType;
                 }
                 continue;
             }
 
             for (uint32_t writeElemIdx = 0; writeElemIdx < descriptorCount;
                  ++writeElemIdx, ++srcArrayElement, ++dstArrayElement) {
-                auto* srcEntry =
-                    GetDescriptorSetElementEntryWrapping(srcTable, srcBinding, srcArrayElement);
-                auto* dstEntry =
-                    GetDescriptorSetElementEntryWrapping(dstTable, dstBinding, dstArrayElement);
+                if (!ResolveDescriptorSetElementIndexWrapping(srcDescriptorSetInfo, srcBinding,
+                                                              srcArrayElement) ||
+                    !ResolveDescriptorSetElementIndexWrapping(dstDescriptorSetInfo, dstBinding,
+                                                              dstArrayElement)) {
+                    break;
+                }
 
-                if (srcEntry == nullptr || dstEntry == nullptr) break;
+                const auto& srcBindingTable = srcDescriptorSetInfo.allWrites[srcBinding];
+                auto srcElemIt = srcBindingTable.find(srcArrayElement);
+                if (srcElemIt == srcBindingTable.end() ||
+                    srcElemIt->second.writeType == DescriptorSetInfo::DescriptorWriteType::Empty) {
+                    dstDescriptorSetInfo.allWrites[dstBinding].erase(dstArrayElement);
+                    continue;
+                }
 
-                *dstEntry = *srcEntry;
+                DescriptorSetInfo::DescriptorWrite srcCopy = srcElemIt->second;
+                dstDescriptorSetInfo.allWrites[dstBinding][dstArrayElement] = std::move(srcCopy);
             }
         }
         bool needEmulateWriteDescriptor = false;
@@ -6161,7 +6645,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreateShaderModule(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                     VkDevice boxed_device,
+                                     Boxed<VkDevice> boxed_device,
                                      const VkShaderModuleCreateInfo* pCreateInfo,
                                      const VkAllocationCallbacks*, VkShaderModule* pShaderModule) {
         auto device = unbox_VkDevice(boxed_device);
@@ -6179,8 +6663,8 @@ class VkDecoderGlobalState::Impl {
         auto& shaderModuleInfo = mShaderModuleInfo[*pShaderModule];
         shaderModuleInfo.device = device;
 
-        *pShaderModule = new_boxed_non_dispatchable_VkShaderModule(*pShaderModule);
-        shaderModuleInfo.boxed = *pShaderModule;
+        shaderModuleInfo.boxed = new_boxed_non_dispatchable_VkShaderModule(*pShaderModule);
+        *pShaderModule = shaderModuleInfo.boxed.value();
 
         return result;
     }
@@ -6203,7 +6687,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyShaderModule(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                  VkDevice boxed_device, VkShaderModule shaderModule,
+                                  Boxed<VkDevice> boxed_device, VkShaderModule shaderModule,
                                   const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -6213,7 +6697,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreatePipelineCache(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                      VkDevice boxed_device,
+                                      Boxed<VkDevice> boxed_device,
                                       const VkPipelineCacheCreateInfo* pCreateInfo,
                                       const VkAllocationCallbacks*,
                                       VkPipelineCache* pPipelineCache) {
@@ -6232,8 +6716,8 @@ class VkDecoderGlobalState::Impl {
         auto& pipelineCacheInfo = mPipelineCacheInfo[*pPipelineCache];
         pipelineCacheInfo.device = device;
 
-        *pPipelineCache = new_boxed_non_dispatchable_VkPipelineCache(*pPipelineCache);
-        pipelineCacheInfo.boxed = *pPipelineCache;
+        pipelineCacheInfo.boxed = new_boxed_non_dispatchable_VkPipelineCache(*pPipelineCache);
+        *pPipelineCache = pipelineCacheInfo.boxed.value();
 
         return result;
     }
@@ -6257,7 +6741,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyPipelineCache(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                   VkDevice boxed_device, VkPipelineCache pipelineCache,
+                                   Boxed<VkDevice> boxed_device, VkPipelineCache pipelineCache,
                                    const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -6267,7 +6751,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreatePipelineLayout(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                       VkDevice boxed_device,
+                                       Boxed<VkDevice> boxed_device,
                                        const VkPipelineLayoutCreateInfo* pCreateInfo,
                                        const VkAllocationCallbacks*,
                                        VkPipelineLayout* pPipelineLayout) {
@@ -6286,8 +6770,8 @@ class VkDecoderGlobalState::Impl {
         auto& pipelineLayoutInfo = mPipelineLayoutInfo[*pPipelineLayout];
         pipelineLayoutInfo.device = device;
 
-        *pPipelineLayout = new_boxed_non_dispatchable_VkPipelineLayout(*pPipelineLayout);
-        pipelineLayoutInfo.boxed = *pPipelineLayout;
+        pipelineLayoutInfo.boxed = new_boxed_non_dispatchable_VkPipelineLayout(*pPipelineLayout);
+        *pPipelineLayout = pipelineLayoutInfo.boxed.value();
 
         return result;
     }
@@ -6313,7 +6797,7 @@ class VkDecoderGlobalState::Impl {
     // This call will be delayed as VulkanQueueSubmitWithCommands feature can change order
     // of the commands and pipeline layouts need to stay valid during recording.
     void on_vkDestroyPipelineLayout(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
-                                    VkDevice boxed_device, VkPipelineLayout pipelineLayout,
+                                    Boxed<VkDevice> boxed_device, VkPipelineLayout pipelineLayout,
                                     const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -6323,7 +6807,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreateGraphicsPipelines(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                          VkDevice boxed_device, VkPipelineCache pipelineCache,
+                                          Boxed<VkDevice> boxed_device, VkPipelineCache pipelineCache,
                                           uint32_t createInfoCount,
                                           const VkGraphicsPipelineCreateInfo* pCreateInfos,
                                           const VkAllocationCallbacks*, VkPipeline* pPipelines) {
@@ -6346,15 +6830,15 @@ class VkDecoderGlobalState::Impl {
             auto& pipelineInfo = mPipelineInfo[pPipelines[i]];
             pipelineInfo.device = device;
 
-            pPipelines[i] = new_boxed_non_dispatchable_VkPipeline(pPipelines[i]);
-            pipelineInfo.boxed = pPipelines[i];
+            pipelineInfo.boxed = new_boxed_non_dispatchable_VkPipeline(pPipelines[i]);
+            pPipelines[i] = pipelineInfo.boxed.value();
         }
 
         return result;
     }
 
     VkResult on_vkCreateComputePipelines(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                         VkDevice boxed_device, VkPipelineCache pipelineCache,
+                                         Boxed<VkDevice> boxed_device, VkPipelineCache pipelineCache,
                                          uint32_t createInfoCount,
                                          const VkComputePipelineCreateInfo* pCreateInfos,
                                          const VkAllocationCallbacks*, VkPipeline* pPipelines) {
@@ -6377,8 +6861,8 @@ class VkDecoderGlobalState::Impl {
             auto& pipelineInfo = mPipelineInfo[pPipelines[i]];
             pipelineInfo.device = device;
 
-            pPipelines[i] = new_boxed_non_dispatchable_VkPipeline(pPipelines[i]);
-            pipelineInfo.boxed = pPipelines[i];
+            pipelineInfo.boxed = new_boxed_non_dispatchable_VkPipeline(pPipelines[i]);
+            pPipelines[i] = pipelineInfo.boxed.value();
         }
 
         return result;
@@ -6401,7 +6885,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyPipeline(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                              VkDevice boxed_device, VkPipeline pipeline,
+                              Boxed<VkDevice> boxed_device, VkPipeline pipeline,
                               const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -6411,7 +6895,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdCopyImage(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                           VkCommandBuffer boxed_commandBuffer, VkImage srcImage,
+                           Boxed<VkCommandBuffer> boxed_commandBuffer, VkImage srcImage,
                            VkImageLayout srcImageLayout, VkImage dstImage,
                            VkImageLayout dstImageLayout, uint32_t regionCount,
                            const VkImageCopy* pRegions) {
@@ -6453,7 +6937,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdCopyImageToBuffer(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                   VkCommandBuffer boxed_commandBuffer, VkImage srcImage,
+                                   Boxed<VkCommandBuffer> boxed_commandBuffer, VkImage srcImage,
                                    VkImageLayout srcImageLayout, VkBuffer dstBuffer,
                                    uint32_t regionCount, const VkBufferImageCopy* pRegions) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
@@ -6481,7 +6965,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdCopyImage2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                            VkCommandBuffer boxed_commandBuffer,
+                            Boxed<VkCommandBuffer> boxed_commandBuffer,
                             const VkCopyImageInfo2* pCopyImageInfo) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
@@ -6527,7 +7011,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdCopyImageToBuffer2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                    VkCommandBuffer boxed_commandBuffer,
+                                    Boxed<VkCommandBuffer> boxed_commandBuffer,
                                     const VkCopyImageToBufferInfo2* pCopyImageToBufferInfo) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
@@ -6557,7 +7041,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdCopyImage2KHR(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                               VkCommandBuffer boxed_commandBuffer,
+                               Boxed<VkCommandBuffer> boxed_commandBuffer,
                                const VkCopyImageInfo2KHR* pCopyImageInfo) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
@@ -6603,7 +7087,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdCopyImageToBuffer2KHR(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                       VkCommandBuffer boxed_commandBuffer,
+                                       Boxed<VkCommandBuffer> boxed_commandBuffer,
                                        const VkCopyImageToBufferInfo2KHR* pCopyImageToBufferInfo) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
@@ -6638,7 +7122,7 @@ class VkDecoderGlobalState::Impl {
     // an AHB-backed blob fails with "invalid Mesa handle" and the guest's mmap64 returns EINVAL.
     // So hand back only the device-local, non-host-visible subset when one exists.
     void on_vkGetImageMemoryRequirements(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                         VkDevice boxed_device, VkImage image,
+                                         Boxed<VkDevice> boxed_device, VkImage image,
                                          VkMemoryRequirements* pMemoryRequirements) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -6666,12 +7150,27 @@ class VkDecoderGlobalState::Impl {
 
     // A driver that defers the layout also reports rowPitch=0; answer with the AHB's stride.
     void on_vkGetImageSubresourceLayout(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
-                                        VkDevice boxed_device, VkImage image,
+                                        Boxed<VkDevice> boxed_device, VkImage image,
                                         const VkImageSubresource* pSubresource,
                                         VkSubresourceLayout* pLayout) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
-        vk->vkGetImageSubresourceLayout(device, image, pSubresource, pLayout);
+        VkImageSubresource subresource = *pSubresource;
+        VkImage targetImage = image;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            auto* imageInfo = gfxstream::base::find(mImageInfo, image);
+            if (imageInfo && imageInfo->compressInfo) {
+                if (subresource.mipLevel >= imageInfo->imageCreateInfoShallow.mipLevels) {
+                    GFXSTREAM_ERROR("%s: Invalid mip level %u.", __func__, subresource.mipLevel);
+                    *pLayout = {};
+                    return;
+                }
+                targetImage = imageInfo->compressInfo->compressedMipmap(subresource.mipLevel);
+                subresource.mipLevel = 0;
+            }
+        }
+        vk->vkGetImageSubresourceLayout(device, targetImage, &subresource, pLayout);
 #ifdef __ANDROID__
         if (pLayout && pLayout->rowPitch == 0) {
             std::lock_guard<std::mutex> lock(mMutex);
@@ -6686,8 +7185,443 @@ class VkDecoderGlobalState::Impl {
 #endif
     }
 
+    // Calls whichever vkGetImageSubresourceLayout2 entry point the device supports. Returns false
+    // if there is none.
+    static bool getImageSubresourceLayout2(VulkanDispatch* vk, VkDevice device, VkImage image,
+                                           const VkImageSubresource2* pSubresource,
+                                           VkSubresourceLayout2* pLayout) {
+        if (vk->vkGetImageSubresourceLayout2) {
+            vk->vkGetImageSubresourceLayout2(device, image, pSubresource, pLayout);
+        } else if (vk->vkGetImageSubresourceLayout2EXT) {
+            vk->vkGetImageSubresourceLayout2EXT(device, image, pSubresource, pLayout);
+        } else if (vk->vkGetImageSubresourceLayout2KHR) {
+            vk->vkGetImageSubresourceLayout2KHR(device, image, pSubresource, pLayout);
+        } else {
+            return false;
+        }
+        return true;
+    }
+
+    void on_vkGetImageSubresourceLayout2(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
+                                         Boxed<VkDevice> boxed_device, VkImage image,
+                                         const VkImageSubresource2* pSubresource,
+                                         VkSubresourceLayout2* pLayout) {
+        auto device = unbox_VkDevice(boxed_device);
+        auto vk = dispatch_VkDevice(boxed_device);
+        VkImageSubresource2 subresource = *pSubresource;
+        VkImage targetImage = image;
+        {
+            std::lock_guard<std::mutex> lock(mMutex);
+            auto* imageInfo = gfxstream::base::find(mImageInfo, image);
+            if (imageInfo && imageInfo->compressInfo) {
+                const uint32_t mipLevel = subresource.imageSubresource.mipLevel;
+                if (mipLevel >= imageInfo->imageCreateInfoShallow.mipLevels) {
+                    GFXSTREAM_ERROR("%s: Invalid mip level %u.", __func__, mipLevel);
+                    pLayout->subresourceLayout = {};
+                    return;
+                }
+                targetImage = imageInfo->compressInfo->compressedMipmap(mipLevel);
+                subresource.imageSubresource.mipLevel = 0;
+            }
+        }
+        getImageSubresourceLayout2(vk, device, targetImage, &subresource, pLayout);
+#ifdef __ANDROID__
+        if (pLayout && pLayout->subresourceLayout.rowPitch == 0) {
+            std::lock_guard<std::mutex> lock(mMutex);
+            auto* dlInfo = gfxstream::base::find(mImageInfo, image);
+            if (dlInfo && dlInfo->deferredLayout.rowPitch > 0) {
+                pLayout->subresourceLayout.rowPitch = dlInfo->deferredLayout.rowPitch;
+                if (pLayout->subresourceLayout.size == 0) {
+                    pLayout->subresourceLayout.size = dlInfo->deferredLayout.size;
+                }
+                GFXSTREAM_INFO("DL-AHB stride image=%p rowPitch=%llu", (void*)image,
+                               (unsigned long long)pLayout->subresourceLayout.rowPitch);
+            }
+        }
+#endif
+    }
+
+    // Returns the size of the host memory that a host image copy region accesses: the offset of
+    // the last texel block that it copies plus the size of that block. Returns std::nullopt if the
+    // region is invalid or would access more than UINT32_MAX bytes, the largest
+    // VkHostPointerResolveGOOGLE::pointerSize.
+    template <typename HostImageCopyRegion>
+    std::optional<uint64_t> getHostImageCopyMemorySize(VulkanDispatch* vk, VkDevice device,
+                                                       VkImage image, const ImageInfo& imageInfo,
+                                                       VkHostImageCopyFlags flags,
+                                                       const HostImageCopyRegion& region) {
+        constexpr uint64_t kMaxSize = std::numeric_limits<uint32_t>::max();
+
+        const VkImageCreateInfo& createInfo = imageInfo.imageCreateInfoShallow;
+        const VkImageSubresourceLayers& subresource = region.imageSubresource;
+        if (subresource.mipLevel >= createInfo.mipLevels ||
+            subresource.baseArrayLayer >= createInfo.arrayLayers) {
+            return std::nullopt;
+        }
+        const uint32_t availableLayers = createInfo.arrayLayers - subresource.baseArrayLayer;
+        const uint32_t layerCount = subresource.layerCount == VK_REMAINING_ARRAY_LAYERS
+                                        ? availableLayers
+                                        : subresource.layerCount;
+        if (layerCount == 0 || layerCount > availableLayers) {
+            return std::nullopt;
+        }
+
+        if (flags & VK_HOST_IMAGE_COPY_MEMCPY_BIT) {
+            // Each layer is copied as VkSubresourceHostMemcpySize::size bytes in an
+            // implementation-defined layout. Query the image that the copy will access.
+            VkImage copyImage = image;
+            uint32_t copyMipLevel = subresource.mipLevel;
+            if (imageInfo.compressInfo) {
+                copyImage = imageInfo.compressInfo->compressedMipmap(subresource.mipLevel);
+                copyMipLevel = 0;
+            }
+            uint64_t size = 0;
+            for (uint32_t i = 0; i < layerCount; ++i) {
+                const VkImageSubresource2 copySubresource = {
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2,
+                    .pNext = nullptr,
+                    .imageSubresource =
+                        {
+                            .aspectMask = subresource.aspectMask,
+                            .mipLevel = copyMipLevel,
+                            .arrayLayer = subresource.baseArrayLayer + i,
+                        },
+                };
+                VkSubresourceHostMemcpySize memcpySize = {
+                    .sType = VK_STRUCTURE_TYPE_SUBRESOURCE_HOST_MEMCPY_SIZE,
+                    .pNext = nullptr,
+                    .size = 0,
+                };
+                VkSubresourceLayout2 layout = {
+                    .sType = VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2,
+                    .pNext = &memcpySize,
+                };
+                if (!getImageSubresourceLayout2(vk, device, copyImage, &copySubresource, &layout) ||
+                    memcpySize.size == 0 || memcpySize.size > kMaxSize - size) {
+                    return std::nullopt;
+                }
+                size += memcpySize.size;
+            }
+            return size;
+        }
+
+        // Emulated compressed images are copied with the layout of the guest's format.
+        const VkFormat format = imageInfo.compressInfo ? imageInfo.compressInfo->compressedFormat()
+                                                       : createInfo.format;
+        const std::optional<TexelBlockInfo> block =
+            getCopyTexelBlockInfo(format, subresource.aspectMask);
+        if (!block || block->width == 0 || block->height == 0 || block->depth == 0) {
+            return std::nullopt;
+        }
+
+        const VkExtent3D& extent = region.imageExtent;
+        if (extent.width == 0 || extent.height == 0 || extent.depth == 0 ||
+            (region.memoryRowLength != 0 && region.memoryRowLength < extent.width) ||
+            (region.memoryImageHeight != 0 && region.memoryImageHeight < extent.height)) {
+            return std::nullopt;
+        }
+        const uint64_t rowLength = region.memoryRowLength ? region.memoryRowLength : extent.width;
+        const uint64_t imageHeight =
+            region.memoryImageHeight ? region.memoryImageHeight : extent.height;
+        auto ceilDiv = [](uint64_t value, uint64_t divisor) {
+            return (value + divisor - 1) / divisor;
+        };
+
+        // All operands are at most kMaxSize, so the products fit in 64 bits before being clamped.
+        bool tooLarge = false;
+        auto mul = [&](uint64_t a, uint64_t b) {
+            const uint64_t product = a * b;
+            if (product > kMaxSize) {
+                tooLarge = true;
+                return kMaxSize;
+            }
+            return product;
+        };
+        const uint64_t depthBlocks = ceilDiv(extent.depth, block->depth);
+        const uint64_t rowPitch = mul(ceilDiv(rowLength, block->width), block->sizeBytes);
+        const uint64_t slicePitch = mul(ceilDiv(imageHeight, block->height), rowPitch);
+        const uint64_t layerPitch = mul(depthBlocks, slicePitch);
+        const uint64_t size = mul(layerCount - 1, layerPitch) + mul(depthBlocks - 1, slicePitch) +
+                              mul(ceilDiv(extent.height, block->height) - 1, rowPitch) +
+                              mul(ceilDiv(extent.width, block->width), block->sizeBytes);
+        if (tooLarge || size > kMaxSize) {
+            return std::nullopt;
+        }
+        return size;
+    }
+
+    // Checks that every region of a host image copy points at memory received from the guest in
+    // VkHostPointerResolveGOOGLE, and that this memory is large enough for the copy. Without the
+    // struct, pHostPointer points at a single byte, see transformImpl_VkMemoryToImageCopy_tohost().
+    template <typename HostImageCopyRegion>
+    bool validateHostImageCopyRegions(VulkanDispatch* vk, VkDevice device, VkImage image,
+                                      const ImageInfo& imageInfo, VkHostImageCopyFlags flags,
+                                      uint32_t regionCount, const HostImageCopyRegion* pRegions) {
+        for (uint32_t r = 0; r < regionCount; r++) {
+            const HostImageCopyRegion& region = pRegions[r];
+            const VkHostPointerResolveGOOGLE* hostPtrResolve =
+                vk_find_struct<VkHostPointerResolveGOOGLE>(&region);
+            if (!hostPtrResolve || !hostPtrResolve->pHostPointer ||
+                region.pHostPointer != hostPtrResolve->pHostPointer) {
+                GFXSTREAM_ERROR("%s: Region %u has no VkHostPointerResolveGOOGLE data.", __func__,
+                                r);
+                return false;
+            }
+            const std::optional<uint64_t> size =
+                getHostImageCopyMemorySize(vk, device, image, imageInfo, flags, region);
+            if (!size) {
+                GFXSTREAM_ERROR("%s: Region %u is invalid.", __func__, r);
+                return false;
+            }
+            if (*size > hostPtrResolve->pointerSize) {
+                GFXSTREAM_ERROR("%s: Region %u accesses %" PRIu64 " bytes, but only %u are available.",
+                                __func__, r, *size, hostPtrResolve->pointerSize);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    VkResult on_vkCopyMemoryToImage_common(bool isExt, Boxed<VkDevice> boxed_device,
+                                           const VkCopyMemoryToImageInfo* pCopyMemoryToImageInfo) {
+        auto device = unbox_VkDevice(boxed_device);
+        auto vk = dispatch_VkDevice(boxed_device);
+        auto copyMemoryToImageFn =
+            isExt ? (vk->vkCopyMemoryToImageEXT ? vk->vkCopyMemoryToImageEXT
+                                                : vk->vkCopyMemoryToImage)
+                  : (vk->vkCopyMemoryToImage ? vk->vkCopyMemoryToImage
+                                             : vk->vkCopyMemoryToImageEXT);
+        if (!copyMemoryToImageFn) {
+            GFXSTREAM_ERROR("%s: Host image copy is not supported by host driver.", __func__);
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto* imageInfo = gfxstream::base::find(mImageInfo, pCopyMemoryToImageInfo->dstImage);
+        if (!imageInfo) return VK_ERROR_INITIALIZATION_FAILED;
+        if (!validateHostImageCopyRegions(vk, device, pCopyMemoryToImageInfo->dstImage, *imageInfo,
+                                          pCopyMemoryToImageInfo->flags,
+                                          pCopyMemoryToImageInfo->regionCount,
+                                          pCopyMemoryToImageInfo->pRegions)) {
+            return VK_ERROR_VALIDATION_FAILED;
+        }
+        if (!imageInfo->compressInfo) {
+            return copyMemoryToImageFn(device, pCopyMemoryToImageInfo);
+        }
+
+        CompressedImageInfo& cmpInfo = *imageInfo->compressInfo;
+        for (uint32_t r = 0; r < pCopyMemoryToImageInfo->regionCount; r++) {
+            uint32_t mipLevel = pCopyMemoryToImageInfo->pRegions[r].imageSubresource.mipLevel;
+            VkMemoryToImageCopy region =
+                cmpInfo.getMemoryToImageCopy(pCopyMemoryToImageInfo->pRegions[r]);
+            VkCopyMemoryToImageInfo inf = *pCopyMemoryToImageInfo;
+            inf.dstImage = cmpInfo.compressedMipmap(mipLevel);
+            inf.regionCount = 1;
+            inf.pRegions = &region;
+
+            VkResult res = copyMemoryToImageFn(device, &inf);
+            if (res != VK_SUCCESS) return res;
+        }
+        return VK_SUCCESS;
+    }
+
+    VkResult on_vkCopyMemoryToImage(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
+                                    Boxed<VkDevice> boxed_device,
+                                    const VkCopyMemoryToImageInfo* pCopyMemoryToImageInfo) {
+        return on_vkCopyMemoryToImage_common(false, boxed_device, pCopyMemoryToImageInfo);
+    }
+
+    VkResult on_vkCopyMemoryToImageEXT(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
+                                       Boxed<VkDevice> boxed_device,
+                                       const VkCopyMemoryToImageInfo* pCopyMemoryToImageInfo) {
+        return on_vkCopyMemoryToImage_common(true, boxed_device, pCopyMemoryToImageInfo);
+    }
+
+    VkResult on_vkCopyImageToMemory_common(bool isExt, Boxed<VkDevice> boxed_device,
+                                           const VkCopyImageToMemoryInfo* pCopyImageToMemoryInfo) {
+        auto device = unbox_VkDevice(boxed_device);
+        auto vk = dispatch_VkDevice(boxed_device);
+        auto copyImageToMemoryFn =
+            isExt ? (vk->vkCopyImageToMemoryEXT ? vk->vkCopyImageToMemoryEXT
+                                                : vk->vkCopyImageToMemory)
+                  : (vk->vkCopyImageToMemory ? vk->vkCopyImageToMemory
+                                             : vk->vkCopyImageToMemoryEXT);
+        if (!copyImageToMemoryFn) {
+            GFXSTREAM_ERROR("%s: Host image copy is not supported by host driver.", __func__);
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto* imageInfo = gfxstream::base::find(mImageInfo, pCopyImageToMemoryInfo->srcImage);
+        if (!imageInfo) return VK_ERROR_INITIALIZATION_FAILED;
+        if (!validateHostImageCopyRegions(vk, device, pCopyImageToMemoryInfo->srcImage, *imageInfo,
+                                          pCopyImageToMemoryInfo->flags,
+                                          pCopyImageToMemoryInfo->regionCount,
+                                          pCopyImageToMemoryInfo->pRegions)) {
+            return VK_ERROR_VALIDATION_FAILED;
+        }
+        if (!imageInfo->compressInfo) {
+            return copyImageToMemoryFn(device, pCopyImageToMemoryInfo);
+        }
+
+        CompressedImageInfo& cmpInfo = *imageInfo->compressInfo;
+        for (uint32_t r = 0; r < pCopyImageToMemoryInfo->regionCount; r++) {
+            uint32_t mipLevel = pCopyImageToMemoryInfo->pRegions[r].imageSubresource.mipLevel;
+            VkImageToMemoryCopy region =
+                cmpInfo.getImageToMemoryCopy(pCopyImageToMemoryInfo->pRegions[r]);
+            VkCopyImageToMemoryInfo inf = *pCopyImageToMemoryInfo;
+            inf.srcImage = cmpInfo.compressedMipmap(mipLevel);
+            inf.regionCount = 1;
+            inf.pRegions = &region;
+
+            VkResult res = copyImageToMemoryFn(device, &inf);
+            if (res != VK_SUCCESS) return res;
+        }
+        return VK_SUCCESS;
+    }
+
+    VkResult on_vkCopyImageToMemory(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
+                                    Boxed<VkDevice> boxed_device,
+                                    const VkCopyImageToMemoryInfo* pCopyImageToMemoryInfo) {
+        return on_vkCopyImageToMemory_common(false, boxed_device, pCopyImageToMemoryInfo);
+    }
+
+    VkResult on_vkCopyImageToMemoryEXT(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
+                                       Boxed<VkDevice> boxed_device,
+                                       const VkCopyImageToMemoryInfo* pCopyImageToMemoryInfo) {
+        return on_vkCopyImageToMemory_common(true, boxed_device, pCopyImageToMemoryInfo);
+    }
+
+    VkResult on_vkCopyImageToImage_common(bool isExt, Boxed<VkDevice> boxed_device,
+                                          const VkCopyImageToImageInfo* pCopyImageToImageInfo) {
+        auto device = unbox_VkDevice(boxed_device);
+        auto vk = dispatch_VkDevice(boxed_device);
+        auto copyImageToImageFn =
+            isExt ? (vk->vkCopyImageToImageEXT ? vk->vkCopyImageToImageEXT
+                                               : vk->vkCopyImageToImage)
+                  : (vk->vkCopyImageToImage ? vk->vkCopyImageToImage
+                                            : vk->vkCopyImageToImageEXT);
+        if (!copyImageToImageFn) {
+            GFXSTREAM_ERROR("%s: Host image copy is not supported by host driver.", __func__);
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+
+        std::lock_guard<std::mutex> lock(mMutex);
+        auto* srcImg = gfxstream::base::find(mImageInfo, pCopyImageToImageInfo->srcImage);
+        auto* dstImg = gfxstream::base::find(mImageInfo, pCopyImageToImageInfo->dstImage);
+        if (!srcImg || !dstImg) return VK_ERROR_INITIALIZATION_FAILED;
+
+        if (!srcImg->compressInfo && !dstImg->compressInfo) {
+            return copyImageToImageFn(device, pCopyImageToImageInfo);
+        }
+
+        for (uint32_t r = 0; r < pCopyImageToImageInfo->regionCount; r++) {
+            const VkImageCopy2& region = pCopyImageToImageInfo->pRegions[r];
+            if ((srcImg->compressInfo &&
+                 region.srcSubresource.mipLevel >= srcImg->imageCreateInfoShallow.mipLevels) ||
+                (dstImg->compressInfo &&
+                 region.dstSubresource.mipLevel >= dstImg->imageCreateInfoShallow.mipLevels)) {
+                GFXSTREAM_ERROR("%s: Region %u has an invalid mip level.", __func__, r);
+                return VK_ERROR_VALIDATION_FAILED;
+            }
+        }
+
+        VkImage srcImageMip = pCopyImageToImageInfo->srcImage;
+        VkImage dstImageMip = pCopyImageToImageInfo->dstImage;
+        for (uint32_t r = 0; r < pCopyImageToImageInfo->regionCount; r++) {
+            if (srcImg->compressInfo) {
+                srcImageMip = srcImg->compressInfo->compressedMipmap(
+                    pCopyImageToImageInfo->pRegions[r].srcSubresource.mipLevel);
+            }
+            if (dstImg->compressInfo) {
+                dstImageMip = dstImg->compressInfo->compressedMipmap(
+                    pCopyImageToImageInfo->pRegions[r].dstSubresource.mipLevel);
+            }
+
+            VkCopyImageToImageInfo inf = *pCopyImageToImageInfo;
+            inf.regionCount = 1;
+            inf.srcImage = srcImageMip;
+            inf.dstImage = dstImageMip;
+
+            VkImageCopy2 region = CompressedImageInfo::getCompressedMipmapsImageCopy(
+                pCopyImageToImageInfo->pRegions[r], srcImg->compressInfo.get(),
+                dstImg->compressInfo.get());
+            inf.pRegions = &region;
+
+            VkResult res = copyImageToImageFn(device, &inf);
+            if (res != VK_SUCCESS) return res;
+        }
+        return VK_SUCCESS;
+    }
+
+    VkResult on_vkCopyImageToImage(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
+                                   Boxed<VkDevice> boxed_device,
+                                   const VkCopyImageToImageInfo* pCopyImageToImageInfo) {
+        return on_vkCopyImageToImage_common(false, boxed_device, pCopyImageToImageInfo);
+    }
+
+    VkResult on_vkCopyImageToImageEXT(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
+                                      Boxed<VkDevice> boxed_device,
+                                      const VkCopyImageToImageInfo* pCopyImageToImageInfo) {
+        return on_vkCopyImageToImage_common(true, boxed_device, pCopyImageToImageInfo);
+    }
+
+    VkResult on_vkTransitionImageLayout_common(
+        bool isExt, Boxed<VkDevice> boxed_device, uint32_t transitionCount,
+        const VkHostImageLayoutTransitionInfo* pTransitions) {
+        auto device = unbox_VkDevice(boxed_device);
+        auto vk = dispatch_VkDevice(boxed_device);
+        auto transitionImageLayoutFn =
+            isExt ? (vk->vkTransitionImageLayoutEXT ? vk->vkTransitionImageLayoutEXT
+                                                    : vk->vkTransitionImageLayout)
+                  : (vk->vkTransitionImageLayout ? vk->vkTransitionImageLayout
+                                                 : vk->vkTransitionImageLayoutEXT);
+        if (!transitionImageLayoutFn) {
+            GFXSTREAM_ERROR("%s: Host image copy is not supported by host driver.", __func__);
+            return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+
+        std::lock_guard<std::mutex> lock(mMutex);
+        std::vector<VkHostImageLayoutTransitionInfo> expandedTransitions;
+        expandedTransitions.reserve(transitionCount);
+        for (uint32_t i = 0; i < transitionCount; i++) {
+            const VkHostImageLayoutTransitionInfo& srcTransition = pTransitions[i];
+            auto* imageInfo = gfxstream::base::find(mImageInfo, srcTransition.image);
+            if (imageInfo && imageInfo->compressInfo) {
+                const VkImageSubresourceRange& range = srcTransition.subresourceRange;
+                const uint32_t mipLevels = imageInfo->imageCreateInfoShallow.mipLevels;
+                if (range.baseMipLevel >= mipLevels ||
+                    (range.levelCount != VK_REMAINING_MIP_LEVELS &&
+                     range.levelCount > mipLevels - range.baseMipLevel)) {
+                    GFXSTREAM_ERROR("%s: Transition %u has an invalid mip range.", __func__, i);
+                    return VK_ERROR_VALIDATION_FAILED;
+                }
+                std::vector<VkHostImageLayoutTransitionInfo> cmpTransitions =
+                    imageInfo->compressInfo->getImageLayoutTransitions(srcTransition);
+                expandedTransitions.insert(expandedTransitions.end(), cmpTransitions.begin(),
+                                           cmpTransitions.end());
+            } else {
+                expandedTransitions.push_back(srcTransition);
+            }
+        }
+        return transitionImageLayoutFn(device, static_cast<uint32_t>(expandedTransitions.size()),
+                                       expandedTransitions.data());
+    }
+
+    VkResult on_vkTransitionImageLayout(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
+                                        Boxed<VkDevice> boxed_device, uint32_t transitionCount,
+                                        const VkHostImageLayoutTransitionInfo* pTransitions) {
+        return on_vkTransitionImageLayout_common(false, boxed_device, transitionCount, pTransitions);
+    }
+
+    VkResult on_vkTransitionImageLayoutEXT(gfxstream::base::BumpPool*, VkSnapshotApiCallHandle,
+                                           Boxed<VkDevice> boxed_device, uint32_t transitionCount,
+                                           const VkHostImageLayoutTransitionInfo* pTransitions) {
+        return on_vkTransitionImageLayout_common(true, boxed_device, transitionCount, pTransitions);
+    }
+
     void on_vkGetImageMemoryRequirements2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                          VkDevice boxed_device,
+                                          Boxed<VkDevice> boxed_device,
                                           const VkImageMemoryRequirementsInfo2* pInfo,
                                           VkMemoryRequirements2* pMemoryRequirements) {
         auto device = unbox_VkDevice(boxed_device);
@@ -6745,7 +7679,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkGetBufferMemoryRequirements(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                          VkDevice boxed_device, VkBuffer buffer,
+                                          Boxed<VkDevice> boxed_device, VkBuffer buffer,
                                           VkMemoryRequirements* pMemoryRequirements) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -6769,7 +7703,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkGetBufferMemoryRequirements2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                           VkDevice boxed_device,
+                                           Boxed<VkDevice> boxed_device,
                                            const VkBufferMemoryRequirementsInfo2* pInfo,
                                            VkMemoryRequirements2* pMemoryRequirements) {
         auto device = unbox_VkDevice(boxed_device);
@@ -6810,7 +7744,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdCopyBufferToImage(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                   VkCommandBuffer boxed_commandBuffer, VkBuffer srcBuffer,
+                                   Boxed<VkCommandBuffer> boxed_commandBuffer, VkBuffer srcBuffer,
                                    VkImage dstImage, VkImageLayout dstImageLayout,
                                    uint32_t regionCount, const VkBufferImageCopy* pRegions,
                                    const VkDecoderContext& context) {
@@ -6873,7 +7807,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdCopyBufferToImage2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                    VkCommandBuffer boxed_commandBuffer,
+                                    Boxed<VkCommandBuffer> boxed_commandBuffer,
                                     const VkCopyBufferToImageInfo2* pCopyBufferToImageInfo,
                                     const VkDecoderContext& context) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
@@ -6931,7 +7865,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdCopyBufferToImage2KHR(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                       VkCommandBuffer boxed_commandBuffer,
+                                       Boxed<VkCommandBuffer> boxed_commandBuffer,
                                        const VkCopyBufferToImageInfo2KHR* pCopyBufferToImageInfo,
                                        const VkDecoderContext& context) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
@@ -7076,13 +8010,20 @@ class VkDecoderGlobalState::Impl {
         if (!cmdBufferInfo) return;
 
         for (uint32_t i = 0; i < imageMemoryBarrierCount; i++) {
-            auto* imageInfo = gfxstream::base::find(mImageInfo, getIMBImage(pImageMemoryBarriers[i]));
+            VkImage img = getIMBImage(pImageMemoryBarriers[i]);
+            auto* imageInfo = gfxstream::base::find(mImageInfo, img);
             if (!imageInfo) {
                 continue;
             }
-            // Update image layout in ImageInfo
-            cmdBufferInfo->imageLayouts[getIMBImage(pImageMemoryBarriers[i])] =
-                getIMBNewLayout(pImageMemoryBarriers[i]);
+            const VkImageLayout newLayout = getIMBNewLayout(pImageMemoryBarriers[i]);
+            const bool isLayoutTransition = (pImageMemoryBarriers[i].oldLayout != newLayout);
+            // Update image layout in CommandBufferInfo (do not overwrite an existing layout on a
+            // same-layout barrier such as an in-renderpass subpass self-dependency, which would
+            // clobber the renderpass's attachmentFinalLayouts).
+            if (isLayoutTransition ||
+                cmdBufferInfo->imageLayouts.find(img) == cmdBufferInfo->imageLayouts.end()) {
+                cmdBufferInfo->imageLayouts[img] = newLayout;
+            }
 
             if (!imageInfo->boundColorBuffer.has_value()) {
                 continue;
@@ -7094,12 +8035,249 @@ class VkDecoderGlobalState::Impl {
             if (getIMBDstQueueFamilyIndex(pImageMemoryBarriers[i]) == VK_QUEUE_FAMILY_EXTERNAL) {
                 cmdBufferInfo->releasedColorBuffers.insert(cb);
             }
-            cmdBufferInfo->cbLayouts[cb] = getIMBNewLayout(pImageMemoryBarriers[i]);
+            if (isLayoutTransition ||
+                cmdBufferInfo->cbLayouts.find(cb) == cmdBufferInfo->cbLayouts.end()) {
+                cmdBufferInfo->cbLayouts[cb] = newLayout;
+            }
         }
     }
 
+    template <typename BarrierType>
+    void stripExternalQueueFamilyForShadowedImagesLocked(
+        uint32_t count, const BarrierType** barriers,
+        std::vector<BarrierType>* mappedBarriers) REQUIRES(mMutex) {
+        bool needsStrip = false;
+        for (uint32_t i = 0; i < count; ++i) {
+            if ((*barriers)[i].srcQueueFamilyIndex != VK_QUEUE_FAMILY_EXTERNAL &&
+                (*barriers)[i].dstQueueFamilyIndex != VK_QUEUE_FAMILY_EXTERNAL) {
+                continue;
+            }
+            const auto* imageInfo = gfxstream::base::find(mImageInfo, getIMBImage((*barriers)[i]));
+            if (imageInfo &&
+                std::holds_alternative<ImageInfo::ShadowedImageMemory>(imageInfo->memoryState)) {
+                needsStrip = true;
+                break;
+            }
+        }
+        if (!needsStrip) {
+            return;
+        }
+        if (mappedBarriers->empty()) {
+            mappedBarriers->assign(*barriers, *barriers + count);
+            *barriers = mappedBarriers->data();
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto* imageInfo =
+                gfxstream::base::find(mImageInfo, getIMBImage((*mappedBarriers)[i]));
+            if (imageInfo &&
+                std::holds_alternative<ImageInfo::ShadowedImageMemory>(imageInfo->memoryState)) {
+                if ((*mappedBarriers)[i].srcQueueFamilyIndex == VK_QUEUE_FAMILY_EXTERNAL ||
+                    (*mappedBarriers)[i].dstQueueFamilyIndex == VK_QUEUE_FAMILY_EXTERNAL) {
+                    (*mappedBarriers)[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    (*mappedBarriers)[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                }
+            }
+        }
+    }
+
+    // See `ImageInfo::ShadowedImageMemory`.
+    void recordShadowImageCopyLocked(VulkanDispatch* vk, VkCommandBuffer commandBuffer,
+                                     CommandBufferInfo* cmdBufferInfo, VkImage img,
+                                     const ImageInfo* imageInfo,
+                                     ImageInfo::ShadowedImageMemory* shadowed, bool isRelease,
+                                     VkImageLayout currentLayout) REQUIRES(mMutex) {
+        VkImageLayout linearOldLayout = shadowed->linearImageLayout;
+        if (cmdBufferInfo) {
+            auto it = cmdBufferInfo->shadowLinearImageLayouts.find(img);
+            if (it != cmdBufferInfo->shadowLinearImageLayouts.end()) {
+                linearOldLayout = it->second;
+            }
+        }
+        const VkImageLayout optimalTransferLayout =
+            isRelease ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                      : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        const VkImageLayout linearTransferLayout =
+            isRelease ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                      : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        VkImageMemoryBarrier toTransfer[2] = {
+            {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT |
+                                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                .dstAccessMask =
+                    isRelease ? static_cast<VkAccessFlags>(VK_ACCESS_TRANSFER_READ_BIT)
+                              : static_cast<VkAccessFlags>(VK_ACCESS_TRANSFER_WRITE_BIT),
+                .oldLayout = isRelease ? currentLayout : VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = optimalTransferLayout,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = shadowed->optimalImage,
+                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT,
+                .dstAccessMask =
+                    isRelease ? static_cast<VkAccessFlags>(VK_ACCESS_TRANSFER_WRITE_BIT)
+                              : static_cast<VkAccessFlags>(VK_ACCESS_TRANSFER_READ_BIT),
+                .oldLayout = isRelease ? VK_IMAGE_LAYOUT_UNDEFINED : linearOldLayout,
+                .newLayout = linearTransferLayout,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = shadowed->linearImage,
+                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+            },
+        };
+        vk->vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2,
+                                 toTransfer);
+
+        const VkImageCopy region = {
+            .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .srcOffset = {0, 0, 0},
+            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .dstOffset = {0, 0, 0},
+            .extent = imageInfo->imageCreateInfoShallow.extent,
+        };
+        if (isRelease) {
+            vk->vkCmdCopyImage(commandBuffer, shadowed->optimalImage, optimalTransferLayout,
+                               shadowed->linearImage, linearTransferLayout, 1, &region);
+        } else {
+            vk->vkCmdCopyImage(commandBuffer, shadowed->linearImage, linearTransferLayout,
+                               shadowed->optimalImage, optimalTransferLayout, 1, &region);
+        }
+
+        VkImageMemoryBarrier fromTransfer[2] = {
+            {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask =
+                    isRelease ? static_cast<VkAccessFlags>(VK_ACCESS_TRANSFER_READ_BIT)
+                              : static_cast<VkAccessFlags>(VK_ACCESS_TRANSFER_WRITE_BIT),
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                .oldLayout = optimalTransferLayout,
+                .newLayout = currentLayout,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = shadowed->optimalImage,
+                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+            },
+            {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask =
+                    isRelease ? static_cast<VkAccessFlags>(VK_ACCESS_TRANSFER_WRITE_BIT)
+                              : static_cast<VkAccessFlags>(VK_ACCESS_TRANSFER_READ_BIT),
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT |
+                                 VK_ACCESS_HOST_READ_BIT,
+                .oldLayout = linearTransferLayout,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = shadowed->linearImage,
+                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+            },
+        };
+        vk->vkCmdPipelineBarrier(
+            commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 0,
+            nullptr, 2, fromTransfer);
+        if (cmdBufferInfo) {
+            cmdBufferInfo->shadowLinearImageLayouts[img] = VK_IMAGE_LAYOUT_GENERAL;
+        } else {
+            shadowed->linearImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        }
+    }
+
+    // See `ImageInfo::ShadowedImageMemory`.
+    template <typename VkImageMemoryBarrierType>
+    void syncShadowImageForImageBarriersLocked(
+        VulkanDispatch* vk, VkCommandBuffer commandBuffer, uint32_t imageMemoryBarrierCount,
+        const VkImageMemoryBarrierType* pGuestImageMemoryBarriers) REQUIRES(mMutex) {
+        CommandBufferInfo* cmdBufferInfo = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
+        for (uint32_t i = 0; i < imageMemoryBarrierCount; i++) {
+            VkImage img = getIMBImage(pGuestImageMemoryBarriers[i]);
+            auto* imageInfo = gfxstream::base::find(mImageInfo, img);
+            if (!imageInfo) {
+                continue;
+            }
+            const VkImageLayout guestOldLayout = pGuestImageMemoryBarriers[i].oldLayout;
+            const VkImageLayout guestNewLayout = getIMBNewLayout(pGuestImageMemoryBarriers[i]);
+            const VkImageLayout adjustedNewLayout = m_vkEmulation->adjustImageLayout(guestNewLayout);
+            const bool isLayoutTransition = (guestOldLayout != guestNewLayout);
+            auto* shadowed =
+                std::get_if<ImageInfo::ShadowedImageMemory>(&imageInfo->memoryState);
+            if (!shadowed) {
+                continue;
+            }
+            const bool isExternalRelease =
+                getIMBDstQueueFamilyIndex(pGuestImageMemoryBarriers[i]) == VK_QUEUE_FAMILY_EXTERNAL;
+            const bool isExternalAcquire =
+                getIMBSrcQueueFamilyIndex(pGuestImageMemoryBarriers[i]) == VK_QUEUE_FAMILY_EXTERNAL;
+            const bool isRelease =
+                isExternalRelease ||
+                (!isExternalAcquire && isLayoutTransition &&
+                 (guestOldLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
+                  guestOldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ||
+                  guestNewLayout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR ||
+                  guestNewLayout == VK_IMAGE_LAYOUT_SHARED_PRESENT_KHR));
+            const bool isAcquire =
+                !isRelease &&
+                (isExternalAcquire ||
+                 (isLayoutTransition &&
+                  (guestNewLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
+                   guestNewLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL ||
+                   (guestOldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
+                    guestNewLayout == VK_IMAGE_LAYOUT_GENERAL))));
+            if (!isRelease && !isAcquire) {
+                continue;
+            }
+            if (isRelease && cmdBufferInfo) {
+                cmdBufferInfo->renderedShadowImages.erase(img);
+            }
+            VkImageLayout currentLayout = adjustedNewLayout;
+            if (currentLayout == VK_IMAGE_LAYOUT_UNDEFINED ||
+                currentLayout == VK_IMAGE_LAYOUT_PREINITIALIZED) {
+                currentLayout = VK_IMAGE_LAYOUT_GENERAL;
+            }
+            recordShadowImageCopyLocked(vk, commandBuffer, cmdBufferInfo, img, imageInfo, shadowed,
+                                        isRelease, currentLayout);
+        }
+    }
+
+    // See `ImageInfo::ShadowedImageMemory`.
+    void syncShadowImageForCommandBufferLocked(VulkanDispatch* vk, VkCommandBuffer commandBuffer,
+                                               CommandBufferInfo* commandBufferInfo)
+        REQUIRES(mMutex) {
+        for (VkImage img : commandBufferInfo->renderedShadowImages) {
+            auto* imageInfo = gfxstream::base::find(mImageInfo, img);
+            if (!imageInfo) {
+                continue;
+            }
+            auto* shadowed =
+                std::get_if<ImageInfo::ShadowedImageMemory>(&imageInfo->memoryState);
+            if (!shadowed) {
+                continue;
+            }
+            VkImageLayout currentLayout = imageInfo->layout;
+            auto layoutIt = commandBufferInfo->imageLayouts.find(img);
+            if (layoutIt != commandBufferInfo->imageLayouts.end()) {
+                currentLayout = layoutIt->second;
+            }
+            if (currentLayout == VK_IMAGE_LAYOUT_UNDEFINED ||
+                currentLayout == VK_IMAGE_LAYOUT_PREINITIALIZED) {
+                currentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            }
+            recordShadowImageCopyLocked(vk, commandBuffer, commandBufferInfo, img, imageInfo,
+                                        shadowed, /*isRelease=*/true, currentLayout);
+        }
+        commandBufferInfo->renderedShadowImages.clear();
+    }
+
     void on_vkCmdPipelineBarrier(
-        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, VkCommandBuffer boxed_commandBuffer,
+        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, Boxed<VkCommandBuffer> boxed_commandBuffer,
         VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask,
         VkDependencyFlags dependencyFlags, uint32_t memoryBarrierCount,
         const VkMemoryBarrier* pMemoryBarriers, uint32_t bufferMemoryBarrierCount,
@@ -7116,19 +8294,21 @@ class VkDecoderGlobalState::Impl {
             convertQueueFamilyForeignToExternal_VkImageMemoryBarrier(const_cast<VkImageMemoryBarrier&>(pImageMemoryBarriers[i]));
         }
 
+        const VkImageMemoryBarrier* guestImageMemoryBarriers = pImageMemoryBarriers;
+        const VkImageMemoryBarrier* hostImageMemoryBarriers = pImageMemoryBarriers;
         std::vector<VkImageMemoryBarrier> mappedImageMemoryBarriers;
         if (needsImageLayoutAdjustment(imageMemoryBarrierCount, pImageMemoryBarriers)) {
             mappedImageMemoryBarriers.assign(pImageMemoryBarriers,
                                              pImageMemoryBarriers + imageMemoryBarrierCount);
             adjustImageLayout(imageMemoryBarrierCount, mappedImageMemoryBarriers.data());
-            pImageMemoryBarriers = mappedImageMemoryBarriers.data();
+            hostImageMemoryBarriers = mappedImageMemoryBarriers.data();
         }
 
         if (imageMemoryBarrierCount == 0) {
             vk->vkCmdPipelineBarrier(commandBuffer, srcStageMask, dstStageMask, dependencyFlags,
                                      memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount,
                                      pBufferMemoryBarriers, imageMemoryBarrierCount,
-                                     pImageMemoryBarriers);
+                                     hostImageMemoryBarriers);
             return;
         }
         std::lock_guard<std::mutex> lock(mMutex);
@@ -7139,13 +8319,17 @@ class VkDecoderGlobalState::Impl {
         if (!deviceInfo) return;
 
         processImageMemoryBarrierLocked(commandBuffer, imageMemoryBarrierCount,
-                                        pImageMemoryBarriers);
+                                        hostImageMemoryBarriers);
+        stripExternalQueueFamilyForShadowedImagesLocked(
+            imageMemoryBarrierCount, &hostImageMemoryBarriers, &mappedImageMemoryBarriers);
 
         if (!deviceInfo->emulateTextureEtc2 && !deviceInfo->emulateTextureAstc) {
             vk->vkCmdPipelineBarrier(commandBuffer, srcStageMask, dstStageMask, dependencyFlags,
                                      memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount,
                                      pBufferMemoryBarriers, imageMemoryBarrierCount,
-                                     pImageMemoryBarriers);
+                                     hostImageMemoryBarriers);
+            syncShadowImageForImageBarriersLocked(vk, commandBuffer, imageMemoryBarrierCount,
+                                                  guestImageMemoryBarriers);
             return;
         }
 
@@ -7155,7 +8339,7 @@ class VkDecoderGlobalState::Impl {
         bool needRebind = false;
 
         for (uint32_t i = 0; i < imageMemoryBarrierCount; i++) {
-            const VkImageMemoryBarrier& srcBarrier = pImageMemoryBarriers[i];
+            const VkImageMemoryBarrier& srcBarrier = hostImageMemoryBarriers[i];
             auto* imageInfo = gfxstream::base::find(mImageInfo, srcBarrier.image);
 
             // If the image doesn't need GPU decompression, nothing to do.
@@ -7197,6 +8381,8 @@ class VkDecoderGlobalState::Impl {
                                      pBufferMemoryBarriers, imageBarriers.size(),
                                      imageBarriers.data());
         }
+        syncShadowImageForImageBarriersLocked(vk, commandBuffer, imageMemoryBarrierCount,
+                                              guestImageMemoryBarriers);
     }
 
     // Conservatively converts synchronization2 stage masks for the legacy decompression path.
@@ -7256,7 +8442,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdPipelineBarrier2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                  VkCommandBuffer boxed_commandBuffer,
+                                  Boxed<VkCommandBuffer> boxed_commandBuffer,
                                   const VkDependencyInfo* pDependencyInfo) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
@@ -7280,6 +8466,8 @@ class VkDecoderGlobalState::Impl {
                 const_cast<VkImageMemoryBarrier2&>(pDependencyInfo->pImageMemoryBarriers[i]));
         }
 
+        const VkImageMemoryBarrier2* guestImageMemoryBarriers =
+            pDependencyInfo->pImageMemoryBarriers;
         VkDependencyInfo mappedDependencyInfo = *pDependencyInfo;
         std::vector<VkImageMemoryBarrier2> mappedImageMemoryBarriers;
         if (needsImageLayoutAdjustment(pDependencyInfo->imageMemoryBarrierCount,
@@ -7303,8 +8491,21 @@ class VkDecoderGlobalState::Impl {
         processImageMemoryBarrierLocked(commandBuffer, pDependencyInfo->imageMemoryBarrierCount,
                                         pDependencyInfo->pImageMemoryBarriers);
 
+        const VkImageMemoryBarrier2* hostImageMemoryBarriers =
+            pDependencyInfo->pImageMemoryBarriers;
+        stripExternalQueueFamilyForShadowedImagesLocked(pDependencyInfo->imageMemoryBarrierCount,
+                                                        &hostImageMemoryBarriers,
+                                                        &mappedImageMemoryBarriers);
+        if (hostImageMemoryBarriers != pDependencyInfo->pImageMemoryBarriers) {
+            mappedDependencyInfo.pImageMemoryBarriers = hostImageMemoryBarriers;
+            pDependencyInfo = &mappedDependencyInfo;
+        }
+
         if (!deviceInfo->emulateTextureEtc2 && !deviceInfo->emulateTextureAstc) {
             dispatchCmdPipelineBarrier2(pDependencyInfo);
+            syncShadowImageForImageBarriersLocked(vk, commandBuffer,
+                                                  pDependencyInfo->imageMemoryBarrierCount,
+                                                  guestImageMemoryBarriers);
             return;
         }
 
@@ -7351,10 +8552,20 @@ class VkDecoderGlobalState::Impl {
         dependencyInfo.imageMemoryBarrierCount = static_cast<uint32_t>(imageBarriers.size());
         dependencyInfo.pImageMemoryBarriers = imageBarriers.data();
         dispatchCmdPipelineBarrier2(&dependencyInfo);
+        syncShadowImageForImageBarriersLocked(vk, commandBuffer,
+                                              pDependencyInfo->imageMemoryBarrierCount,
+                                              guestImageMemoryBarriers);
+    }
+
+    void on_vkCmdPipelineBarrier2KHR(gfxstream::base::BumpPool* pool,
+                                     VkSnapshotApiCallHandle apiCallHandle,
+                                     Boxed<VkCommandBuffer> boxed_commandBuffer,
+                                     const VkDependencyInfo* pDependencyInfo) {
+        on_vkCmdPipelineBarrier2(pool, apiCallHandle, boxed_commandBuffer, pDependencyInfo);
     }
 
     void on_vkCmdWaitEvents(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                            VkCommandBuffer boxed_commandBuffer, uint32_t eventCount,
+                            Boxed<VkCommandBuffer> boxed_commandBuffer, uint32_t eventCount,
                             const VkEvent* pEvents, VkPipelineStageFlags srcStageMask,
                             VkPipelineStageFlags dstStageMask, uint32_t memoryBarrierCount,
                             const VkMemoryBarrier* pMemoryBarriers,
@@ -7387,13 +8598,71 @@ class VkDecoderGlobalState::Impl {
         processImageMemoryBarrierLocked(commandBuffer, imageMemoryBarrierCount,
                                         pImageMemoryBarriers);
 
-        vk->vkCmdWaitEvents(commandBuffer, eventCount, pEvents, srcStageMask, dstStageMask,
+        CommandBufferInfo* cmdBufferInfo = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
+        DeviceInfo* deviceInfo =
+            cmdBufferInfo ? gfxstream::base::find(mDeviceInfo, cmdBufferInfo->device) : nullptr;
+        if (!deviceInfo || (!deviceInfo->emulateTextureEtc2 && !deviceInfo->emulateTextureAstc)) {
+            vk->vkCmdWaitEvents(commandBuffer, eventCount, pEvents, srcStageMask, dstStageMask,
+                                memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount,
+                                pBufferMemoryBarriers, imageMemoryBarrierCount,
+                                pImageMemoryBarriers);
+            return;
+        }
+
+        std::vector<VkImageMemoryBarrier> waitImageBarriers;
+        std::vector<std::pair<CompressedImageInfo*, VkImageMemoryBarrier>> barriersToDecompress;
+
+        for (uint32_t i = 0; i < imageMemoryBarrierCount; i++) {
+            const VkImageMemoryBarrier& srcBarrier = pImageMemoryBarriers[i];
+            auto* imageInfo = gfxstream::base::find(mImageInfo, srcBarrier.image);
+            bool needGpuDecompression = false;
+            if (imageInfo && imageInfo->compressInfo) {
+                needGpuDecompression =
+                    !imageInfo->compressInfo->isAstc() || !deviceInfo->useAstcCpuDecompression;
+            }
+            if (!needGpuDecompression) {
+                waitImageBarriers.push_back(srcBarrier);
+                continue;
+            }
+
+            if (imageInfo->compressInfo->willDecompress(srcBarrier)) {
+                barriersToDecompress.emplace_back(imageInfo->compressInfo.get(), srcBarrier);
+            } else {
+                imageInfo->compressInfo->decompressIfNeeded(
+                    vk, commandBuffer, srcStageMask, dstStageMask, srcBarrier, waitImageBarriers);
+            }
+        }
+
+        VkPipelineStageFlags waitDstStageMask =
+            barriersToDecompress.empty() ? dstStageMask
+                                         : (dstStageMask | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        vk->vkCmdWaitEvents(commandBuffer, eventCount, pEvents, srcStageMask, waitDstStageMask,
                             memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount,
-                            pBufferMemoryBarriers, imageMemoryBarrierCount, pImageMemoryBarriers);
+                            pBufferMemoryBarriers, waitImageBarriers.size(),
+                            waitImageBarriers.data());
+
+        bool needRebind = false;
+        std::vector<VkImageMemoryBarrier> unusedBarriers;
+        for (const auto& [compressInfo, srcBarrier] : barriersToDecompress) {
+            needRebind |= compressInfo->decompressIfNeeded(
+                vk, commandBuffer, srcStageMask, dstStageMask, srcBarrier, unusedBarriers);
+        }
+
+        if (needRebind && cmdBufferInfo->computePipeline) {
+            vk->vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                  cmdBufferInfo->computePipeline);
+            if (!cmdBufferInfo->currentDescriptorSets.empty()) {
+                vk->vkCmdBindDescriptorSets(
+                    commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, cmdBufferInfo->descriptorLayout,
+                    cmdBufferInfo->firstSet, cmdBufferInfo->currentDescriptorSets.size(),
+                    cmdBufferInfo->currentDescriptorSets.data(),
+                    cmdBufferInfo->dynamicOffsets.size(), cmdBufferInfo->dynamicOffsets.data());
+            }
+        }
     }
 
     void on_vkCmdWaitEvents2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                             VkCommandBuffer boxed_commandBuffer, uint32_t eventCount,
+                             Boxed<VkCommandBuffer> boxed_commandBuffer, uint32_t eventCount,
                              const VkEvent* pEvents, const VkDependencyInfo* pDependencyInfos) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
@@ -7455,7 +8724,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdWaitEvents2KHR(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                VkCommandBuffer boxed_commandBuffer, uint32_t eventCount,
+                                Boxed<VkCommandBuffer> boxed_commandBuffer, uint32_t eventCount,
                                 const VkEvent* pEvents, const VkDependencyInfo* pDependencyInfos) {
         on_vkCmdWaitEvents2(pool, {}, boxed_commandBuffer, eventCount, pEvents, pDependencyInfos);
     }
@@ -7607,7 +8876,7 @@ class VkDecoderGlobalState::Impl {
     };
 
     VkResult on_vkAllocateMemory(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                 VkDevice boxed_device, const VkMemoryAllocateInfo* pAllocateInfo,
+                                 Boxed<VkDevice> boxed_device, const VkMemoryAllocateInfo* pAllocateInfo,
                                  const VkAllocationCallbacks*, VkDeviceMemory* pMemory) {
         if (!pAllocateInfo) return VK_ERROR_INITIALIZATION_FAILED;
         auto device = unbox_VkDevice(boxed_device);
@@ -7719,8 +8988,8 @@ class VkDecoderGlobalState::Impl {
         }
 
         if (!plan.isHostVisible()) {
-            *pMemory = new_boxed_non_dispatchable_VkDeviceMemory(*pMemory);
-            memoryInfo.boxed = *pMemory;
+            memoryInfo.boxed = new_boxed_non_dispatchable_VkDeviceMemory(*pMemory);
+            *pMemory = memoryInfo.boxed.value();
             return result;
         }
 
@@ -7742,8 +9011,8 @@ class VkDecoderGlobalState::Impl {
             memoryInfo.ptr = plan.preMappedHostPtr;
         }
 
-        *pMemory = new_boxed_non_dispatchable_VkDeviceMemory(*pMemory);
-        memoryInfo.boxed = *pMemory;
+        memoryInfo.boxed = new_boxed_non_dispatchable_VkDeviceMemory(*pMemory);
+        *pMemory = memoryInfo.boxed.value();
 
         return result;
     }
@@ -7784,7 +9053,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkFreeMemory(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                         VkDevice boxed_device, VkDeviceMemory memory,
+                         Boxed<VkDevice> boxed_device, VkDeviceMemory memory,
                          const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -7794,7 +9063,7 @@ class VkDecoderGlobalState::Impl {
         freeMemoryLocked(device, deviceDispatch, memory);
     }
 
-    VkResult on_vkMapMemory(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, VkDevice,
+    VkResult on_vkMapMemory(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, Boxed<VkDevice>,
                             VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size,
                             VkMemoryMapFlags flags, void** ppData) {
         std::lock_guard<std::mutex> lock(mMutex);
@@ -7816,7 +9085,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkMapMemory2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
-                             VkDevice boxed_device, const VkMemoryMapInfo* pMemoryMapInfo,
+                             Boxed<VkDevice> boxed_device, const VkMemoryMapInfo* pMemoryMapInfo,
                              void** ppData) {
         if (!pMemoryMapInfo || !ppData) return VK_ERROR_MEMORY_MAP_FAILED;
         return on_vkMapMemory(pool, apiCallHandle, boxed_device, pMemoryMapInfo->memory,
@@ -7824,14 +9093,14 @@ class VkDecoderGlobalState::Impl {
                               ppData);
     }
 
-    void on_vkUnmapMemory(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, VkDevice,
+    void on_vkUnmapMemory(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, Boxed<VkDevice>,
                           VkDeviceMemory) {
         // no-op; user-level mapping does not correspond
         // to any operation here.
     }
 
     VkResult on_vkUnmapMemory2(gfxstream::base::BumpPool* pool,
-                               VkSnapshotApiCallHandle apiCallHandle, VkDevice boxed_device,
+                               VkSnapshotApiCallHandle apiCallHandle, Boxed<VkDevice> boxed_device,
                                const VkMemoryUnmapInfo* pMemoryUnmapInfo) {
         if (!pMemoryUnmapInfo) return VK_ERROR_MEMORY_MAP_FAILED;
         on_vkUnmapMemory(pool, apiCallHandle, boxed_device, pMemoryUnmapInfo->memory);
@@ -7946,14 +9215,14 @@ class VkDecoderGlobalState::Impl {
 
     // VK_ANDROID_native_buffer
     VkResult on_vkGetSwapchainGrallocUsageANDROID(gfxstream::base::BumpPool* pool,
-                                                  VkSnapshotApiCallHandle, VkDevice, VkFormat format,
+                                                  VkSnapshotApiCallHandle, Boxed<VkDevice>, VkFormat format,
                                                   VkImageUsageFlags imageUsage, int* grallocUsage) {
         getGralloc0Usage(format, imageUsage, grallocUsage);
         return VK_SUCCESS;
     }
 
     VkResult on_vkGetSwapchainGrallocUsage2ANDROID(
-        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, VkDevice, VkFormat format,
+        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, Boxed<VkDevice>, VkFormat format,
         VkImageUsageFlags imageUsage, VkSwapchainImageUsageFlagsANDROID swapchainImageUsage,
         uint64_t* grallocConsumerUsage, uint64_t* grallocProducerUsage) {
         getGralloc1Usage(format, imageUsage, swapchainImageUsage, grallocConsumerUsage,
@@ -7962,7 +9231,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkAcquireImageANDROID(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                      VkDevice boxed_device, VkImage image, int nativeFenceFd,
+                                      Boxed<VkDevice> boxed_device, VkImage image, int nativeFenceFd,
                                       VkSemaphore semaphore, VkFence fence) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -8029,7 +9298,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkQueueSignalReleaseImageANDROID(gfxstream::base::BumpPool* pool,
-                                                 VkSnapshotApiCallHandle, VkQueue boxed_queue,
+                                                 VkSnapshotApiCallHandle, Boxed<VkQueue> boxed_queue,
                                                  uint32_t waitSemaphoreCount,
                                                  const VkSemaphore* pWaitSemaphores, VkImage image,
                                                  int* pNativeFenceFd) {
@@ -8128,7 +9397,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkMapMemoryIntoAddressSpaceGOOGLE(gfxstream::base::BumpPool* pool,
-                                                  VkSnapshotApiCallHandle, VkDevice boxed_device,
+                                                  VkSnapshotApiCallHandle, Boxed<VkDevice> boxed_device,
                                                   VkDeviceMemory memory, uint64_t* pAddress) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -8158,7 +9427,7 @@ class VkDecoderGlobalState::Impl {
         return VK_SUCCESS;
     }
 
-    VkResult vkGetBlobInternal(VkDevice boxed_device, VkDeviceMemory memory, uint64_t hostBlobId) {
+    VkResult vkGetBlobInternal(Boxed<VkDevice> boxed_device, VkDeviceMemory memory, uint64_t hostBlobId) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
 
@@ -8274,12 +9543,12 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkGetBlobGOOGLE(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                VkDevice boxed_device, VkDeviceMemory memory) {
+                                Boxed<VkDevice> boxed_device, VkDeviceMemory memory) {
         return vkGetBlobInternal(boxed_device, memory, 0);
     }
 
     VkResult on_vkGetMemoryHostAddressInfoGOOGLE(gfxstream::base::BumpPool* pool,
-                                                 VkSnapshotApiCallHandle, VkDevice boxed_device,
+                                                 VkSnapshotApiCallHandle, Boxed<VkDevice> boxed_device,
                                                  VkDeviceMemory memory, uint64_t* pAddress,
                                                  uint64_t* pSize, uint64_t* pHostmemId) {
         uint64_t hostBlobId = mNextHostBlobId++;
@@ -8288,7 +9557,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkFreeMemorySyncGOOGLE(gfxstream::base::BumpPool* pool,
-                                       VkSnapshotApiCallHandle apiCallHandle, VkDevice boxed_device,
+                                       VkSnapshotApiCallHandle apiCallHandle, Boxed<VkDevice> boxed_device,
                                        VkDeviceMemory memory, const VkAllocationCallbacks*) {
         on_vkFreeMemory(pool, apiCallHandle, boxed_device, memory, nullptr);
 
@@ -8296,7 +9565,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkAllocateCommandBuffers(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                         VkDevice boxed_device,
+                                         Boxed<VkDevice> boxed_device,
                                          const VkCommandBufferAllocateInfo* pAllocateInfo,
                                          VkCommandBuffer* pCommandBuffers) {
         auto device = unbox_VkDevice(boxed_device);
@@ -8329,13 +9598,13 @@ class VkDecoderGlobalState::Impl {
 
             commandPoolInfo->cmdBuffers.insert(pCommandBuffers[i]);
 
-            pCommandBuffers[i] = (VkCommandBuffer)boxed;
+            pCommandBuffers[i] = boxed.value();
         }
         return result;
     }
 
     VkResult on_vkCreateCommandPool(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                    VkDevice boxed_device,
+                                    Boxed<VkDevice> boxed_device,
                                     const VkCommandPoolCreateInfo* pCreateInfo,
                                     const VkAllocationCallbacks*, VkCommandPool* pCommandPool) {
         auto device = unbox_VkDevice(boxed_device);
@@ -8364,8 +9633,8 @@ class VkDecoderGlobalState::Impl {
         auto& cmdPoolInfo = mCommandPoolInfo[*pCommandPool];
         cmdPoolInfo.device = device;
 
-        *pCommandPool = new_boxed_non_dispatchable_VkCommandPool(*pCommandPool);
-        cmdPoolInfo.boxed = *pCommandPool;
+        cmdPoolInfo.boxed = new_boxed_non_dispatchable_VkCommandPool(*pCommandPool);
+        *pCommandPool = cmdPoolInfo.boxed.value();
 
         return result;
     }
@@ -8377,7 +9646,7 @@ class VkDecoderGlobalState::Impl {
         for (const VkCommandBuffer commandBuffer : commandPoolInfo.cmdBuffers) {
             auto commandBufferIt = commandBufferInfos.find(commandBuffer);
             if (commandBufferIt != commandBufferInfos.end()) {
-                VkCommandBuffer boxedCommandBuffer = commandBufferIt->second.boxed;
+                Boxed<VkCommandBuffer> boxedCommandBuffer = commandBufferIt->second.boxed;
                 commandBufferInfos.erase(commandBufferIt);
                 delete_VkCommandBuffer(boxedCommandBuffer);
             } else {
@@ -8401,7 +9670,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyCommandPool(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                 VkDevice boxed_device, VkCommandPool commandPool,
+                                 Boxed<VkDevice> boxed_device, VkCommandPool commandPool,
                                  const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -8411,7 +9680,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkResetCommandPool(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                   VkDevice boxed_device, VkCommandPool commandPool,
+                                   Boxed<VkDevice> boxed_device, VkCommandPool commandPool,
                                    VkCommandPoolResetFlags flags) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -8424,7 +9693,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdExecuteCommands(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                 VkCommandBuffer boxed_commandBuffer, uint32_t commandBufferCount,
+                                 Boxed<VkCommandBuffer> boxed_commandBuffer, uint32_t commandBufferCount,
                                  const VkCommandBuffer* pCommandBuffers) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
@@ -8655,7 +9924,7 @@ class VkDecoderGlobalState::Impl {
 
     template <typename VkSubmitInfoType>
     VkResult on_vkQueueSubmit(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                              VkQueue boxed_queue, uint32_t submitCount,
+                              Boxed<VkQueue> boxed_queue, uint32_t submitCount,
                               const VkSubmitInfoType* pSubmits, VkFence fence) {
         auto queue = unbox_VkQueue(boxed_queue);
         auto vk = dispatch_VkQueue(boxed_queue);
@@ -8686,8 +9955,8 @@ class VkDecoderGlobalState::Impl {
                             if (!descriptorSetInfo) {
                                 continue;
                             }
-                            for (auto& writes : descriptorSetInfo->allWrites) {
-                                for (const auto& write : writes) {
+                            for (const auto& writes : descriptorSetInfo->allWrites) {
+                                for (const auto& [elemIdx, write] : writes) {
                                     bool isValid = true;
                                     for (const auto& alive : write.alives) {
                                         isValid &= !alive.expired();
@@ -8863,6 +10132,16 @@ class VkDecoderGlobalState::Impl {
                         }
                         imageIte->second.layout = ite.second;
                     }
+                    for (const auto& ite : cmdBufferInfo->shadowLinearImageLayouts) {
+                        auto imageIte = mImageInfo.find(ite.first);
+                        if (imageIte == mImageInfo.end()) {
+                            continue;
+                        }
+                        if (auto* shadowed = std::get_if<ImageInfo::ShadowedImageMemory>(
+                                &imageIte->second.memoryState)) {
+                            shadowed->linearImageLayout = ite.second;
+                        }
+                    }
                 }
             }
             // Update latestUse for all wait/signal semaphores, to ensure that they
@@ -8978,7 +10257,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkQueueWaitIdle(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                VkQueue boxed_queue) {
+                                Boxed<VkQueue> boxed_queue) {
         auto queue = unbox_VkQueue(boxed_queue);
         auto vk = dispatch_VkQueue(boxed_queue);
 
@@ -9002,7 +10281,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkResetCommandBuffer(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                     VkCommandBuffer boxed_commandBuffer,
+                                     Boxed<VkCommandBuffer> boxed_commandBuffer,
                                      VkCommandBufferResetFlags flags) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
@@ -9058,7 +10337,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkFreeCommandBuffers(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                 VkDevice boxed_device, VkCommandPool commandPool,
+                                 Boxed<VkDevice> boxed_device, VkCommandPool commandPool,
                                  uint32_t commandBufferCount,
                                  const VkCommandBuffer* pCommandBuffers) {
         auto device = unbox_VkDevice(boxed_device);
@@ -9077,7 +10356,7 @@ class VkDecoderGlobalState::Impl {
 
     void on_vkGetPhysicalDeviceExternalSemaphoreProperties(
         gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-        VkPhysicalDevice boxed_physicalDevice,
+        Boxed<VkPhysicalDevice> boxed_physicalDevice,
         const VkPhysicalDeviceExternalSemaphoreInfo* pExternalSemaphoreInfo,
         VkExternalSemaphoreProperties* pExternalSemaphoreProperties) {
         auto physicalDevice = unbox_VkPhysicalDevice(boxed_physicalDevice);
@@ -9118,7 +10397,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreateDescriptorUpdateTemplate(
-        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, VkDevice boxed_device,
+        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, Boxed<VkDevice> boxed_device,
         const VkDescriptorUpdateTemplateCreateInfo* pCreateInfo, const VkAllocationCallbacks*,
         VkDescriptorUpdateTemplate* pDescriptorUpdateTemplate) {
         auto device = unbox_VkDevice(boxed_device);
@@ -9131,10 +10410,10 @@ class VkDecoderGlobalState::Impl {
 
         if (res == VK_SUCCESS) {
             VkDescriptorUpdateTemplate unboxedTemplate = *pDescriptorUpdateTemplate;
-            *pDescriptorUpdateTemplate =
-                new_boxed_non_dispatchable_VkDescriptorUpdateTemplate(unboxedTemplate);
             descriptorUpdateTemplateInfo.device = device;
-            descriptorUpdateTemplateInfo.boxed = *pDescriptorUpdateTemplate;
+            descriptorUpdateTemplateInfo.boxed =
+                new_boxed_non_dispatchable_VkDescriptorUpdateTemplate(unboxedTemplate);
+            *pDescriptorUpdateTemplate = descriptorUpdateTemplateInfo.boxed.value();
             registerDescriptorUpdateTemplate(unboxedTemplate, descriptorUpdateTemplateInfo);
         }
 
@@ -9142,7 +10421,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreateDescriptorUpdateTemplateKHR(
-        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, VkDevice boxed_device,
+        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, Boxed<VkDevice> boxed_device,
         const VkDescriptorUpdateTemplateCreateInfo* pCreateInfo, const VkAllocationCallbacks*,
         VkDescriptorUpdateTemplate* pDescriptorUpdateTemplate) {
         auto device = unbox_VkDevice(boxed_device);
@@ -9155,10 +10434,10 @@ class VkDecoderGlobalState::Impl {
 
         if (res == VK_SUCCESS) {
             VkDescriptorUpdateTemplate unboxedTemplate = *pDescriptorUpdateTemplate;
-            *pDescriptorUpdateTemplate =
-                new_boxed_non_dispatchable_VkDescriptorUpdateTemplate(unboxedTemplate);
             descriptorUpdateTemplateInfo.device = device;
-            descriptorUpdateTemplateInfo.boxed = *pDescriptorUpdateTemplate;
+            descriptorUpdateTemplateInfo.boxed =
+                new_boxed_non_dispatchable_VkDescriptorUpdateTemplate(unboxedTemplate);
+            *pDescriptorUpdateTemplate = descriptorUpdateTemplateInfo.boxed.value();
             registerDescriptorUpdateTemplate(unboxedTemplate, descriptorUpdateTemplateInfo);
         }
 
@@ -9166,7 +10445,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyDescriptorUpdateTemplate(gfxstream::base::BumpPool* pool,
-                                              VkSnapshotApiCallHandle, VkDevice boxed_device,
+                                              VkSnapshotApiCallHandle, Boxed<VkDevice> boxed_device,
                                               VkDescriptorUpdateTemplate descriptorUpdateTemplate,
                                               const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
@@ -9178,7 +10457,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyDescriptorUpdateTemplateKHR(
-        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, VkDevice boxed_device,
+        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, Boxed<VkDevice> boxed_device,
         VkDescriptorUpdateTemplate descriptorUpdateTemplate, const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -9189,7 +10468,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkUpdateDescriptorSetWithTemplateSizedGOOGLE(
-        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, VkDevice boxed_device,
+        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, Boxed<VkDevice> boxed_device,
         VkDescriptorSet descriptorSet, VkDescriptorUpdateTemplate descriptorUpdateTemplate,
         uint32_t imageInfoCount, uint32_t bufferInfoCount, uint32_t bufferViewCount,
         const uint32_t* pImageInfoEntryIndices, const uint32_t* pBufferInfoEntryIndices,
@@ -9217,7 +10496,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkUpdateDescriptorSetWithTemplateSized2GOOGLE(
-        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, VkDevice boxed_device,
+        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, Boxed<VkDevice> boxed_device,
         VkDescriptorSet descriptorSet, VkDescriptorUpdateTemplate descriptorUpdateTemplate,
         uint32_t imageInfoCount, uint32_t bufferInfoCount, uint32_t bufferViewCount,
         uint32_t inlineUniformBlockCount, const uint32_t* pImageInfoEntryIndices,
@@ -9246,7 +10525,7 @@ class VkDecoderGlobalState::Impl {
                                               info.data.data());
     }
 
-    void hostSyncCommandBuffer(const char* tag, VkCommandBuffer boxed_commandBuffer,
+    void hostSyncCommandBuffer(const char* tag, Boxed<VkCommandBuffer> boxed_commandBuffer,
                                uint32_t needHostSync, uint32_t sequenceNumber) {
         auto nextDeadline = []() {
             return gfxstream::base::getUnixTimeUs() + 10000;  // 10 ms
@@ -9277,12 +10556,12 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCommandBufferHostSyncGOOGLE(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                          VkCommandBuffer commandBuffer, uint32_t needHostSync,
+                                          Boxed<VkCommandBuffer> commandBuffer, uint32_t needHostSync,
                                           uint32_t sequenceNumber) {
         this->hostSyncCommandBuffer("hostSync", commandBuffer, needHostSync, sequenceNumber);
     }
 
-    void hostSyncQueue(const char* tag, VkQueue boxed_queue, uint32_t needHostSync,
+    void hostSyncQueue(const char* tag, Boxed<VkQueue> boxed_queue, uint32_t needHostSync,
                        uint32_t sequenceNumber) {
         auto nextDeadline = []() {
             return gfxstream::base::getUnixTimeUs() + 10000;  // 10 ms
@@ -9312,13 +10591,13 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkQueueHostSyncGOOGLE(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                  VkQueue queue, uint32_t needHostSync, uint32_t sequenceNumber) {
+                                  Boxed<VkQueue> queue, uint32_t needHostSync, uint32_t sequenceNumber) {
         this->hostSyncQueue("hostSyncQueue", queue, needHostSync, sequenceNumber);
     }
 
     VkResult on_vkCreateImageWithRequirementsGOOGLE(gfxstream::base::BumpPool* pool,
                                                     VkSnapshotApiCallHandle apiCallHandle,
-                                                    VkDevice boxed_device,
+                                                    Boxed<VkDevice> boxed_device,
                                                     const VkImageCreateInfo* pCreateInfo,
                                                     const VkAllocationCallbacks*, VkImage* pImage,
                                                     VkMemoryRequirements* pMemoryRequirements) {
@@ -9333,7 +10612,7 @@ class VkDecoderGlobalState::Impl {
             return imageCreateRes;
         }
 
-        VkImage image = try_unbox_VkImage(*pImage);
+        VkImage image = try_unbox_VkImage(Boxed<VkImage>(*pImage));
         if (image == VK_NULL_HANDLE) {
             // This should not happen on valid Vulkan apps and the boxed image
             // should stay valid until the end of this call even after moving out
@@ -9351,7 +10630,7 @@ class VkDecoderGlobalState::Impl {
 
     VkResult on_vkCreateBufferWithRequirementsGOOGLE(
         gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
-        VkDevice boxed_device, const VkBufferCreateInfo* pCreateInfo, const VkAllocationCallbacks*,
+        Boxed<VkDevice> boxed_device, const VkBufferCreateInfo* pCreateInfo, const VkAllocationCallbacks*,
         VkBuffer* pBuffer, VkMemoryRequirements* pMemoryRequirements) {
         if (pMemoryRequirements) {
             memset(pMemoryRequirements, 0, sizeof(*pMemoryRequirements));
@@ -9363,7 +10642,7 @@ class VkDecoderGlobalState::Impl {
         if (bufferCreateRes != VK_SUCCESS) {
             return bufferCreateRes;
         }
-        VkBuffer buffer = try_unbox_VkBuffer(*pBuffer);
+        VkBuffer buffer = try_unbox_VkBuffer(Boxed<VkBuffer>(*pBuffer));
         if (buffer == VK_NULL_HANDLE) {
             // This should not happen on valid Vulkan apps and the boxed buffer
             // should stay valid until the end of this call even after moving out
@@ -9379,7 +10658,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkBeginCommandBuffer(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                     VkCommandBuffer boxed_commandBuffer,
+                                     Boxed<VkCommandBuffer> boxed_commandBuffer,
                                      const VkCommandBufferBeginInfo* pBeginInfo,
                                      const VkDecoderContext& context) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
@@ -9408,7 +10687,7 @@ class VkDecoderGlobalState::Impl {
 
     VkResult on_vkBeginCommandBufferAsyncGOOGLE(gfxstream::base::BumpPool* pool,
                                                 VkSnapshotApiCallHandle apiCallHandle,
-                                                VkCommandBuffer boxed_commandBuffer,
+                                                Boxed<VkCommandBuffer> boxed_commandBuffer,
                                                 const VkCommandBufferBeginInfo* pBeginInfo,
                                                 const VkDecoderContext& context) {
         return this->on_vkBeginCommandBuffer(pool, apiCallHandle, boxed_commandBuffer, pBeginInfo,
@@ -9416,7 +10695,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkEndCommandBuffer(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                   VkCommandBuffer boxed_commandBuffer,
+                                   Boxed<VkCommandBuffer> boxed_commandBuffer,
                                    const VkDecoderContext& context) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
@@ -9428,6 +10707,8 @@ class VkDecoderGlobalState::Impl {
         auto* commandBufferInfo = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
         if (!commandBufferInfo) return VK_ERROR_UNKNOWN;
 
+        syncShadowImageForCommandBufferLocked(vk, commandBuffer, commandBufferInfo);
+
         if (context.processName) {
             commandBufferInfo->debugUtilsHelper.cmdEndDebugLabel(commandBuffer);
         }
@@ -9437,20 +10718,20 @@ class VkDecoderGlobalState::Impl {
 
     void on_vkEndCommandBufferAsyncGOOGLE(gfxstream::base::BumpPool* pool,
                                           VkSnapshotApiCallHandle apiCallHandle,
-                                          VkCommandBuffer boxed_commandBuffer,
+                                          Boxed<VkCommandBuffer> boxed_commandBuffer,
                                           const VkDecoderContext& context) {
         on_vkEndCommandBuffer(pool, apiCallHandle, boxed_commandBuffer, context);
     }
 
     void on_vkResetCommandBufferAsyncGOOGLE(gfxstream::base::BumpPool* pool,
                                             VkSnapshotApiCallHandle apiCallHandle,
-                                            VkCommandBuffer boxed_commandBuffer,
+                                            Boxed<VkCommandBuffer> boxed_commandBuffer,
                                             VkCommandBufferResetFlags flags) {
         on_vkResetCommandBuffer(pool, apiCallHandle, boxed_commandBuffer, flags);
     }
 
     void on_vkCmdSetEvent(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                          VkCommandBuffer boxed_commandBuffer, VkEvent event,
+                          Boxed<VkCommandBuffer> boxed_commandBuffer, VkEvent event,
                           VkPipelineStageFlags stageMask) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
@@ -9473,7 +10754,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdResetEvent(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                            VkCommandBuffer boxed_commandBuffer, VkEvent event,
+                            Boxed<VkCommandBuffer> boxed_commandBuffer, VkEvent event,
                             VkPipelineStageFlags stageMask) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
@@ -9495,7 +10776,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdBindPipeline(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                              VkCommandBuffer boxed_commandBuffer,
+                              Boxed<VkCommandBuffer> boxed_commandBuffer,
                               VkPipelineBindPoint pipelineBindPoint, VkPipeline pipeline) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
@@ -9510,7 +10791,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdBindDescriptorSets(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                    VkCommandBuffer boxed_commandBuffer,
+                                    Boxed<VkCommandBuffer> boxed_commandBuffer,
                                     VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout,
                                     uint32_t firstSet, uint32_t descriptorSetCount,
                                     const VkDescriptorSet* pDescriptorSets,
@@ -9524,21 +10805,22 @@ class VkDecoderGlobalState::Impl {
             std::lock_guard<std::mutex> lock(mMutex);
             auto* cmdBufferInfo = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
             if (cmdBufferInfo) {
-                cmdBufferInfo->descriptorLayout = layout;
-
                 cmdBufferInfo->allDescriptorSets.insert(pDescriptorSets,
                                                         pDescriptorSets + descriptorSetCount);
-                cmdBufferInfo->firstSet = firstSet;
-                cmdBufferInfo->currentDescriptorSets.assign(pDescriptorSets,
-                                                            pDescriptorSets + descriptorSetCount);
-                cmdBufferInfo->dynamicOffsets.assign(pDynamicOffsets,
-                                                     pDynamicOffsets + dynamicOffsetCount);
+                if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
+                    cmdBufferInfo->descriptorLayout = layout;
+                    cmdBufferInfo->firstSet = firstSet;
+                    cmdBufferInfo->currentDescriptorSets.assign(
+                        pDescriptorSets, pDescriptorSets + descriptorSetCount);
+                    cmdBufferInfo->dynamicOffsets.assign(pDynamicOffsets,
+                                                         pDynamicOffsets + dynamicOffsetCount);
+                }
             }
         }
     }
 
     VkResult on_vkCreateRenderPass(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                   VkDevice boxed_device, const VkRenderPassCreateInfo* pCreateInfo,
+                                   Boxed<VkDevice> boxed_device, const VkRenderPassCreateInfo* pCreateInfo,
                                    const VkAllocationCallbacks*, VkRenderPass* pRenderPass) {
         auto device = unbox_VkDevice(boxed_device);
         auto vk = dispatch_VkDevice(boxed_device);
@@ -9632,18 +10914,18 @@ class VkDecoderGlobalState::Impl {
             renderPassInfo.attachmentFinalLayouts.reserve(pCreateInfo->attachmentCount);
             for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
                 renderPassInfo.attachmentFinalLayouts.push_back(
-                    pCreateInfo->pAttachments[i].finalLayout);
+                    m_vkEmulation->adjustImageLayout(pCreateInfo->pAttachments[i].finalLayout));
             }
         }
 
-        *pRenderPass = new_boxed_non_dispatchable_VkRenderPass(*pRenderPass);
-        renderPassInfo.boxed = *pRenderPass;
+        renderPassInfo.boxed = new_boxed_non_dispatchable_VkRenderPass(*pRenderPass);
+        *pRenderPass = renderPassInfo.boxed.value();
 
         return res;
     }
 
     VkResult on_vkCreateRenderPass2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                    VkDevice boxed_device,
+                                    Boxed<VkDevice> boxed_device,
                                     const VkRenderPassCreateInfo2* pCreateInfo,
                                     const VkAllocationCallbacks*, VkRenderPass* pRenderPass) {
         auto device = unbox_VkDevice(boxed_device);
@@ -9720,12 +11002,12 @@ class VkDecoderGlobalState::Impl {
             renderPassInfo.attachmentFinalLayouts.reserve(pCreateInfo->attachmentCount);
             for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
                 renderPassInfo.attachmentFinalLayouts.push_back(
-                    pCreateInfo->pAttachments[i].finalLayout);
+                    m_vkEmulation->adjustImageLayout(pCreateInfo->pAttachments[i].finalLayout));
             }
         }
 
-        *pRenderPass = new_boxed_non_dispatchable_VkRenderPass(*pRenderPass);
-        renderPassInfo.boxed = *pRenderPass;
+        renderPassInfo.boxed = new_boxed_non_dispatchable_VkRenderPass(*pRenderPass);
+        *pRenderPass = renderPassInfo.boxed.value();
 
         return res;
     }
@@ -9748,7 +11030,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyRenderPass(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                VkDevice boxed_device, VkRenderPass renderPass,
+                                Boxed<VkDevice> boxed_device, VkRenderPass renderPass,
                                 const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -9784,39 +11066,58 @@ class VkDecoderGlobalState::Impl {
 
         RenderPassInfo* rpInfo =
             gfxstream::base::find(mRenderPassInfo, pRenderPassBegin->renderPass);
-        if (rpInfo) {
-            const VkRenderPassAttachmentBeginInfo* attachmentBeginInfo = nullptr;
-            for (const auto* next =
-                     reinterpret_cast<const VkBaseInStructure*>(pRenderPassBegin->pNext);
-                 next != nullptr; next = next->pNext) {
-                if (next->sType == VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO) {
-                    attachmentBeginInfo =
-                        reinterpret_cast<const VkRenderPassAttachmentBeginInfo*>(next);
-                    break;
+        const VkRenderPassAttachmentBeginInfo* attachmentBeginInfo = nullptr;
+        for (const auto* next =
+                 reinterpret_cast<const VkBaseInStructure*>(pRenderPassBegin->pNext);
+             next != nullptr; next = next->pNext) {
+            if (next->sType == VK_STRUCTURE_TYPE_RENDER_PASS_ATTACHMENT_BEGIN_INFO) {
+                attachmentBeginInfo =
+                    reinterpret_cast<const VkRenderPassAttachmentBeginInfo*>(next);
+                break;
+            }
+        }
+
+        if (attachmentBeginInfo && attachmentBeginInfo->pAttachments) {
+            for (uint32_t i = 0; i < attachmentBeginInfo->attachmentCount; i++) {
+                auto* imageViewInfo =
+                    gfxstream::base::find(mImageViewInfo, attachmentBeginInfo->pAttachments[i]);
+                if (!imageViewInfo) {
+                    continue;
+                }
+                if (imageViewInfo->boundColorBuffer.has_value()) {
+                    cmdBufferInfo->releasedColorBuffers.insert(
+                        imageViewInfo->boundColorBuffer.value());
+                }
+                VkImage image = imageViewInfo->image;
+                if (image == VK_NULL_HANDLE) {
+                    continue;
+                }
+                if (rpInfo && i < rpInfo->attachmentFinalLayouts.size() &&
+                    rpInfo->attachmentFinalLayouts[i] != VK_IMAGE_LAYOUT_UNDEFINED) {
+                    cmdBufferInfo->imageLayouts[image] = rpInfo->attachmentFinalLayouts[i];
+                }
+                auto* imageInfo = gfxstream::base::find(mImageInfo, image);
+                if (imageInfo &&
+                    std::holds_alternative<ImageInfo::ShadowedImageMemory>(
+                        imageInfo->memoryState)) {
+                    cmdBufferInfo->renderedShadowImages.insert(image);
                 }
             }
-            if (attachmentBeginInfo && attachmentBeginInfo->pAttachments) {
-                const uint32_t count =
-                    std::min<uint32_t>(attachmentBeginInfo->attachmentCount,
-                                       rpInfo->attachmentFinalLayouts.size());
-                for (uint32_t i = 0; i < count; i++) {
-                    auto* imageViewInfo =
-                        gfxstream::base::find(mImageViewInfo, attachmentBeginInfo->pAttachments[i]);
-                    if (imageViewInfo && imageViewInfo->image != VK_NULL_HANDLE &&
-                        rpInfo->attachmentFinalLayouts[i] != VK_IMAGE_LAYOUT_UNDEFINED) {
-                        cmdBufferInfo->imageLayouts[imageViewInfo->image] =
-                            rpInfo->attachmentFinalLayouts[i];
-                    }
+        } else {
+            for (size_t i = 0; i < fbInfo->attachedImages.size(); i++) {
+                VkImage image = fbInfo->attachedImages[i];
+                if (image == VK_NULL_HANDLE) {
+                    continue;
                 }
-            } else {
-                const size_t count = std::min(fbInfo->attachedImages.size(),
-                                              rpInfo->attachmentFinalLayouts.size());
-                for (size_t i = 0; i < count; i++) {
-                    VkImage image = fbInfo->attachedImages[i];
-                    if (image != VK_NULL_HANDLE &&
-                        rpInfo->attachmentFinalLayouts[i] != VK_IMAGE_LAYOUT_UNDEFINED) {
-                        cmdBufferInfo->imageLayouts[image] = rpInfo->attachmentFinalLayouts[i];
-                    }
+                if (rpInfo && i < rpInfo->attachmentFinalLayouts.size() &&
+                    rpInfo->attachmentFinalLayouts[i] != VK_IMAGE_LAYOUT_UNDEFINED) {
+                    cmdBufferInfo->imageLayouts[image] = rpInfo->attachmentFinalLayouts[i];
+                }
+                auto* imageInfo = gfxstream::base::find(mImageInfo, image);
+                if (imageInfo &&
+                    std::holds_alternative<ImageInfo::ShadowedImageMemory>(
+                        imageInfo->memoryState)) {
+                    cmdBufferInfo->renderedShadowImages.insert(image);
                 }
             }
         }
@@ -9824,7 +11125,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdBeginRenderPass(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                 VkCommandBuffer boxed_commandBuffer,
+                                 Boxed<VkCommandBuffer> boxed_commandBuffer,
                                  const VkRenderPassBeginInfo* pRenderPassBegin,
                                  VkSubpassContents contents) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
@@ -9835,7 +11136,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCmdBeginRenderPass2(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                  VkCommandBuffer boxed_commandBuffer,
+                                  Boxed<VkCommandBuffer> boxed_commandBuffer,
                                   const VkRenderPassBeginInfo* pRenderPassBegin,
                                   const VkSubpassBeginInfo* pSubpassBeginInfo) {
         auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
@@ -9847,15 +11148,103 @@ class VkDecoderGlobalState::Impl {
 
     void on_vkCmdBeginRenderPass2KHR(gfxstream::base::BumpPool* pool,
                                      VkSnapshotApiCallHandle apiCallHandle,
-                                     VkCommandBuffer boxed_commandBuffer,
+                                     Boxed<VkCommandBuffer> boxed_commandBuffer,
                                      const VkRenderPassBeginInfo* pRenderPassBegin,
                                      const VkSubpassBeginInfo* pSubpassBeginInfo) {
         on_vkCmdBeginRenderPass2(pool, apiCallHandle, boxed_commandBuffer, pRenderPassBegin,
                                  pSubpassBeginInfo);
     }
 
+    void registerRenderingImageViewLocked(CommandBufferInfo* cmdBufferInfo, VkImageView imageView,
+                                          VkImageLayout imageLayout) REQUIRES(mMutex) {
+        if (imageView == VK_NULL_HANDLE) {
+            return;
+        }
+        auto* imageViewInfo = gfxstream::base::find(mImageViewInfo, imageView);
+        if (!imageViewInfo) {
+            return;
+        }
+        if (imageViewInfo->boundColorBuffer.has_value()) {
+            cmdBufferInfo->releasedColorBuffers.insert(imageViewInfo->boundColorBuffer.value());
+        }
+        VkImage image = imageViewInfo->image;
+        if (image == VK_NULL_HANDLE) {
+            return;
+        }
+        if (imageLayout != VK_IMAGE_LAYOUT_UNDEFINED) {
+            cmdBufferInfo->imageLayouts[image] = m_vkEmulation->adjustImageLayout(imageLayout);
+        }
+        auto* imageInfo = gfxstream::base::find(mImageInfo, image);
+        if (imageInfo &&
+            std::holds_alternative<ImageInfo::ShadowedImageMemory>(imageInfo->memoryState)) {
+            cmdBufferInfo->renderedShadowImages.insert(image);
+        }
+    }
+
+    void registerRenderingAttachmentLocked(CommandBufferInfo* cmdBufferInfo,
+                                           const VkRenderingAttachmentInfo* attachment)
+        REQUIRES(mMutex) {
+        if (!attachment) {
+            return;
+        }
+        registerRenderingImageViewLocked(cmdBufferInfo, attachment->imageView,
+                                         attachment->imageLayout);
+        if (attachment->resolveMode != VK_RESOLVE_MODE_NONE) {
+            registerRenderingImageViewLocked(cmdBufferInfo, attachment->resolveImageView,
+                                             attachment->resolveImageLayout);
+        }
+    }
+
+    bool registerRenderingInfo(VkCommandBuffer commandBuffer,
+                               const VkRenderingInfo* pRenderingInfo) {
+        if (!pRenderingInfo) {
+            GFXSTREAM_ERROR("pRenderingInfo is null");
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(mMutex);
+        CommandBufferInfo* cmdBufferInfo = gfxstream::base::find(mCommandBufferInfo, commandBuffer);
+        if (!cmdBufferInfo) {
+            GFXSTREAM_ERROR("VkCommandBuffer=%p not found in mCommandBufferInfo", commandBuffer);
+            return false;
+        }
+
+        if (pRenderingInfo->pColorAttachments) {
+            for (uint32_t i = 0; i < pRenderingInfo->colorAttachmentCount; ++i) {
+                registerRenderingAttachmentLocked(cmdBufferInfo,
+                                                  &pRenderingInfo->pColorAttachments[i]);
+            }
+        }
+        registerRenderingAttachmentLocked(cmdBufferInfo, pRenderingInfo->pDepthAttachment);
+        registerRenderingAttachmentLocked(cmdBufferInfo, pRenderingInfo->pStencilAttachment);
+        return true;
+    }
+
+    void on_vkCmdBeginRendering(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
+                                Boxed<VkCommandBuffer> boxed_commandBuffer,
+                                const VkRenderingInfo* pRenderingInfo) {
+        auto commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
+        auto vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
+        if (registerRenderingInfo(commandBuffer, pRenderingInfo)) {
+            if (vk->vkCmdBeginRendering) {
+                vk->vkCmdBeginRendering(commandBuffer, pRenderingInfo);
+            } else if (vk->vkCmdBeginRenderingKHR) {
+                vk->vkCmdBeginRenderingKHR(commandBuffer, pRenderingInfo);
+            } else {
+                GFXSTREAM_FATAL("%s: function implementation cannot be found!", __func__);
+            }
+        }
+    }
+
+    void on_vkCmdBeginRenderingKHR(gfxstream::base::BumpPool* pool,
+                                   VkSnapshotApiCallHandle apiCallHandle,
+                                   Boxed<VkCommandBuffer> boxed_commandBuffer,
+                                   const VkRenderingInfo* pRenderingInfo) {
+        on_vkCmdBeginRendering(pool, apiCallHandle, boxed_commandBuffer, pRenderingInfo);
+    }
+
     void on_vkCmdCopyQueryPoolResults(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                      VkCommandBuffer boxed_commandBuffer, VkQueryPool queryPool,
+                                      Boxed<VkCommandBuffer> boxed_commandBuffer, VkQueryPool queryPool,
                                       uint32_t firstQuery, uint32_t queryCount, VkBuffer dstBuffer,
                                       VkDeviceSize dstOffset, VkDeviceSize stride,
                                       VkQueryResultFlags flags) {
@@ -9883,7 +11272,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkSetEvent(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                           VkDevice boxed_device, VkEvent event) {
+                           Boxed<VkDevice> boxed_device, VkEvent event) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
         VkResult result = deviceDispatch->vkSetEvent(device, event);
@@ -9903,7 +11292,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkResetEvent(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                             VkDevice boxed_device, VkEvent event) {
+                             Boxed<VkDevice> boxed_device, VkEvent event) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
         VkResult result = deviceDispatch->vkResetEvent(device, event);
@@ -9917,14 +11306,14 @@ class VkDecoderGlobalState::Impl {
                 auto& eventInfo = eventInfoIt->second;
                 eventInfo.isSignaled = false;
                 eventInfo.isFromHost = false;
-                eventInfo.boxed_queue = VK_NULL_HANDLE;
+                eventInfo.boxed_queue = Boxed<VkQueue>();
             }
         }
         return result;
     }
 
     VkResult on_vkCreateEvent(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                              VkDevice boxed_device, const VkEventCreateInfo* pCreateInfo,
+                              Boxed<VkDevice> boxed_device, const VkEventCreateInfo* pCreateInfo,
                               const VkAllocationCallbacks*, VkEvent* pEvent) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -9936,13 +11325,13 @@ class VkDecoderGlobalState::Impl {
         VALIDATE_NEW_HANDLE_INFO_ENTRY(mEventInfo, *pEvent);
         auto& eventInfo = mEventInfo[*pEvent];
         eventInfo.device = device;
-        *pEvent = new_boxed_non_dispatchable_VkEvent(*pEvent);
-        eventInfo.boxed = *pEvent;
+        eventInfo.boxed = new_boxed_non_dispatchable_VkEvent(*pEvent);
+        *pEvent = eventInfo.boxed.value();
         return result;
     }
 
     void on_vkDestroyEvent(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                           VkDevice boxed_device, VkEvent event, const VkAllocationCallbacks*) {
+                           Boxed<VkDevice> boxed_device, VkEvent event, const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
 
@@ -9962,7 +11351,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreateFramebuffer(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                    VkDevice boxed_device,
+                                    Boxed<VkDevice> boxed_device,
                                     const VkFramebufferCreateInfo* pCreateInfo,
                                     const VkAllocationCallbacks*, VkFramebuffer* pFramebuffer) {
         auto device = unbox_VkDevice(boxed_device);
@@ -10001,8 +11390,8 @@ class VkDecoderGlobalState::Impl {
             }
         }
 
-        *pFramebuffer = new_boxed_non_dispatchable_VkFramebuffer(*pFramebuffer);
-        framebufferInfo.boxed = *pFramebuffer;
+        framebufferInfo.boxed = new_boxed_non_dispatchable_VkFramebuffer(*pFramebuffer);
+        *pFramebuffer = framebufferInfo.boxed.value();
 
         return result;
     }
@@ -10025,7 +11414,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyFramebuffer(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                 VkDevice boxed_device, VkFramebuffer framebuffer,
+                                 Boxed<VkDevice> boxed_device, VkFramebuffer framebuffer,
                                  const VkAllocationCallbacks*) {
         auto device = unbox_VkDevice(boxed_device);
         auto deviceDispatch = dispatch_VkDevice(boxed_device);
@@ -10035,7 +11424,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkQueueBindSparse(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                  VkQueue boxed_queue, uint32_t bindInfoCount,
+                                  Boxed<VkQueue> boxed_queue, uint32_t bindInfoCount,
                                   const VkBindSparseInfo* pBindInfo, VkFence fence) {
         // If pBindInfo contains VkTimelineSemaphoreSubmitInfo, then it's
         // possible the host driver isn't equipped to deal with them yet.  To
@@ -10146,7 +11535,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkQueuePresentKHR(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                  VkQueue boxed_queue, const VkPresentInfoKHR* pPresentInfo) {
+                                  Boxed<VkQueue> boxed_queue, const VkPresentInfoKHR* pPresentInfo) {
         // Note that on Android guests, this call will actually be handled
         // with vkQueueSignalReleaseImageANDROID
         auto queue = unbox_VkQueue(boxed_queue);
@@ -10174,7 +11563,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkGetLinearImageLayoutGOOGLE(gfxstream::base::BumpPool* pool,
-                                         VkSnapshotApiCallHandle apiCallHandle, VkDevice boxed_device,
+                                         VkSnapshotApiCallHandle apiCallHandle, Boxed<VkDevice> boxed_device,
                                          VkFormat format, VkDeviceSize* pOffset,
                                          VkDeviceSize* pRowPitchAlignment) {
         VkDeviceSize offset = 0u;
@@ -10236,7 +11625,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkGetLinearImageLayout2GOOGLE(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                          VkDevice boxed_device,
+                                          Boxed<VkDevice> boxed_device,
                                           const VkImageCreateInfo* pCreateInfo,
                                           VkDeviceSize* pOffset, VkDeviceSize* pRowPitchAlignment)
         EXCLUDES(mMutex) {
@@ -10310,20 +11699,20 @@ class VkDecoderGlobalState::Impl {
 #include "vk_sub_decoder.cpp"
 
     void on_vkQueueFlushCommandsGOOGLE(gfxstream::base::BumpPool* pool,
-                                       VkSnapshotApiCallHandle apiCallHandle, VkQueue queue,
-                                       VkCommandBuffer boxed_commandBuffer, VkDeviceSize dataSize,
+                                       VkSnapshotApiCallHandle apiCallHandle, Boxed<VkQueue> queue,
+                                       Boxed<VkCommandBuffer> boxed_commandBuffer, VkDeviceSize dataSize,
                                        const void* pData, const VkDecoderContext& context) {
         (void)queue;
 
         VkCommandBuffer commandBuffer = unbox_VkCommandBuffer(boxed_commandBuffer);
         VulkanDispatch* vk = dispatch_VkCommandBuffer(boxed_commandBuffer);
         VulkanMemReadingStream* readStream = readstream_VkCommandBuffer(boxed_commandBuffer);
-        subDecode(readStream, vk, apiCallHandle, boxed_commandBuffer, commandBuffer, dataSize,
+        subDecode(readStream, vk, apiCallHandle, boxed_commandBuffer.value(), commandBuffer, dataSize,
                   pData, context);
     }
 
     void on_vkQueueFlushCommandsFromAuxMemoryGOOGLE(gfxstream::base::BumpPool* pool,
-                                                    VkSnapshotApiCallHandle, VkQueue queue,
+                                                    VkSnapshotApiCallHandle, Boxed<VkQueue> queue,
                                                     VkCommandBuffer commandBuffer,
                                                     VkDeviceMemory deviceMemory,
                                                     VkDeviceSize dataOffset, VkDeviceSize dataSize,
@@ -10348,45 +11737,87 @@ class VkDecoderGlobalState::Impl {
             return VK_NULL_HANDLE;
         }
 
-        if (setHandleInfo->underlying) {
-            if (pendingAlloc) {
-                VkDescriptorSet allocedSet;
-                vk->vkFreeDescriptorSets(device, pool, 1,
-                                         (VkDescriptorSet*)(&setHandleInfo->underlying));
-                VkDescriptorSetAllocateInfo dsAi = {
-                    VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, 0, pool, 1, &setLayout,
-                };
-                vk->vkAllocateDescriptorSets(device, &dsAi, &allocedSet);
-                setHandleInfo->underlying = (uint64_t)allocedSet;
-                initDescriptorSetInfoLocked(device, pool, setLayout, poolId, allocedSet);
-                *didAlloc = true;
-                return allocedSet;
-            } else {
-                *didAlloc = false;
+        if (!pendingAlloc) {
+            *didAlloc = false;
+            if (setHandleInfo->underlying) {
                 return (VkDescriptorSet)(setHandleInfo->underlying);
             }
-        } else {
-            if (pendingAlloc) {
-                VkDescriptorSet allocedSet;
-                VkDescriptorSetAllocateInfo dsAi = {
-                    VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, 0, pool, 1, &setLayout,
-                };
-                vk->vkAllocateDescriptorSets(device, &dsAi, &allocedSet);
-                setHandleInfo->underlying = (uint64_t)allocedSet;
-                initDescriptorSetInfoLocked(device, pool, setLayout, poolId, allocedSet);
-                *didAlloc = true;
-                return allocedSet;
-            } else {
-                GFXSTREAM_ERROR("VkDescriptorPool:%p wanted to get set with id 0x%" PRIx64, pool,
-                                poolId);
-                *didAlloc = false;
-                return VK_NULL_HANDLE;
+            GFXSTREAM_ERROR("VkDescriptorPool:%p wanted to get set with id 0x%" PRIx64, pool,
+                            poolId);
+            return VK_NULL_HANDLE;
+        }
+
+        if (setHandleInfo->underlying) {
+            VkDescriptorSet oldSet = (VkDescriptorSet)setHandleInfo->underlying;
+            auto* oldSetInfo = gfxstream::base::find(mDescriptorSetInfo, oldSet);
+            if (oldSetInfo) {
+                removeDescriptorSetAllocationLocked(*poolInfo, oldSetInfo->bindings);
+                poolInfo->allocatedSetsUnboxedToBoxed.erase(oldSet);
+                mDescriptorSetInfo.erase(oldSet);
+            }
+            vk->vkFreeDescriptorSets(device, pool, 1, &oldSet);
+            setHandleInfo->underlying = 0;
+        }
+
+        uint32_t fallbackVarCount = 0;
+        const uint32_t* pVarCount = nullptr;
+        VkDescriptorSetVariableDescriptorCountAllocateInfo varAi = {
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO,
+            nullptr,
+            1,
+            &fallbackVarCount,
+        };
+        if (auto* layoutInfo = gfxstream::base::find(mDescriptorSetLayoutInfo, setLayout)) {
+            for (size_t i = 0; i < layoutInfo->bindings.size(); ++i) {
+                if (i < layoutInfo->bindingFlags.size() &&
+                    (layoutInfo->bindingFlags[i] &
+                     VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT)) {
+                    VkDescriptorType varType = layoutInfo->bindings[i].descriptorType;
+                    uint32_t fixedSameType = 0;
+                    for (size_t j = 0; j < layoutInfo->bindings.size(); ++j) {
+                        if (j != i && layoutInfo->bindings[j].descriptorType == varType) {
+                            fixedSameType += layoutInfo->bindings[j].descriptorCount;
+                        }
+                    }
+                    uint32_t maxAvail = 0;
+                    for (const auto& p : poolInfo->pools) {
+                        if (p.type == varType && p.descriptorCount > p.used) {
+                            maxAvail = std::max(maxAvail, p.descriptorCount - p.used);
+                        }
+                    }
+                    uint32_t availForVar = maxAvail > fixedSameType ? maxAvail - fixedSameType : 0;
+                    fallbackVarCount =
+                        std::min(layoutInfo->bindings[i].descriptorCount, availForVar);
+                    pVarCount = &fallbackVarCount;
+                    break;
+                }
             }
         }
+
+        VkDescriptorSet allocedSet = VK_NULL_HANDLE;
+        VkDescriptorSetAllocateInfo dsAi = {
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            pVarCount ? &varAi : nullptr,
+            pool,
+            1,
+            &setLayout,
+        };
+        VkResult allocRes = vk->vkAllocateDescriptorSets(device, &dsAi, &allocedSet);
+        if (allocRes != VK_SUCCESS || allocedSet == VK_NULL_HANDLE) {
+            GFXSTREAM_ERROR("Failed to allocate descriptor set for poolId 0x%" PRIx64 ": %d",
+                            poolId, allocRes);
+            setHandleInfo->underlying = 0;
+            *didAlloc = false;
+            return VK_NULL_HANDLE;
+        }
+        setHandleInfo->underlying = (uint64_t)allocedSet;
+        initDescriptorSetInfoLocked(device, pool, setLayout, poolId, allocedSet, pVarCount);
+        *didAlloc = true;
+        return allocedSet;
     }
 
     void on_vkQueueCommitDescriptorSetUpdatesGOOGLE(
-        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkQueue boxed_queue,
+        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, Boxed<VkQueue> boxed_queue,
         uint32_t descriptorPoolCount, const VkDescriptorPool* pDescriptorPools,
         uint32_t descriptorSetCount, const VkDescriptorSetLayout* pDescriptorSetLayouts,
         const uint64_t* pDescriptorSetPoolIds, const uint32_t* pDescriptorSetWhichPool,
@@ -10487,7 +11918,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkCollectDescriptorPoolIdsGOOGLE(gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle,
-                                             VkDevice device, VkDescriptorPool descriptorPool,
+                                             Boxed<VkDevice> device, VkDescriptorPool descriptorPool,
                                              uint32_t* pPoolIdCount, uint64_t* pPoolIds) {
 
 
@@ -10520,13 +11951,14 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreateSamplerYcbcrConversion(
-        gfxstream::base::BumpPool*, VkSnapshotApiCallHandle, VkDevice boxed_device,
+        gfxstream::base::BumpPool*, VkSnapshotApiCallHandle, Boxed<VkDevice> boxed_device,
         const VkSamplerYcbcrConversionCreateInfo* pCreateInfo, const VkAllocationCallbacks*,
         VkSamplerYcbcrConversion* pYcbcrConversion) {
         if (m_vkEmulation->isYcbcrEmulationEnabled() &&
             !m_vkEmulation->supportsSamplerYcbcrConversion()) {
             *pYcbcrConversion = new_boxed_non_dispatchable_VkSamplerYcbcrConversion(
-                (VkSamplerYcbcrConversion)((uintptr_t)0xffff0000ull));
+                                    (VkSamplerYcbcrConversion)((uintptr_t)0xffff0000ull))
+                                    .value();
             return VK_SUCCESS;
         }
 
@@ -10556,8 +11988,9 @@ class VkDecoderGlobalState::Impl {
         auto& ycbcrConversionInfo = mSamplerYcbcrConversionInfo[*pYcbcrConversion];
         ycbcrConversionInfo.device = device;
 
-        *pYcbcrConversion = new_boxed_non_dispatchable_VkSamplerYcbcrConversion(*pYcbcrConversion);
-        ycbcrConversionInfo.boxed = *pYcbcrConversion;
+        ycbcrConversionInfo.boxed =
+            new_boxed_non_dispatchable_VkSamplerYcbcrConversion(*pYcbcrConversion);
+        *pYcbcrConversion = ycbcrConversionInfo.boxed.value();
         return VK_SUCCESS;
     }
 
@@ -10612,7 +12045,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroySamplerYcbcrConversion(gfxstream::base::BumpPool* pool,
-                                            VkSnapshotApiCallHandle, VkDevice boxed_device,
+                                            VkSnapshotApiCallHandle, Boxed<VkDevice> boxed_device,
                                             VkSamplerYcbcrConversion ycbcrConversion,
                                             const VkAllocationCallbacks*) {
         if (m_vkEmulation->isYcbcrEmulationEnabled() &&
@@ -10627,7 +12060,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkEnumeratePhysicalDeviceGroups(
-        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, VkInstance boxed_instance,
+        gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle, Boxed<VkInstance> boxed_instance,
         uint32_t* pPhysicalDeviceGroupCount,
         VkPhysicalDeviceGroupProperties* pPhysicalDeviceGroupProperties) {
         auto instance = unbox_VkInstance(boxed_instance);
@@ -10658,7 +12091,7 @@ class VkDecoderGlobalState::Impl {
                     .physicalDeviceCount = 1,
                     .physicalDevices =
                         {
-                            unboxed_to_boxed_VkPhysicalDevice(physicalDevices[i]),
+                            unboxed_to_boxed_VkPhysicalDevice(physicalDevices[i]).value(),
                         },
                     .subsetAllocation = VK_FALSE,
                 };
@@ -10672,7 +12105,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreatePrivateDataSlotEXT(gfxstream::base::BumpPool* pool,
-                                           VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                           VkSnapshotApiCallHandle apiCallHandle, Boxed<VkDevice> device,
                                            const VkPrivateDataSlotCreateInfo* pCreateInfo,
                                            const VkAllocationCallbacks* pAllocator,
                                            VkPrivateDataSlot* pPrivateDataSlot) {
@@ -10682,7 +12115,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkDestroyPrivateDataSlotEXT(gfxstream::base::BumpPool* pool,
-                                        VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                        VkSnapshotApiCallHandle apiCallHandle, Boxed<VkDevice> device,
                                         VkPrivateDataSlot privateDataSlot,
                                         const VkAllocationCallbacks* pAllocator) {
         return on_vkDestroyPrivateDataSlot(pool, apiCallHandle, device, privateDataSlot,
@@ -10690,7 +12123,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkGetPrivateDataEXT(gfxstream::base::BumpPool* pool,
-                                VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                VkSnapshotApiCallHandle apiCallHandle, Boxed<VkDevice> device,
                                 VkObjectType objectType, uint64_t objectHandle,
                                 VkPrivateDataSlot privateDataSlot, uint64_t* pData) {
         on_vkGetPrivateData(pool, apiCallHandle, device, objectType, objectHandle, privateDataSlot,
@@ -10698,7 +12131,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkSetPrivateDataEXT(gfxstream::base::BumpPool* pool,
-                                    VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                    VkSnapshotApiCallHandle apiCallHandle, Boxed<VkDevice> device,
                                     VkObjectType objectType, uint64_t objectHandle,
                                     VkPrivateDataSlot privateDataSlot, uint64_t data) {
         return on_vkSetPrivateData(pool, apiCallHandle, device, objectType, objectHandle,
@@ -10706,7 +12139,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkCreatePrivateDataSlot(gfxstream::base::BumpPool* pool,
-                                        VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                        VkSnapshotApiCallHandle apiCallHandle, Boxed<VkDevice> device,
                                         const VkPrivateDataSlotCreateInfo* pCreateInfo,
                                         const VkAllocationCallbacks* pAllocator,
                                         VkPrivateDataSlot* pPrivateDataSlot) {
@@ -10717,12 +12150,12 @@ class VkDecoderGlobalState::Impl {
 
         VkPrivateDataSlot handle = (VkPrivateDataSlot)(uintptr_t)nextHandle.fetch_add(1);
 
-        *pPrivateDataSlot = new_boxed_non_dispatchable_VkPrivateDataSlot(handle);
+        *pPrivateDataSlot = new_boxed_non_dispatchable_VkPrivateDataSlot(handle).value();
         return VK_SUCCESS;
     }
 
     void on_vkDestroyPrivateDataSlot(gfxstream::base::BumpPool* /*pool*/,
-                                     VkSnapshotApiCallHandle /*apiCallHandle*/, VkDevice /*device*/,
+                                     VkSnapshotApiCallHandle /*apiCallHandle*/, Boxed<VkDevice> /*device*/,
                                      VkPrivateDataSlot /*privateDataSlot*/,
                                      const VkAllocationCallbacks* /*pAllocator*/) {
         // No-op as `privateDataSlot` is just an arbitrary handle created by
@@ -10730,7 +12163,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     void on_vkGetPrivateData(gfxstream::base::BumpPool* /*pool*/,
-                             VkSnapshotApiCallHandle /*apiCallHandle*/, VkDevice /*device*/,
+                             VkSnapshotApiCallHandle /*apiCallHandle*/, Boxed<VkDevice> /*device*/,
                              VkObjectType /*objectType*/, uint64_t /*objectHandle*/,
                              VkPrivateDataSlot /*privateDataSlot*/, uint64_t* /*pData*/) {
         GFXSTREAM_VERBOSE(
@@ -10738,7 +12171,7 @@ class VkDecoderGlobalState::Impl {
     }
 
     VkResult on_vkSetPrivateData(gfxstream::base::BumpPool* /*pool*/,
-                                 VkSnapshotApiCallHandle /*apiCallHandle*/, VkDevice /*device*/,
+                                 VkSnapshotApiCallHandle /*apiCallHandle*/, Boxed<VkDevice> /*device*/,
                                  VkObjectType /*objectType*/, uint64_t /*objectHandle*/,
                                  VkPrivateDataSlot /*privateDataSlot*/, uint64_t /*data*/) {
         GFXSTREAM_VERBOSE(
@@ -10748,14 +12181,14 @@ class VkDecoderGlobalState::Impl {
 
     VkResult on_vkSetDebugUtilsObjectNameEXT(gfxstream::base::BumpPool* /*pool*/,
                                              VkSnapshotApiCallHandle /*apiCallHandle*/,
-                                             VkDevice /*device*/,
+                                             Boxed<VkDevice> /*device*/,
                                              const VkDebugUtilsObjectNameInfoEXT* /*pNameInfo*/) {
         return VK_SUCCESS;
     }
 
     VkResult on_vkSetDebugUtilsObjectTagEXT(gfxstream::base::BumpPool* /*pool*/,
                                             VkSnapshotApiCallHandle /*apiCallHandle*/,
-                                            VkDevice /*device*/,
+                                            Boxed<VkDevice> /*device*/,
                                             const VkDebugUtilsObjectTagInfoEXT* /*pTagInfo*/) {
         return VK_SUCCESS;
     }
@@ -10861,7 +12294,7 @@ class VkDecoderGlobalState::Impl {
     AsyncResult registerQsriCallback(Boxed<VkImage> boxed_image, VkQsriTimeline::Callback callback) {
         std::lock_guard<std::mutex> lock(mMutex);
 
-        VkImage image = try_unbox_VkImage(boxed_image.value());
+        VkImage image = try_unbox_VkImage(boxed_image);
         if (image == VK_NULL_HANDLE) return AsyncResult::FAIL_AND_CALLBACK_NOT_SCHEDULED;
 
         auto imageInfoIt = mImageInfo.find(image);
@@ -10939,6 +12372,10 @@ class VkDecoderGlobalState::Impl {
             const VkNativeBufferANDROID* pNativeBufferANDROID =
                 vk_find_struct<VkNativeBufferANDROID>(&imageCreateInfo);
 
+            if (pExternalMemoryImageCi) {
+                imageCreateInfo.usage |=
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            }
             if (pExternalMemoryImageCi && pExternalMemoryImageCi->handleTypes &
                                               VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) {
                 const VkExternalMemoryHandleTypeFlagBits defaultHandleType =
@@ -11100,6 +12537,36 @@ class VkDecoderGlobalState::Impl {
         GFXSTREAM_FATAL("Not yet implemented.");
     }
 
+    void transformImpl_VkMemoryToImageCopy_tohost(const VkMemoryToImageCopy* regions,
+                                                  uint32_t count) {
+        VkMemoryToImageCopy* mutRegions = const_cast<VkMemoryToImageCopy*>(regions);
+        for (uint32_t i = 0; i < count; ++i) {
+            VkMemoryToImageCopy& region = mutRegions[i];
+            const VkHostPointerResolveGOOGLE* hostPtrResolve =
+                vk_find_struct<VkHostPointerResolveGOOGLE>(&region);
+            if (hostPtrResolve) {
+                region.pHostPointer = hostPtrResolve->pHostPointer;
+            }
+        }
+    }
+
+    void transformImpl_VkMemoryToImageCopy_fromhost(const VkMemoryToImageCopy*, uint32_t) {}
+
+    void transformImpl_VkImageToMemoryCopy_tohost(const VkImageToMemoryCopy* regions,
+                                                  uint32_t count) {
+        VkImageToMemoryCopy* mutRegions = const_cast<VkImageToMemoryCopy*>(regions);
+        for (uint32_t i = 0; i < count; ++i) {
+            VkImageToMemoryCopy& region = mutRegions[i];
+            const VkHostPointerResolveGOOGLE* hostPtrResolve =
+                vk_find_struct<VkHostPointerResolveGOOGLE>(&region);
+            if (hostPtrResolve) {
+                region.pHostPointer = hostPtrResolve->pHostPointer;
+            }
+        }
+    }
+
+    void transformImpl_VkImageToMemoryCopy_fromhost(const VkImageToMemoryCopy*, uint32_t) {}
+
 #define DEFINE_EXTERNAL_HANDLE_TYPE_TRANSFORM(type, field)                                      \
     void transformImpl_##type##_tohost(const type* props, uint32_t count) {                     \
         type* mut = (type*)props;                                                               \
@@ -11115,6 +12582,26 @@ class VkDecoderGlobalState::Impl {
             mut[i].field = (VkExternalMemoryHandleTypeFlagBits)                                 \
                                m_vkEmulation->transformExternalMemoryHandleTypeFlags_fromhost(  \
                                    mut[i].field, GUEST_EXTERNAL_MEMORY_HANDLE_TYPES);           \
+        }                                                                                       \
+    }
+
+#define DEFINE_EXTERNAL_HANDLE_TYPE_FLAGS_TRANSFORM(type, field)                                \
+    void transformImpl_##type##_tohost(const type* props, uint32_t count) {                     \
+        type* mut = (type*)props;                                                               \
+        for (uint32_t i = 0; i < count; ++i) {                                                  \
+            mut[i].field =                                                                      \
+                m_vkEmulation->transformExternalMemoryHandleTypeFlags_tohost(mut[i].field);     \
+            if (m_vkEmulation->supportsDmaBuf() &&                                              \
+                (mut[i].field & VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT)) {                \
+                mut[i].field |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;                 \
+            }                                                                                   \
+        }                                                                                       \
+    }                                                                                           \
+    void transformImpl_##type##_fromhost(const type* props, uint32_t count) {                   \
+        type* mut = (type*)props;                                                               \
+        for (uint32_t i = 0; i < count; ++i) {                                                  \
+            mut[i].field = m_vkEmulation->transformExternalMemoryHandleTypeFlags_fromhost(      \
+                mut[i].field, GUEST_EXTERNAL_MEMORY_HANDLE_TYPES);                              \
         }                                                                                       \
     }
 
@@ -11141,9 +12628,9 @@ class VkDecoderGlobalState::Impl {
     void transformImpl_VkPhysicalDeviceExternalImageFormatInfo_fromhost(
         const VkPhysicalDeviceExternalImageFormatInfo*, uint32_t) {}
     DEFINE_EXTERNAL_HANDLE_TYPE_TRANSFORM(VkPhysicalDeviceExternalBufferInfo, handleType)
-    DEFINE_EXTERNAL_HANDLE_TYPE_TRANSFORM(VkExternalMemoryImageCreateInfo, handleTypes)
-    DEFINE_EXTERNAL_HANDLE_TYPE_TRANSFORM(VkExternalMemoryBufferCreateInfo, handleTypes)
-    DEFINE_EXTERNAL_HANDLE_TYPE_TRANSFORM(VkExportMemoryAllocateInfo, handleTypes)
+    DEFINE_EXTERNAL_HANDLE_TYPE_FLAGS_TRANSFORM(VkExternalMemoryImageCreateInfo, handleTypes)
+    DEFINE_EXTERNAL_HANDLE_TYPE_FLAGS_TRANSFORM(VkExternalMemoryBufferCreateInfo, handleTypes)
+    DEFINE_EXTERNAL_HANDLE_TYPE_FLAGS_TRANSFORM(VkExportMemoryAllocateInfo, handleTypes)
     DEFINE_EXTERNAL_MEMORY_PROPERTIES_TRANSFORM(VkExternalImageFormatProperties)
     DEFINE_EXTERNAL_MEMORY_PROPERTIES_TRANSFORM(VkExternalBufferProperties)
 
@@ -11248,9 +12735,7 @@ class VkDecoderGlobalState::Impl {
 #if defined(__linux__)
         // A dma-buf is a Linux kernel construct, commonly used with open-source DRM drivers.
         // See https://docs.kernel.org/driver-api/dma-buf.html for details.
-        if (m_vkEmulation->supportsDmaBuf()) {
-            hostAlwaysDeviceExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
-        }
+        hostAlwaysDeviceExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
 #endif
 
         // Enable all the device extensions that should always be enabled on the host (if available)
@@ -11463,7 +12948,8 @@ class VkDecoderGlobalState::Impl {
         const auto extMemMode = m_vkEmulation->getExternalMemoryMode();
         switch (extMemMode) {
 #if defined(__unix__) && !defined(__ANDROID__)
-            case ExternalMemory::Mode::OpaqueFd: {
+            case ExternalMemory::Mode::OpaqueFd:
+            case ExternalMemory::Mode::DmaBuf: {
                 if (!vk->vkGetMemoryFdKHR) {
                     GFXSTREAM_ERROR("%s: External memory function not supported.", __func__);
                     return std::nullopt;
@@ -11472,9 +12958,13 @@ class VkDecoderGlobalState::Impl {
                     .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
                     .pNext = nullptr,
                     .memory = memory,
-                    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+                    .handleType = extMemMode == ExternalMemory::Mode::OpaqueFd
+                                      ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
+                                      : VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
                 };
-                ret.streamHandleType = STREAM_HANDLE_TYPE_MEM_OPAQUE_FD;
+                ret.streamHandleType = extMemMode == ExternalMemory::Mode::OpaqueFd
+                                           ? STREAM_HANDLE_TYPE_MEM_OPAQUE_FD
+                                           : STREAM_HANDLE_TYPE_MEM_DMABUF;
 
 #if defined(__linux__)
                 if (m_vkEmulation->supportsDmaBuf()) {
@@ -12064,7 +13554,7 @@ class VkDecoderGlobalState::Impl {
 #endif
         // The boxed physical devices are owned by the instance; release them
         // together with it.
-        for (VkPhysicalDevice boxedPhysicalDevice : instanceInfo.boxedPhysicalDevices) {
+        for (Boxed<VkPhysicalDevice> boxedPhysicalDevice : instanceInfo.boxedPhysicalDevices) {
             delete_VkPhysicalDevice(boxedPhysicalDevice);
         }
         delete_VkInstance(instanceInfo.boxed);
@@ -12188,12 +13678,23 @@ class VkDecoderGlobalState::Impl {
         // VK_ERROR_OUT_OF_POOL_MEMORY if it fails.
         std::vector<DescriptorPoolInfo::PoolState> poolCopy = poolInfo->pools;
 
+        const auto* varDescCountAllocInfo =
+            vk_find_struct<VkDescriptorSetVariableDescriptorCountAllocateInfo>(pAllocateInfo);
+
         for (uint32_t i = 0; i < pAllocateInfo->descriptorSetCount; ++i) {
             auto setLayoutInfo =
                 gfxstream::base::find(mDescriptorSetLayoutInfo, pAllocateInfo->pSetLayouts[i]);
             if (!setLayoutInfo) return VK_ERROR_INITIALIZATION_FAILED;
 
-            for (const auto& binding : setLayoutInfo->bindings) {
+            const uint32_t* varCount =
+                (varDescCountAllocInfo && varDescCountAllocInfo->descriptorSetCount > i &&
+                 varDescCountAllocInfo->pDescriptorCounts)
+                    ? &varDescCountAllocInfo->pDescriptorCounts[i]
+                    : nullptr;
+            auto effectiveBindings = getEffectiveLayoutBindings(*setLayoutInfo, varCount);
+
+            for (const auto& binding : effectiveBindings) {
+                if (binding.descriptorCount == 0) continue;
                 bool success = false;
                 for (auto& pool : poolCopy) {
                     if (!isBindingFeasibleForAlloc(pool, binding)) continue;
@@ -12215,6 +13716,7 @@ class VkDecoderGlobalState::Impl {
         DescriptorPoolInfo& poolInfo, const std::vector<VkDescriptorSetLayoutBinding>& bindings) {
         ++poolInfo.usedSets;
         for (const auto& binding : bindings) {
+            if (binding.descriptorCount == 0) continue;
             for (auto& pool : poolInfo.pools) {
                 if (!isBindingFeasibleForAlloc(pool, binding)) continue;
                 allocBindingFeasible(binding, pool);
@@ -12227,6 +13729,7 @@ class VkDecoderGlobalState::Impl {
         DescriptorPoolInfo& poolInfo, const std::vector<VkDescriptorSetLayoutBinding>& bindings) {
         --poolInfo.usedSets;
         for (const auto& binding : bindings) {
+            if (binding.descriptorCount == 0) continue;
             for (auto& pool : poolInfo.pools) {
                 if (!isBindingFeasibleForFree(pool, binding)) continue;
                 freeBindingFeasible(binding, pool);
@@ -12295,9 +13798,9 @@ class VkDecoderGlobalState::Impl {
     // `VkDevice`s with Virtio GPU context ids because API calls are not currently
     // replayed on the "same" RenderThread which originally made the API call so
     // RenderThreadInfoVk::ctx_id is not available.
-    std::optional<std::unordered_map<VkDevice, uint32_t>> mSnapshotLoadVkDeviceToVirtioCpuContextId
-        GUARDED_BY(mMutex);
-    std::unordered_map<VkInstance, uint32_t> mSnapshotLoadBoxedInstance2ContextId
+    std::optional<std::unordered_map<Boxed<VkDevice>, uint32_t>>
+        mSnapshotLoadVkDeviceToVirtioCpuContextId GUARDED_BY(mMutex);
+    std::unordered_map<Boxed<VkInstance>, uint32_t> mSnapshotLoadBoxedInstance2ContextId
         GUARDED_BY(mMutex);
 
     struct LinearImageCreateInfo {
@@ -12423,12 +13926,12 @@ bool VkDecoderGlobalState::load(gfxstream::Stream* stream, GfxApiLogger& gfxLogg
 PFN_vkVoidFunction VkDecoderGlobalState::on_vkGetInstanceProcAddr(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkInstance instance,
     const char* pName) {
-    return mImpl->on_vkGetInstanceProcAddr(pool, apiCallHandle, instance, pName);
+    return mImpl->on_vkGetInstanceProcAddr(pool, apiCallHandle, Boxed<VkInstance>(instance), pName);
 }
 PFN_vkVoidFunction VkDecoderGlobalState::on_vkGetDeviceProcAddr(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const char* pName) {
-    return mImpl->on_vkGetDeviceProcAddr(pool, apiCallHandle, device, pName);
+    return mImpl->on_vkGetDeviceProcAddr(pool, apiCallHandle, Boxed<VkDevice>(device), pName);
 }
 
 VkResult VkDecoderGlobalState::on_vkEnumerateInstanceVersion(gfxstream::base::BumpPool* pool,
@@ -12455,7 +13958,7 @@ VkResult VkDecoderGlobalState::on_vkCreateInstance(gfxstream::base::BumpPool* po
 void VkDecoderGlobalState::on_vkDestroyInstance(gfxstream::base::BumpPool* pool,
                                                 VkSnapshotApiCallHandle apiCallHandle,
                                                 VkInstance instance, const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyInstance(pool, apiCallHandle, instance, nullptr);
+    mImpl->on_vkDestroyInstance(pool, apiCallHandle, Boxed<VkInstance>(instance), nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkEnumeratePhysicalDevices(gfxstream::base::BumpPool* pool,
@@ -12463,7 +13966,7 @@ VkResult VkDecoderGlobalState::on_vkEnumeratePhysicalDevices(gfxstream::base::Bu
                                                              VkInstance instance,
                                                              uint32_t* physicalDeviceCount,
                                                              VkPhysicalDevice* physicalDevices) {
-    return mImpl->on_vkEnumeratePhysicalDevices(pool, apiCallHandle, instance, physicalDeviceCount,
+    return mImpl->on_vkEnumeratePhysicalDevices(pool, apiCallHandle, Boxed<VkInstance>(instance), physicalDeviceCount,
                                                 physicalDevices);
 }
 
@@ -12471,20 +13974,20 @@ void VkDecoderGlobalState::on_vkGetPhysicalDeviceFeatures(gfxstream::base::BumpP
                                                           VkSnapshotApiCallHandle apiCallHandle,
                                                           VkPhysicalDevice physicalDevice,
                                                           VkPhysicalDeviceFeatures* pFeatures) {
-    mImpl->on_vkGetPhysicalDeviceFeatures(pool, apiCallHandle, physicalDevice, pFeatures);
+    mImpl->on_vkGetPhysicalDeviceFeatures(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pFeatures);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceFeatures2(gfxstream::base::BumpPool* pool,
                                                            VkSnapshotApiCallHandle apiCallHandle,
                                                            VkPhysicalDevice physicalDevice,
                                                            VkPhysicalDeviceFeatures2* pFeatures) {
-    mImpl->on_vkGetPhysicalDeviceFeatures2(pool, apiCallHandle, physicalDevice, pFeatures);
+    mImpl->on_vkGetPhysicalDeviceFeatures2(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pFeatures);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceFeatures2KHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2KHR* pFeatures) {
-    mImpl->on_vkGetPhysicalDeviceFeatures2(pool, apiCallHandle, physicalDevice, pFeatures);
+    mImpl->on_vkGetPhysicalDeviceFeatures2(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pFeatures);
 }
 
 VkResult VkDecoderGlobalState::on_vkGetPhysicalDeviceImageFormatProperties(
@@ -12492,7 +13995,7 @@ VkResult VkDecoderGlobalState::on_vkGetPhysicalDeviceImageFormatProperties(
     VkPhysicalDevice physicalDevice, VkFormat format, VkImageType type, VkImageTiling tiling,
     VkImageUsageFlags usage, VkImageCreateFlags flags,
     VkImageFormatProperties* pImageFormatProperties) {
-    return mImpl->on_vkGetPhysicalDeviceImageFormatProperties(pool, apiCallHandle, physicalDevice,
+    return mImpl->on_vkGetPhysicalDeviceImageFormatProperties(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice),
                                                               format, type, tiling, usage, flags,
                                                               pImageFormatProperties);
 }
@@ -12501,47 +14004,47 @@ VkResult VkDecoderGlobalState::on_vkGetPhysicalDeviceImageFormatProperties2(
     VkPhysicalDevice physicalDevice, const VkPhysicalDeviceImageFormatInfo2* pImageFormatInfo,
     VkImageFormatProperties2* pImageFormatProperties) {
     return mImpl->on_vkGetPhysicalDeviceImageFormatProperties2(
-        pool, apiCallHandle, physicalDevice, pImageFormatInfo, pImageFormatProperties);
+        pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pImageFormatInfo, pImageFormatProperties);
 }
 VkResult VkDecoderGlobalState::on_vkGetPhysicalDeviceImageFormatProperties2KHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkPhysicalDevice physicalDevice, const VkPhysicalDeviceImageFormatInfo2* pImageFormatInfo,
     VkImageFormatProperties2* pImageFormatProperties) {
     return mImpl->on_vkGetPhysicalDeviceImageFormatProperties2(
-        pool, apiCallHandle, physicalDevice, pImageFormatInfo, pImageFormatProperties);
+        pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pImageFormatInfo, pImageFormatProperties);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceFormatProperties(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties* pFormatProperties) {
-    mImpl->on_vkGetPhysicalDeviceFormatProperties(pool, apiCallHandle, physicalDevice, format,
+    mImpl->on_vkGetPhysicalDeviceFormatProperties(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), format,
                                                   pFormatProperties);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceFormatProperties2(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties2* pFormatProperties) {
-    mImpl->on_vkGetPhysicalDeviceFormatProperties2(pool, apiCallHandle, physicalDevice, format,
+    mImpl->on_vkGetPhysicalDeviceFormatProperties2(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), format,
                                                    pFormatProperties);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceFormatProperties2KHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties2* pFormatProperties) {
-    mImpl->on_vkGetPhysicalDeviceFormatProperties2(pool, apiCallHandle, physicalDevice, format,
+    mImpl->on_vkGetPhysicalDeviceFormatProperties2(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), format,
                                                    pFormatProperties);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceProperties(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties* pProperties) {
-    mImpl->on_vkGetPhysicalDeviceProperties(pool, apiCallHandle, physicalDevice, pProperties);
+    mImpl->on_vkGetPhysicalDeviceProperties(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pProperties);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceProperties2(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2* pProperties) {
-    mImpl->on_vkGetPhysicalDeviceProperties2(pool, apiCallHandle, physicalDevice, pProperties);
+    mImpl->on_vkGetPhysicalDeviceProperties2(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pProperties);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceQueueFamilyProperties(
@@ -12549,7 +14052,7 @@ void VkDecoderGlobalState::on_vkGetPhysicalDeviceQueueFamilyProperties(
     VkPhysicalDevice physicalDevice, uint32_t* pQueueFamilyPropertyCount,
     VkQueueFamilyProperties* pQueueFamilyProperties) {
     mImpl->on_vkGetPhysicalDeviceQueueFamilyProperties(
-        pool, apiCallHandle, physicalDevice, pQueueFamilyPropertyCount, pQueueFamilyProperties);
+        pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pQueueFamilyPropertyCount, pQueueFamilyProperties);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceQueueFamilyProperties2(
@@ -12557,7 +14060,7 @@ void VkDecoderGlobalState::on_vkGetPhysicalDeviceQueueFamilyProperties2(
     VkPhysicalDevice physicalDevice, uint32_t* pQueueFamilyPropertyCount,
     VkQueueFamilyProperties2* pQueueFamilyProperties) {
     mImpl->on_vkGetPhysicalDeviceQueueFamilyProperties2(
-        pool, apiCallHandle, physicalDevice, pQueueFamilyPropertyCount, pQueueFamilyProperties);
+        pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pQueueFamilyPropertyCount, pQueueFamilyProperties);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceQueueFamilyProperties2KHR(
@@ -12565,40 +14068,41 @@ void VkDecoderGlobalState::on_vkGetPhysicalDeviceQueueFamilyProperties2KHR(
     VkPhysicalDevice physicalDevice, uint32_t* pQueueFamilyPropertyCount,
     VkQueueFamilyProperties2* pQueueFamilyProperties) {
     mImpl->on_vkGetPhysicalDeviceQueueFamilyProperties2(
-        pool, apiCallHandle, physicalDevice, pQueueFamilyPropertyCount, pQueueFamilyProperties);
+        pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pQueueFamilyPropertyCount,
+        pQueueFamilyProperties);
 }
 
 VkResult VkDecoderGlobalState::on_vkQueuePresentKHR(gfxstream::base::BumpPool* pool,
                                                     VkSnapshotApiCallHandle apiCallHandle,
                                                     VkQueue queue,
                                                     const VkPresentInfoKHR* pPresentInfo) {
-    return mImpl->on_vkQueuePresentKHR(pool, apiCallHandle, queue, pPresentInfo);
+    return mImpl->on_vkQueuePresentKHR(pool, apiCallHandle, Boxed<VkQueue>(queue), pPresentInfo);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceProperties2KHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2* pProperties) {
-    mImpl->on_vkGetPhysicalDeviceProperties2(pool, apiCallHandle, physicalDevice, pProperties);
+    mImpl->on_vkGetPhysicalDeviceProperties2(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pProperties);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceMemoryProperties(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties* pMemoryProperties) {
-    mImpl->on_vkGetPhysicalDeviceMemoryProperties(pool, apiCallHandle, physicalDevice,
+    mImpl->on_vkGetPhysicalDeviceMemoryProperties(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice),
                                                   pMemoryProperties);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceMemoryProperties2(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties2* pMemoryProperties) {
-    mImpl->on_vkGetPhysicalDeviceMemoryProperties2(pool, apiCallHandle, physicalDevice,
+    mImpl->on_vkGetPhysicalDeviceMemoryProperties2(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice),
                                                    pMemoryProperties);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceMemoryProperties2KHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkPhysicalDevice physicalDevice, VkPhysicalDeviceMemoryProperties2* pMemoryProperties) {
-    mImpl->on_vkGetPhysicalDeviceMemoryProperties2(pool, apiCallHandle, physicalDevice,
+    mImpl->on_vkGetPhysicalDeviceMemoryProperties2(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice),
                                                    pMemoryProperties);
 }
 
@@ -12606,7 +14110,7 @@ VkResult VkDecoderGlobalState::on_vkEnumerateDeviceExtensionProperties(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkPhysicalDevice physicalDevice, const char* pLayerName, uint32_t* pPropertyCount,
     VkExtensionProperties* pProperties) {
-    return mImpl->on_vkEnumerateDeviceExtensionProperties(pool, apiCallHandle, physicalDevice,
+    return mImpl->on_vkEnumerateDeviceExtensionProperties(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice),
                                                           pLayerName, pPropertyCount, pProperties);
 }
 
@@ -12615,7 +14119,7 @@ VkResult VkDecoderGlobalState::on_vkCreateDevice(gfxstream::base::BumpPool* pool
                                                  VkPhysicalDevice physicalDevice,
                                                  const VkDeviceCreateInfo* pCreateInfo,
                                                  const VkAllocationCallbacks*, VkDevice* pDevice) {
-    return mImpl->on_vkCreateDevice(pool, apiCallHandle, physicalDevice, pCreateInfo, nullptr,
+    return mImpl->on_vkCreateDevice(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pCreateInfo, nullptr,
                                     pDevice);
 }
 
@@ -12623,7 +14127,7 @@ void VkDecoderGlobalState::on_vkGetDeviceQueue(gfxstream::base::BumpPool* pool,
                                                VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
                                                uint32_t queueFamilyIndex, uint32_t queueIndex,
                                                VkQueue* pQueue) {
-    mImpl->on_vkGetDeviceQueue(pool, apiCallHandle, device, queueFamilyIndex, queueIndex, pQueue);
+    mImpl->on_vkGetDeviceQueue(pool, apiCallHandle, Boxed<VkDevice>(device), queueFamilyIndex, queueIndex, pQueue);
 }
 
 void VkDecoderGlobalState::on_vkGetDeviceQueue2(gfxstream::base::BumpPool* pool,
@@ -12631,7 +14135,7 @@ void VkDecoderGlobalState::on_vkGetDeviceQueue2(gfxstream::base::BumpPool* pool,
                                                 VkDevice device,
                                                 const VkDeviceQueueInfo2* pQueueInfo,
                                                 VkQueue* pQueue) {
-    mImpl->on_vkGetDeviceQueue2(pool, apiCallHandle, device, pQueueInfo, pQueue);
+    mImpl->on_vkGetDeviceQueue2(pool, apiCallHandle, Boxed<VkDevice>(device), pQueueInfo, pQueue);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceSparseImageFormatProperties(
@@ -12639,7 +14143,7 @@ void VkDecoderGlobalState::on_vkGetPhysicalDeviceSparseImageFormatProperties(
     VkPhysicalDevice physicalDevice, VkFormat format, VkImageType type,
     VkSampleCountFlagBits samples, VkImageUsageFlags usage, VkImageTiling tiling,
     uint32_t* pPropertyCount, VkSparseImageFormatProperties* pProperties) {
-    mImpl->on_vkGetPhysicalDeviceSparseImageFormatProperties(pool, apiCallHandle, physicalDevice,
+    mImpl->on_vkGetPhysicalDeviceSparseImageFormatProperties(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice),
                                                              format, type, samples, usage, tiling,
                                                              pPropertyCount, pProperties);
 }
@@ -12648,48 +14152,48 @@ void VkDecoderGlobalState::on_vkGetPhysicalDeviceSparseImageFormatProperties2(gf
         VkSnapshotApiCallHandle apiCallHandle,
         VkPhysicalDevice physicalDevice, const VkPhysicalDeviceSparseImageFormatInfo2* pFormatInfo,
         uint32_t* pPropertyCount, VkSparseImageFormatProperties2* pProperties) {
-    mImpl->on_vkGetPhysicalDeviceSparseImageFormatProperties2(pool, apiCallHandle, physicalDevice, pFormatInfo, pPropertyCount, pProperties);
+    mImpl->on_vkGetPhysicalDeviceSparseImageFormatProperties2(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pFormatInfo, pPropertyCount, pProperties);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceSparseImageFormatProperties2KHR(gfxstream::base::BumpPool* pool,
                                                 VkSnapshotApiCallHandle apiCallHandle,
         VkPhysicalDevice physicalDevice, const VkPhysicalDeviceSparseImageFormatInfo2* pFormatInfo,
         uint32_t* pPropertyCount, VkSparseImageFormatProperties2* pProperties) {
-    mImpl->on_vkGetPhysicalDeviceSparseImageFormatProperties2KHR(pool, apiCallHandle, physicalDevice, pFormatInfo, pPropertyCount, pProperties);
+    mImpl->on_vkGetPhysicalDeviceSparseImageFormatProperties2KHR(pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pFormatInfo, pPropertyCount, pProperties);
 }
 
 void VkDecoderGlobalState::on_vkGetDeviceBufferMemoryRequirements(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkDeviceBufferMemoryRequirements* pInfo, VkMemoryRequirements2* pMemoryRequirements) {
-    mImpl->on_vkGetDeviceBufferMemoryRequirements(pool, apiCallHandle, device, pInfo,
+    mImpl->on_vkGetDeviceBufferMemoryRequirements(pool, apiCallHandle, Boxed<VkDevice>(device), pInfo,
                                                   pMemoryRequirements);
 }
 
 void VkDecoderGlobalState::on_vkGetDeviceBufferMemoryRequirementsKHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkDeviceBufferMemoryRequirements* pInfo, VkMemoryRequirements2* pMemoryRequirements) {
-    mImpl->on_vkGetDeviceBufferMemoryRequirements(pool, apiCallHandle, device, pInfo,
+    mImpl->on_vkGetDeviceBufferMemoryRequirements(pool, apiCallHandle, Boxed<VkDevice>(device), pInfo,
                                                   pMemoryRequirements);
 }
 
 void VkDecoderGlobalState::on_vkGetDeviceImageMemoryRequirements(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkDeviceImageMemoryRequirements* pInfo, VkMemoryRequirements2* pMemoryRequirements) {
-    mImpl->on_vkGetDeviceImageMemoryRequirements(pool, apiCallHandle, device, pInfo,
+    mImpl->on_vkGetDeviceImageMemoryRequirements(pool, apiCallHandle, Boxed<VkDevice>(device), pInfo,
                                                  pMemoryRequirements);
 }
 
 void VkDecoderGlobalState::on_vkGetDeviceImageMemoryRequirementsKHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkDeviceImageMemoryRequirements* pInfo, VkMemoryRequirements2* pMemoryRequirements) {
-    mImpl->on_vkGetDeviceImageMemoryRequirements(pool, apiCallHandle, device, pInfo,
+    mImpl->on_vkGetDeviceImageMemoryRequirements(pool, apiCallHandle, Boxed<VkDevice>(device), pInfo,
                                                  pMemoryRequirements);
 }
 
 void VkDecoderGlobalState::on_vkDestroyDevice(gfxstream::base::BumpPool* pool,
                                               VkSnapshotApiCallHandle apiCallHandle,
                                               VkDevice device, const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyDevice(pool, apiCallHandle, device, nullptr);
+    mImpl->on_vkDestroyDevice(pool, apiCallHandle, Boxed<VkDevice>(device), nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreateBuffer(gfxstream::base::BumpPool* pool,
@@ -12697,14 +14201,14 @@ VkResult VkDecoderGlobalState::on_vkCreateBuffer(gfxstream::base::BumpPool* pool
                                                  VkDevice device,
                                                  const VkBufferCreateInfo* pCreateInfo,
                                                  const VkAllocationCallbacks*, VkBuffer* pBuffer) {
-    return mImpl->on_vkCreateBuffer(pool, apiCallHandle, device, pCreateInfo, nullptr, pBuffer);
+    return mImpl->on_vkCreateBuffer(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo, nullptr, pBuffer);
 }
 
 void VkDecoderGlobalState::on_vkDestroyBuffer(gfxstream::base::BumpPool* pool,
                                               VkSnapshotApiCallHandle apiCallHandle,
                                               VkDevice device, VkBuffer buffer,
                                               const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyBuffer(pool, apiCallHandle, device, buffer, nullptr);
+    mImpl->on_vkDestroyBuffer(pool, apiCallHandle, Boxed<VkDevice>(device), buffer, nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkBindBufferMemory(gfxstream::base::BumpPool* pool,
@@ -12712,21 +14216,21 @@ VkResult VkDecoderGlobalState::on_vkBindBufferMemory(gfxstream::base::BumpPool* 
                                                      VkDevice device, VkBuffer buffer,
                                                      VkDeviceMemory memory,
                                                      VkDeviceSize memoryOffset) {
-    return mImpl->on_vkBindBufferMemory(pool, apiCallHandle, device, buffer, memory, memoryOffset);
+    return mImpl->on_vkBindBufferMemory(pool, apiCallHandle, Boxed<VkDevice>(device), buffer, memory, memoryOffset);
 }
 
 VkResult VkDecoderGlobalState::on_vkBindBufferMemory2(gfxstream::base::BumpPool* pool,
                                                       VkSnapshotApiCallHandle apiCallHandle,
                                                       VkDevice device, uint32_t bindInfoCount,
                                                       const VkBindBufferMemoryInfo* pBindInfos) {
-    return mImpl->on_vkBindBufferMemory2(pool, apiCallHandle, device, bindInfoCount, pBindInfos);
+    return mImpl->on_vkBindBufferMemory2(pool, apiCallHandle, Boxed<VkDevice>(device), bindInfoCount, pBindInfos);
 }
 
 VkResult VkDecoderGlobalState::on_vkBindBufferMemory2KHR(gfxstream::base::BumpPool* pool,
                                                          VkSnapshotApiCallHandle apiCallHandle,
                                                          VkDevice device, uint32_t bindInfoCount,
                                                          const VkBindBufferMemoryInfo* pBindInfos) {
-    return mImpl->on_vkBindBufferMemory2KHR(pool, apiCallHandle, device, bindInfoCount, pBindInfos);
+    return mImpl->on_vkBindBufferMemory2KHR(pool, apiCallHandle, Boxed<VkDevice>(device), bindInfoCount, pBindInfos);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreateImage(gfxstream::base::BumpPool* pool,
@@ -12734,13 +14238,13 @@ VkResult VkDecoderGlobalState::on_vkCreateImage(gfxstream::base::BumpPool* pool,
                                                 VkDevice device,
                                                 const VkImageCreateInfo* pCreateInfo,
                                                 const VkAllocationCallbacks*, VkImage* pImage) {
-    return mImpl->on_vkCreateImage(pool, apiCallHandle, device, pCreateInfo, nullptr, pImage);
+    return mImpl->on_vkCreateImage(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo, nullptr, pImage);
 }
 
 void VkDecoderGlobalState::on_vkDestroyImage(gfxstream::base::BumpPool* pool,
                                              VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
                                              VkImage image, const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyImage(pool, apiCallHandle, device, image, nullptr);
+    mImpl->on_vkDestroyImage(pool, apiCallHandle, Boxed<VkDevice>(device), image, nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkBindImageMemory(gfxstream::base::BumpPool* pool,
@@ -12748,60 +14252,60 @@ VkResult VkDecoderGlobalState::on_vkBindImageMemory(gfxstream::base::BumpPool* p
                                                     VkDevice device, VkImage image,
                                                     VkDeviceMemory memory,
                                                     VkDeviceSize memoryOffset) {
-    return mImpl->on_vkBindImageMemory(pool, apiCallHandle, device, image, memory, memoryOffset);
+    return mImpl->on_vkBindImageMemory(pool, apiCallHandle, Boxed<VkDevice>(device), image, memory, memoryOffset);
 }
 
 VkResult VkDecoderGlobalState::on_vkBindImageMemory2(gfxstream::base::BumpPool* pool,
                                                      VkSnapshotApiCallHandle apiCallHandle,
                                                      VkDevice device, uint32_t bindInfoCount,
                                                      const VkBindImageMemoryInfo* pBindInfos) {
-    return mImpl->on_vkBindImageMemory2(pool, apiCallHandle, device, bindInfoCount, pBindInfos);
+    return mImpl->on_vkBindImageMemory2(pool, apiCallHandle, Boxed<VkDevice>(device), bindInfoCount, pBindInfos);
 }
 
 VkResult VkDecoderGlobalState::on_vkBindImageMemory2KHR(gfxstream::base::BumpPool* pool,
                                                         VkSnapshotApiCallHandle apiCallHandle,
                                                         VkDevice device, uint32_t bindInfoCount,
                                                         const VkBindImageMemoryInfo* pBindInfos) {
-    return mImpl->on_vkBindImageMemory2(pool, apiCallHandle, device, bindInfoCount, pBindInfos);
+    return mImpl->on_vkBindImageMemory2(pool, apiCallHandle, Boxed<VkDevice>(device), bindInfoCount, pBindInfos);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreateImageView(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkImageViewCreateInfo* pCreateInfo, const VkAllocationCallbacks*, VkImageView* pView) {
-    return mImpl->on_vkCreateImageView(pool, apiCallHandle, device, pCreateInfo, nullptr, pView);
+    return mImpl->on_vkCreateImageView(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo, nullptr, pView);
 }
 
 void VkDecoderGlobalState::on_vkDestroyImageView(gfxstream::base::BumpPool* pool,
                                                  VkSnapshotApiCallHandle apiCallHandle,
                                                  VkDevice device, VkImageView imageView,
                                                  const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyImageView(pool, apiCallHandle, device, imageView, nullptr);
+    mImpl->on_vkDestroyImageView(pool, apiCallHandle, Boxed<VkDevice>(device), imageView, nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreateBufferView(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkBufferViewCreateInfo* pCreateInfo, const VkAllocationCallbacks*, VkBufferView* pView) {
-    return mImpl->on_vkCreateBufferView(pool, apiCallHandle, device, pCreateInfo, nullptr, pView);
+    return mImpl->on_vkCreateBufferView(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo, nullptr, pView);
 }
 
 void VkDecoderGlobalState::on_vkDestroyBufferView(gfxstream::base::BumpPool* pool,
                                                   VkSnapshotApiCallHandle apiCallHandle,
                                                   VkDevice device, VkBufferView bufferView,
                                                   const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyBufferView(pool, apiCallHandle, device, bufferView, nullptr);
+    mImpl->on_vkDestroyBufferView(pool, apiCallHandle, Boxed<VkDevice>(device), bufferView, nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreateSampler(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkSamplerCreateInfo* pCreateInfo, const VkAllocationCallbacks*, VkSampler* pSampler) {
-    return mImpl->on_vkCreateSampler(pool, apiCallHandle, device, pCreateInfo, nullptr, pSampler);
+    return mImpl->on_vkCreateSampler(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo, nullptr, pSampler);
 }
 
 void VkDecoderGlobalState::on_vkDestroySampler(gfxstream::base::BumpPool* pool,
                                                VkSnapshotApiCallHandle apiCallHandle,
                                                VkDevice device, VkSampler sampler,
                                                const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroySampler(pool, apiCallHandle, device, sampler, nullptr);
+    mImpl->on_vkDestroySampler(pool, apiCallHandle, Boxed<VkDevice>(device), sampler, nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreateSemaphore(gfxstream::base::BumpPool* pool,
@@ -12810,14 +14314,14 @@ VkResult VkDecoderGlobalState::on_vkCreateSemaphore(gfxstream::base::BumpPool* p
                                                     const VkSemaphoreCreateInfo* pCreateInfo,
                                                     const VkAllocationCallbacks*,
                                                     VkSemaphore* pSemaphore) {
-    return mImpl->on_vkCreateSemaphore(pool, apiCallHandle, device, pCreateInfo, nullptr,
+    return mImpl->on_vkCreateSemaphore(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo, nullptr,
                                        pSemaphore);
 }
 
 VkResult VkDecoderGlobalState::on_vkImportSemaphoreFdKHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkImportSemaphoreFdInfoKHR* pImportSemaphoreFdInfo) {
-    return mImpl->on_vkImportSemaphoreFdKHR(pool, apiCallHandle, device, pImportSemaphoreFdInfo);
+    return mImpl->on_vkImportSemaphoreFdKHR(pool, apiCallHandle, Boxed<VkDevice>(device), pImportSemaphoreFdInfo);
 }
 
 VkResult VkDecoderGlobalState::on_vkGetSemaphoreFdKHR(gfxstream::base::BumpPool* pool,
@@ -12825,21 +14329,21 @@ VkResult VkDecoderGlobalState::on_vkGetSemaphoreFdKHR(gfxstream::base::BumpPool*
                                                       VkDevice device,
                                                       const VkSemaphoreGetFdInfoKHR* pGetFdInfo,
                                                       int* pFd) {
-    return mImpl->on_vkGetSemaphoreFdKHR(pool, apiCallHandle, device, pGetFdInfo, pFd);
+    return mImpl->on_vkGetSemaphoreFdKHR(pool, apiCallHandle, Boxed<VkDevice>(device), pGetFdInfo, pFd);
 }
 
 VkResult VkDecoderGlobalState::on_vkGetSemaphoreGOOGLE(gfxstream::base::BumpPool* pool,
                                                        VkSnapshotApiCallHandle apiCallHandle,
                                                        VkDevice device, VkSemaphore semaphore,
                                                        uint64_t syncId) {
-    return mImpl->on_vkGetSemaphoreGOOGLE(pool, apiCallHandle, device, semaphore, syncId);
+    return mImpl->on_vkGetSemaphoreGOOGLE(pool, apiCallHandle, Boxed<VkDevice>(device), semaphore, syncId);
 }
 
 void VkDecoderGlobalState::on_vkDestroySemaphore(gfxstream::base::BumpPool* pool,
                                                  VkSnapshotApiCallHandle apiCallHandle,
                                                  VkDevice device, VkSemaphore semaphore,
                                                  const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroySemaphore(pool, apiCallHandle, device, semaphore, nullptr);
+    mImpl->on_vkDestroySemaphore(pool, apiCallHandle, Boxed<VkDevice>(device), semaphore, nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkWaitSemaphores(gfxstream::base::BumpPool* pool,
@@ -12847,14 +14351,14 @@ VkResult VkDecoderGlobalState::on_vkWaitSemaphores(gfxstream::base::BumpPool* po
                                                    VkDevice device,
                                                    const VkSemaphoreWaitInfo* pWaitInfo,
                                                    uint64_t timeout) {
-    return mImpl->on_vkWaitSemaphores(pool, apiCallHandle, device, pWaitInfo, timeout);
+    return mImpl->on_vkWaitSemaphores(pool, apiCallHandle, Boxed<VkDevice>(device), pWaitInfo, timeout);
 }
 
 VkResult VkDecoderGlobalState::on_vkSignalSemaphore(gfxstream::base::BumpPool* pool,
                                                    VkSnapshotApiCallHandle apiCallHandle,
                                                    VkDevice device,
                                                    const VkSemaphoreSignalInfo* pSignalInfo) {
-    return mImpl->on_vkSignalSemaphore(pool, apiCallHandle, device, pSignalInfo);
+    return mImpl->on_vkSignalSemaphore(pool, apiCallHandle, Boxed<VkDevice>(device), pSignalInfo);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreateFence(gfxstream::base::BumpPool* pool,
@@ -12862,13 +14366,13 @@ VkResult VkDecoderGlobalState::on_vkCreateFence(gfxstream::base::BumpPool* pool,
                                                 VkDevice device,
                                                 const VkFenceCreateInfo* pCreateInfo,
                                                 const VkAllocationCallbacks*, VkFence* pFence) {
-    return mImpl->on_vkCreateFence(pool, apiCallHandle, device, pCreateInfo, nullptr, pFence);
+    return mImpl->on_vkCreateFence(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo, nullptr, pFence);
 }
 
 VkResult VkDecoderGlobalState::on_vkGetFenceStatus(gfxstream::base::BumpPool* pool,
                                                    VkSnapshotApiCallHandle apiCallHandle,
                                                    VkDevice device, VkFence fence) {
-    return mImpl->on_vkGetFenceStatus(pool, apiCallHandle, device, fence);
+    return mImpl->on_vkGetFenceStatus(pool, apiCallHandle, Boxed<VkDevice>(device), fence);
 }
 
 VkResult VkDecoderGlobalState::on_vkWaitForFences(gfxstream::base::BumpPool* pool,
@@ -12876,7 +14380,7 @@ VkResult VkDecoderGlobalState::on_vkWaitForFences(gfxstream::base::BumpPool* poo
                                                   VkDevice device, uint32_t fenceCount,
                                                   const VkFence* pFences, VkBool32 waitAll,
                                                   uint64_t timeout) {
-    return mImpl->on_vkWaitForFences(pool, apiCallHandle, device, fenceCount, pFences, waitAll,
+    return mImpl->on_vkWaitForFences(pool, apiCallHandle, Boxed<VkDevice>(device), fenceCount, pFences, waitAll,
                                      timeout);
 }
 
@@ -12884,27 +14388,27 @@ VkResult VkDecoderGlobalState::on_vkResetFences(gfxstream::base::BumpPool* pool,
                                                 VkSnapshotApiCallHandle apiCallHandle,
                                                 VkDevice device, uint32_t fenceCount,
                                                 const VkFence* pFences) {
-    return mImpl->on_vkResetFences(pool, apiCallHandle, device, fenceCount, pFences);
+    return mImpl->on_vkResetFences(pool, apiCallHandle, Boxed<VkDevice>(device), fenceCount, pFences);
 }
 
 void VkDecoderGlobalState::on_vkDestroyFence(gfxstream::base::BumpPool* pool,
                                              VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
                                              VkFence fence, const VkAllocationCallbacks*) {
-    return mImpl->on_vkDestroyFence(pool, apiCallHandle, device, fence, nullptr);
+    return mImpl->on_vkDestroyFence(pool, apiCallHandle, Boxed<VkDevice>(device), fence, nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreateDescriptorSetLayout(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkDescriptorSetLayoutCreateInfo* pCreateInfo, const VkAllocationCallbacks*,
     VkDescriptorSetLayout* pSetLayout) {
-    return mImpl->on_vkCreateDescriptorSetLayout(pool, apiCallHandle, device, pCreateInfo, nullptr,
+    return mImpl->on_vkCreateDescriptorSetLayout(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo, nullptr,
                                                  pSetLayout);
 }
 
 void VkDecoderGlobalState::on_vkDestroyDescriptorSetLayout(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     VkDescriptorSetLayout descriptorSetLayout, const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyDescriptorSetLayout(pool, apiCallHandle, device, descriptorSetLayout,
+    mImpl->on_vkDestroyDescriptorSetLayout(pool, apiCallHandle, Boxed<VkDevice>(device), descriptorSetLayout,
                                            nullptr);
 }
 
@@ -12912,7 +14416,7 @@ VkResult VkDecoderGlobalState::on_vkCreateDescriptorPool(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkDescriptorPoolCreateInfo* pCreateInfo, const VkAllocationCallbacks*,
     VkDescriptorPool* pDescriptorPool) {
-    return mImpl->on_vkCreateDescriptorPool(pool, apiCallHandle, device, pCreateInfo, nullptr,
+    return mImpl->on_vkCreateDescriptorPool(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo, nullptr,
                                             pDescriptorPool);
 }
 
@@ -12921,7 +14425,7 @@ void VkDecoderGlobalState::on_vkDestroyDescriptorPool(gfxstream::base::BumpPool*
                                                       VkDevice device,
                                                       VkDescriptorPool descriptorPool,
                                                       const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyDescriptorPool(pool, apiCallHandle, device, descriptorPool, nullptr);
+    mImpl->on_vkDestroyDescriptorPool(pool, apiCallHandle, Boxed<VkDevice>(device), descriptorPool, nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkResetDescriptorPool(gfxstream::base::BumpPool* pool,
@@ -12929,13 +14433,13 @@ VkResult VkDecoderGlobalState::on_vkResetDescriptorPool(gfxstream::base::BumpPoo
                                                         VkDevice device,
                                                         VkDescriptorPool descriptorPool,
                                                         VkDescriptorPoolResetFlags flags) {
-    return mImpl->on_vkResetDescriptorPool(pool, apiCallHandle, device, descriptorPool, flags);
+    return mImpl->on_vkResetDescriptorPool(pool, apiCallHandle, Boxed<VkDevice>(device), descriptorPool, flags);
 }
 
 VkResult VkDecoderGlobalState::on_vkAllocateDescriptorSets(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkDescriptorSetAllocateInfo* pAllocateInfo, VkDescriptorSet* pDescriptorSets) {
-    return mImpl->on_vkAllocateDescriptorSets(pool, apiCallHandle, device, pAllocateInfo,
+    return mImpl->on_vkAllocateDescriptorSets(pool, apiCallHandle, Boxed<VkDevice>(device), pAllocateInfo,
                                               pDescriptorSets);
 }
 
@@ -12945,7 +14449,7 @@ VkResult VkDecoderGlobalState::on_vkFreeDescriptorSets(gfxstream::base::BumpPool
                                                        VkDescriptorPool descriptorPool,
                                                        uint32_t descriptorSetCount,
                                                        const VkDescriptorSet* pDescriptorSets) {
-    return mImpl->on_vkFreeDescriptorSets(pool, apiCallHandle, device, descriptorPool,
+    return mImpl->on_vkFreeDescriptorSets(pool, apiCallHandle, Boxed<VkDevice>(device), descriptorPool,
                                           descriptorSetCount, pDescriptorSets);
 }
 
@@ -12955,7 +14459,7 @@ void VkDecoderGlobalState::on_vkUpdateDescriptorSets(gfxstream::base::BumpPool* 
                                                      const VkWriteDescriptorSet* pDescriptorWrites,
                                                      uint32_t descriptorCopyCount,
                                                      const VkCopyDescriptorSet* pDescriptorCopies) {
-    mImpl->on_vkUpdateDescriptorSets(pool, apiCallHandle, device, descriptorWriteCount,
+    mImpl->on_vkUpdateDescriptorSets(pool, apiCallHandle, Boxed<VkDevice>(device), descriptorWriteCount,
                                      pDescriptorWrites, descriptorCopyCount, pDescriptorCopies);
 }
 
@@ -12965,7 +14469,7 @@ VkResult VkDecoderGlobalState::on_vkCreateShaderModule(gfxstream::base::BumpPool
                                                        const VkShaderModuleCreateInfo* pCreateInfo,
                                                        const VkAllocationCallbacks*,
                                                        VkShaderModule* pShaderModule) {
-    return mImpl->on_vkCreateShaderModule(pool, apiCallHandle, boxed_device, pCreateInfo, nullptr,
+    return mImpl->on_vkCreateShaderModule(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), pCreateInfo, nullptr,
                                           pShaderModule);
 }
 
@@ -12974,14 +14478,14 @@ void VkDecoderGlobalState::on_vkDestroyShaderModule(gfxstream::base::BumpPool* p
                                                     VkDevice boxed_device,
                                                     VkShaderModule shaderModule,
                                                     const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyShaderModule(pool, apiCallHandle, boxed_device, shaderModule, nullptr);
+    mImpl->on_vkDestroyShaderModule(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), shaderModule, nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreatePipelineCache(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice boxed_device,
     const VkPipelineCacheCreateInfo* pCreateInfo, const VkAllocationCallbacks*,
     VkPipelineCache* pPipelineCache) {
-    return mImpl->on_vkCreatePipelineCache(pool, apiCallHandle, boxed_device, pCreateInfo, nullptr,
+    return mImpl->on_vkCreatePipelineCache(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), pCreateInfo, nullptr,
                                            pPipelineCache);
 }
 
@@ -12990,14 +14494,14 @@ void VkDecoderGlobalState::on_vkDestroyPipelineCache(gfxstream::base::BumpPool* 
                                                      VkDevice boxed_device,
                                                      VkPipelineCache pipelineCache,
                                                      const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyPipelineCache(pool, apiCallHandle, boxed_device, pipelineCache, nullptr);
+    mImpl->on_vkDestroyPipelineCache(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), pipelineCache, nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreatePipelineLayout(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice boxed_device,
     const VkPipelineLayoutCreateInfo* pCreateInfo, const VkAllocationCallbacks*,
     VkPipelineLayout* pPipelineLayout) {
-    return mImpl->on_vkCreatePipelineLayout(pool, apiCallHandle, boxed_device, pCreateInfo, nullptr,
+    return mImpl->on_vkCreatePipelineLayout(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), pCreateInfo, nullptr,
                                             pPipelineLayout);
 }
 
@@ -13006,7 +14510,7 @@ void VkDecoderGlobalState::on_vkDestroyPipelineLayout(gfxstream::base::BumpPool*
                                                       VkDevice boxed_device,
                                                       VkPipelineLayout pipelineLayout,
                                                       const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyPipelineLayout(pool, apiCallHandle, boxed_device, pipelineLayout, nullptr);
+    mImpl->on_vkDestroyPipelineLayout(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), pipelineLayout, nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreateGraphicsPipelines(
@@ -13014,7 +14518,7 @@ VkResult VkDecoderGlobalState::on_vkCreateGraphicsPipelines(
     VkPipelineCache pipelineCache, uint32_t createInfoCount,
     const VkGraphicsPipelineCreateInfo* pCreateInfos, const VkAllocationCallbacks*,
     VkPipeline* pPipelines) {
-    return mImpl->on_vkCreateGraphicsPipelines(pool, apiCallHandle, boxed_device, pipelineCache,
+    return mImpl->on_vkCreateGraphicsPipelines(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), pipelineCache,
                                                createInfoCount, pCreateInfos, nullptr, pPipelines);
 }
 
@@ -13023,7 +14527,7 @@ VkResult VkDecoderGlobalState::on_vkCreateComputePipelines(
     VkPipelineCache pipelineCache, uint32_t createInfoCount,
     const VkComputePipelineCreateInfo* pCreateInfos, const VkAllocationCallbacks*,
     VkPipeline* pPipelines) {
-    return mImpl->on_vkCreateComputePipelines(pool, apiCallHandle, boxed_device, pipelineCache,
+    return mImpl->on_vkCreateComputePipelines(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), pipelineCache,
                                               createInfoCount, pCreateInfos, nullptr, pPipelines);
 }
 
@@ -13031,7 +14535,7 @@ void VkDecoderGlobalState::on_vkDestroyPipeline(gfxstream::base::BumpPool* pool,
                                                 VkSnapshotApiCallHandle apiCallHandle,
                                                 VkDevice boxed_device, VkPipeline pipeline,
                                                 const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyPipeline(pool, apiCallHandle, boxed_device, pipeline, nullptr);
+    mImpl->on_vkDestroyPipeline(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), pipeline, nullptr);
 }
 
 void VkDecoderGlobalState::on_vkCmdCopyBufferToImage(
@@ -13039,7 +14543,7 @@ void VkDecoderGlobalState::on_vkCmdCopyBufferToImage(
     VkCommandBuffer commandBuffer, VkBuffer srcBuffer, VkImage dstImage,
     VkImageLayout dstImageLayout, uint32_t regionCount, const VkBufferImageCopy* pRegions,
     const VkDecoderContext& context) {
-    mImpl->on_vkCmdCopyBufferToImage(pool, apiCallHandle, commandBuffer, srcBuffer, dstImage,
+    mImpl->on_vkCmdCopyBufferToImage(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), srcBuffer, dstImage,
                                      dstImageLayout, regionCount, pRegions, context);
 }
 
@@ -13049,7 +14553,7 @@ void VkDecoderGlobalState::on_vkCmdCopyImage(gfxstream::base::BumpPool* pool,
                                              VkImageLayout srcImageLayout, VkImage dstImage,
                                              VkImageLayout dstImageLayout, uint32_t regionCount,
                                              const VkImageCopy* pRegions) {
-    mImpl->on_vkCmdCopyImage(pool, apiCallHandle, commandBuffer, srcImage, srcImageLayout, dstImage,
+    mImpl->on_vkCmdCopyImage(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), srcImage, srcImageLayout, dstImage,
                              dstImageLayout, regionCount, pRegions);
 }
 void VkDecoderGlobalState::on_vkCmdCopyImageToBuffer(gfxstream::base::BumpPool* pool,
@@ -13058,7 +14562,7 @@ void VkDecoderGlobalState::on_vkCmdCopyImageToBuffer(gfxstream::base::BumpPool* 
                                                      VkImage srcImage, VkImageLayout srcImageLayout,
                                                      VkBuffer dstBuffer, uint32_t regionCount,
                                                      const VkBufferImageCopy* pRegions) {
-    mImpl->on_vkCmdCopyImageToBuffer(pool, apiCallHandle, commandBuffer, srcImage, srcImageLayout,
+    mImpl->on_vkCmdCopyImageToBuffer(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), srcImage, srcImageLayout,
                                      dstBuffer, regionCount, pRegions);
 }
 
@@ -13066,7 +14570,7 @@ void VkDecoderGlobalState::on_vkCmdCopyBufferToImage2(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkCommandBuffer commandBuffer, const VkCopyBufferToImageInfo2* pCopyBufferToImageInfo,
     const VkDecoderContext& context) {
-    mImpl->on_vkCmdCopyBufferToImage2(pool, apiCallHandle, commandBuffer, pCopyBufferToImageInfo,
+    mImpl->on_vkCmdCopyBufferToImage2(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), pCopyBufferToImageInfo,
                                       context);
 }
 
@@ -13074,20 +14578,20 @@ void VkDecoderGlobalState::on_vkCmdCopyImage2(gfxstream::base::BumpPool* pool,
                                               VkSnapshotApiCallHandle apiCallHandle,
                                               VkCommandBuffer commandBuffer,
                                               const VkCopyImageInfo2* pCopyImageInfo) {
-    mImpl->on_vkCmdCopyImage2(pool, apiCallHandle, commandBuffer, pCopyImageInfo);
+    mImpl->on_vkCmdCopyImage2(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), pCopyImageInfo);
 }
 
 void VkDecoderGlobalState::on_vkCmdCopyImageToBuffer2(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkCommandBuffer commandBuffer, const VkCopyImageToBufferInfo2* pCopyImageToBufferInfo) {
-    mImpl->on_vkCmdCopyImageToBuffer2(pool, apiCallHandle, commandBuffer, pCopyImageToBufferInfo);
+    mImpl->on_vkCmdCopyImageToBuffer2(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), pCopyImageToBufferInfo);
 }
 
 void VkDecoderGlobalState::on_vkCmdCopyBufferToImage2KHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkCommandBuffer commandBuffer, const VkCopyBufferToImageInfo2KHR* pCopyBufferToImageInfo,
     const VkDecoderContext& context) {
-    mImpl->on_vkCmdCopyBufferToImage2KHR(pool, apiCallHandle, commandBuffer, pCopyBufferToImageInfo,
+    mImpl->on_vkCmdCopyBufferToImage2KHR(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), pCopyBufferToImageInfo,
                                          context);
 }
 
@@ -13095,58 +14599,135 @@ void VkDecoderGlobalState::on_vkCmdCopyImage2KHR(gfxstream::base::BumpPool* pool
                                                  VkSnapshotApiCallHandle apiCallHandle,
                                                  VkCommandBuffer commandBuffer,
                                                  const VkCopyImageInfo2KHR* pCopyImageInfo) {
-    mImpl->on_vkCmdCopyImage2KHR(pool, apiCallHandle, commandBuffer, pCopyImageInfo);
+    mImpl->on_vkCmdCopyImage2KHR(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), pCopyImageInfo);
 }
 
 void VkDecoderGlobalState::on_vkCmdCopyImageToBuffer2KHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkCommandBuffer commandBuffer, const VkCopyImageToBufferInfo2KHR* pCopyImageToBufferInfo) {
-    mImpl->on_vkCmdCopyImageToBuffer2KHR(pool, apiCallHandle, commandBuffer, pCopyImageToBufferInfo);
+    mImpl->on_vkCmdCopyImageToBuffer2KHR(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), pCopyImageToBufferInfo);
 }
 
 void VkDecoderGlobalState::on_vkGetImageSubresourceLayout(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     VkImage image, const VkImageSubresource* pSubresource, VkSubresourceLayout* pLayout) {
-    mImpl->on_vkGetImageSubresourceLayout(pool, apiCallHandle, device, image, pSubresource,
+    mImpl->on_vkGetImageSubresourceLayout(pool, apiCallHandle, Boxed<VkDevice>(device), image, pSubresource,
                                           pLayout);
+}
+
+void VkDecoderGlobalState::on_vkGetImageSubresourceLayout2(
+    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+    VkImage image, const VkImageSubresource2* pSubresource, VkSubresourceLayout2* pLayout) {
+    mImpl->on_vkGetImageSubresourceLayout2(pool, apiCallHandle, Boxed<VkDevice>(device), image,
+                                           pSubresource, pLayout);
+}
+
+void VkDecoderGlobalState::on_vkGetImageSubresourceLayout2KHR(
+    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+    VkImage image, const VkImageSubresource2* pSubresource, VkSubresourceLayout2* pLayout) {
+    mImpl->on_vkGetImageSubresourceLayout2(pool, apiCallHandle, Boxed<VkDevice>(device), image,
+                                           pSubresource, pLayout);
+}
+
+void VkDecoderGlobalState::on_vkGetImageSubresourceLayout2EXT(
+    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+    VkImage image, const VkImageSubresource2* pSubresource, VkSubresourceLayout2* pLayout) {
+    mImpl->on_vkGetImageSubresourceLayout2(pool, apiCallHandle, Boxed<VkDevice>(device), image,
+                                           pSubresource, pLayout);
+}
+
+VkResult VkDecoderGlobalState::on_vkCopyMemoryToImage(
+    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+    const VkCopyMemoryToImageInfo* pCopyMemoryToImageInfo) {
+    return mImpl->on_vkCopyMemoryToImage(pool, apiCallHandle, Boxed<VkDevice>(device),
+                                         pCopyMemoryToImageInfo);
+}
+
+VkResult VkDecoderGlobalState::on_vkCopyMemoryToImageEXT(
+    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+    const VkCopyMemoryToImageInfo* pCopyMemoryToImageInfo) {
+    return mImpl->on_vkCopyMemoryToImageEXT(pool, apiCallHandle, Boxed<VkDevice>(device),
+                                            pCopyMemoryToImageInfo);
+}
+
+VkResult VkDecoderGlobalState::on_vkCopyImageToMemory(
+    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+    const VkCopyImageToMemoryInfo* pCopyImageToMemoryInfo) {
+    return mImpl->on_vkCopyImageToMemory(pool, apiCallHandle, Boxed<VkDevice>(device),
+                                         pCopyImageToMemoryInfo);
+}
+
+VkResult VkDecoderGlobalState::on_vkCopyImageToMemoryEXT(
+    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+    const VkCopyImageToMemoryInfo* pCopyImageToMemoryInfo) {
+    return mImpl->on_vkCopyImageToMemoryEXT(pool, apiCallHandle, Boxed<VkDevice>(device),
+                                            pCopyImageToMemoryInfo);
+}
+
+VkResult VkDecoderGlobalState::on_vkCopyImageToImage(
+    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+    const VkCopyImageToImageInfo* pCopyImageToImageInfo) {
+    return mImpl->on_vkCopyImageToImage(pool, apiCallHandle, Boxed<VkDevice>(device),
+                                        pCopyImageToImageInfo);
+}
+
+VkResult VkDecoderGlobalState::on_vkCopyImageToImageEXT(
+    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+    const VkCopyImageToImageInfo* pCopyImageToImageInfo) {
+    return mImpl->on_vkCopyImageToImageEXT(pool, apiCallHandle, Boxed<VkDevice>(device),
+                                           pCopyImageToImageInfo);
+}
+
+VkResult VkDecoderGlobalState::on_vkTransitionImageLayout(
+    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+    uint32_t transitionCount, const VkHostImageLayoutTransitionInfo* pTransitions) {
+    return mImpl->on_vkTransitionImageLayout(pool, apiCallHandle, Boxed<VkDevice>(device),
+                                             transitionCount, pTransitions);
+}
+
+VkResult VkDecoderGlobalState::on_vkTransitionImageLayoutEXT(
+    gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+    uint32_t transitionCount, const VkHostImageLayoutTransitionInfo* pTransitions) {
+    return mImpl->on_vkTransitionImageLayoutEXT(pool, apiCallHandle, Boxed<VkDevice>(device),
+                                                transitionCount, pTransitions);
 }
 
 void VkDecoderGlobalState::on_vkGetImageMemoryRequirements(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     VkImage image, VkMemoryRequirements* pMemoryRequirements) {
-    mImpl->on_vkGetImageMemoryRequirements(pool, apiCallHandle, device, image, pMemoryRequirements);
+    mImpl->on_vkGetImageMemoryRequirements(pool, apiCallHandle, Boxed<VkDevice>(device), image, pMemoryRequirements);
 }
 
 void VkDecoderGlobalState::on_vkGetImageMemoryRequirements2(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkImageMemoryRequirementsInfo2* pInfo, VkMemoryRequirements2* pMemoryRequirements) {
-    mImpl->on_vkGetImageMemoryRequirements2(pool, apiCallHandle, device, pInfo, pMemoryRequirements);
+    mImpl->on_vkGetImageMemoryRequirements2(pool, apiCallHandle, Boxed<VkDevice>(device), pInfo, pMemoryRequirements);
 }
 
 void VkDecoderGlobalState::on_vkGetImageMemoryRequirements2KHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkImageMemoryRequirementsInfo2* pInfo, VkMemoryRequirements2* pMemoryRequirements) {
-    mImpl->on_vkGetImageMemoryRequirements2(pool, apiCallHandle, device, pInfo, pMemoryRequirements);
+    mImpl->on_vkGetImageMemoryRequirements2(pool, apiCallHandle, Boxed<VkDevice>(device), pInfo, pMemoryRequirements);
 }
 
 void VkDecoderGlobalState::on_vkGetBufferMemoryRequirements(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     VkBuffer buffer, VkMemoryRequirements* pMemoryRequirements) {
-    mImpl->on_vkGetBufferMemoryRequirements(pool, apiCallHandle, device, buffer,
+    mImpl->on_vkGetBufferMemoryRequirements(pool, apiCallHandle, Boxed<VkDevice>(device), buffer,
                                             pMemoryRequirements);
 }
 
 void VkDecoderGlobalState::on_vkGetBufferMemoryRequirements2(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkBufferMemoryRequirementsInfo2* pInfo, VkMemoryRequirements2* pMemoryRequirements) {
-    mImpl->on_vkGetBufferMemoryRequirements2(pool, apiCallHandle, device, pInfo,
+    mImpl->on_vkGetBufferMemoryRequirements2(pool, apiCallHandle, Boxed<VkDevice>(device), pInfo,
                                              pMemoryRequirements);
 }
 
 void VkDecoderGlobalState::on_vkGetBufferMemoryRequirements2KHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkBufferMemoryRequirementsInfo2* pInfo, VkMemoryRequirements2* pMemoryRequirements) {
-    mImpl->on_vkGetBufferMemoryRequirements2(pool, apiCallHandle, device, pInfo,
+    mImpl->on_vkGetBufferMemoryRequirements2(pool, apiCallHandle, Boxed<VkDevice>(device), pInfo,
                                              pMemoryRequirements);
 }
 
@@ -13157,7 +14738,7 @@ void VkDecoderGlobalState::on_vkCmdPipelineBarrier(
     uint32_t memoryBarrierCount, const VkMemoryBarrier* pMemoryBarriers,
     uint32_t bufferMemoryBarrierCount, const VkBufferMemoryBarrier* pBufferMemoryBarriers,
     uint32_t imageMemoryBarrierCount, const VkImageMemoryBarrier* pImageMemoryBarriers) {
-    mImpl->on_vkCmdPipelineBarrier(pool, apiCallHandle, commandBuffer, srcStageMask, dstStageMask,
+    mImpl->on_vkCmdPipelineBarrier(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), srcStageMask, dstStageMask,
                                    dependencyFlags, memoryBarrierCount, pMemoryBarriers,
                                    bufferMemoryBarrierCount, pBufferMemoryBarriers,
                                    imageMemoryBarrierCount, pImageMemoryBarriers);
@@ -13167,14 +14748,15 @@ void VkDecoderGlobalState::on_vkCmdPipelineBarrier2(gfxstream::base::BumpPool* p
                                                     VkSnapshotApiCallHandle apiCallHandle,
                                                     VkCommandBuffer commandBuffer,
                                                     const VkDependencyInfo* pDependencyInfo) {
-    mImpl->on_vkCmdPipelineBarrier2(pool, apiCallHandle, commandBuffer, pDependencyInfo);
+    mImpl->on_vkCmdPipelineBarrier2(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), pDependencyInfo);
 }
 
 void VkDecoderGlobalState::on_vkCmdPipelineBarrier2KHR(gfxstream::base::BumpPool* pool,
                                                        VkSnapshotApiCallHandle apiCallHandle,
                                                        VkCommandBuffer commandBuffer,
                                                        const VkDependencyInfo* pDependencyInfo) {
-    mImpl->on_vkCmdPipelineBarrier2(pool, apiCallHandle, commandBuffer, pDependencyInfo);
+    mImpl->on_vkCmdPipelineBarrier2(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer),
+                                    pDependencyInfo);
 }
 
 void VkDecoderGlobalState::on_vkCmdWaitEvents(
@@ -13184,7 +14766,7 @@ void VkDecoderGlobalState::on_vkCmdWaitEvents(
     uint32_t memoryBarrierCount, const VkMemoryBarrier* pMemoryBarriers,
     uint32_t bufferMemoryBarrierCount, const VkBufferMemoryBarrier* pBufferMemoryBarriers,
     uint32_t imageMemoryBarrierCount, const VkImageMemoryBarrier* pImageMemoryBarriers) {
-    mImpl->on_vkCmdWaitEvents(pool, apiCallHandle, commandBuffer, eventCount, pEvents, srcStageMask,
+    mImpl->on_vkCmdWaitEvents(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), eventCount, pEvents, srcStageMask,
                               dstStageMask, memoryBarrierCount, pMemoryBarriers,
                               bufferMemoryBarrierCount, pBufferMemoryBarriers,
                               imageMemoryBarrierCount, pImageMemoryBarriers);
@@ -13195,7 +14777,7 @@ void VkDecoderGlobalState::on_vkCmdWaitEvents2(gfxstream::base::BumpPool* pool,
                                                VkCommandBuffer commandBuffer, uint32_t eventCount,
                                                const VkEvent* pEvents,
                                                const VkDependencyInfo* pDependencyInfos) {
-    mImpl->on_vkCmdWaitEvents2(pool, apiCallHandle, commandBuffer, eventCount, pEvents,
+    mImpl->on_vkCmdWaitEvents2(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), eventCount, pEvents,
                                pDependencyInfos);
 }
 
@@ -13204,7 +14786,7 @@ void VkDecoderGlobalState::on_vkCmdWaitEvents2KHR(gfxstream::base::BumpPool* poo
                                                   VkCommandBuffer commandBuffer,
                                                   uint32_t eventCount, const VkEvent* pEvents,
                                                   const VkDependencyInfo* pDependencyInfos) {
-    mImpl->on_vkCmdWaitEvents2KHR(pool, apiCallHandle, commandBuffer, eventCount, pEvents,
+    mImpl->on_vkCmdWaitEvents2KHR(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), eventCount, pEvents,
                                   pDependencyInfos);
 }
 
@@ -13214,13 +14796,13 @@ VkResult VkDecoderGlobalState::on_vkAllocateMemory(gfxstream::base::BumpPool* po
                                                    const VkMemoryAllocateInfo* pAllocateInfo,
                                                    const VkAllocationCallbacks*,
                                                    VkDeviceMemory* pMemory) {
-    return mImpl->on_vkAllocateMemory(pool, apiCallHandle, device, pAllocateInfo, nullptr, pMemory);
+    return mImpl->on_vkAllocateMemory(pool, apiCallHandle, Boxed<VkDevice>(device), pAllocateInfo, nullptr, pMemory);
 }
 
 void VkDecoderGlobalState::on_vkFreeMemory(gfxstream::base::BumpPool* pool,
                                            VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
                                            VkDeviceMemory memory, const VkAllocationCallbacks*) {
-    mImpl->on_vkFreeMemory(pool, apiCallHandle, device, memory, nullptr);
+    mImpl->on_vkFreeMemory(pool, apiCallHandle, Boxed<VkDevice>(device), memory, nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkMapMemory(gfxstream::base::BumpPool* pool,
@@ -13228,7 +14810,7 @@ VkResult VkDecoderGlobalState::on_vkMapMemory(gfxstream::base::BumpPool* pool,
                                               VkDeviceMemory memory, VkDeviceSize offset,
                                               VkDeviceSize size, VkMemoryMapFlags flags,
                                               void** ppData) {
-    return mImpl->on_vkMapMemory(pool, apiCallHandle, device, memory, offset, size, flags, ppData);
+    return mImpl->on_vkMapMemory(pool, apiCallHandle, Boxed<VkDevice>(device), memory, offset, size, flags, ppData);
 }
 
 VkResult VkDecoderGlobalState::on_vkMapMemory2(gfxstream::base::BumpPool* pool,
@@ -13236,7 +14818,8 @@ VkResult VkDecoderGlobalState::on_vkMapMemory2(gfxstream::base::BumpPool* pool,
                                                VkDevice device,
                                                const VkMemoryMapInfo* pMemoryMapInfo,
                                                void** ppData) {
-    return mImpl->on_vkMapMemory2(pool, apiCallHandle, device, pMemoryMapInfo, ppData);
+    return mImpl->on_vkMapMemory2(pool, apiCallHandle, Boxed<VkDevice>(device), pMemoryMapInfo,
+                                  ppData);
 }
 
 VkResult VkDecoderGlobalState::on_vkMapMemory2KHR(gfxstream::base::BumpPool* pool,
@@ -13244,27 +14827,28 @@ VkResult VkDecoderGlobalState::on_vkMapMemory2KHR(gfxstream::base::BumpPool* poo
                                                   VkDevice device,
                                                   const VkMemoryMapInfo* pMemoryMapInfo,
                                                   void** ppData) {
-    return mImpl->on_vkMapMemory2(pool, apiCallHandle, device, pMemoryMapInfo, ppData);
+    return mImpl->on_vkMapMemory2(pool, apiCallHandle, Boxed<VkDevice>(device), pMemoryMapInfo,
+                                  ppData);
 }
 
 void VkDecoderGlobalState::on_vkUnmapMemory(gfxstream::base::BumpPool* pool,
                                             VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
                                             VkDeviceMemory memory) {
-    mImpl->on_vkUnmapMemory(pool, apiCallHandle, device, memory);
+    mImpl->on_vkUnmapMemory(pool, apiCallHandle, Boxed<VkDevice>(device), memory);
 }
 
 VkResult VkDecoderGlobalState::on_vkUnmapMemory2(gfxstream::base::BumpPool* pool,
                                                  VkSnapshotApiCallHandle apiCallHandle,
                                                  VkDevice device,
                                                  const VkMemoryUnmapInfo* pMemoryUnmapInfo) {
-    return mImpl->on_vkUnmapMemory2(pool, apiCallHandle, device, pMemoryUnmapInfo);
+    return mImpl->on_vkUnmapMemory2(pool, apiCallHandle, Boxed<VkDevice>(device), pMemoryUnmapInfo);
 }
 
 VkResult VkDecoderGlobalState::on_vkUnmapMemory2KHR(gfxstream::base::BumpPool* pool,
                                                     VkSnapshotApiCallHandle apiCallHandle,
                                                     VkDevice device,
                                                     const VkMemoryUnmapInfo* pMemoryUnmapInfo) {
-    return mImpl->on_vkUnmapMemory2(pool, apiCallHandle, device, pMemoryUnmapInfo);
+    return mImpl->on_vkUnmapMemory2(pool, apiCallHandle, Boxed<VkDevice>(device), pMemoryUnmapInfo);
 }
 
 uint8_t* VkDecoderGlobalState::getMappedHostPointer(VkDeviceMemory memory) {
@@ -13285,7 +14869,7 @@ VkDecoderGlobalState::HostFeatureSupport VkDecoderGlobalState::getHostFeatureSup
 VkResult VkDecoderGlobalState::on_vkGetSwapchainGrallocUsageANDROID(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     VkFormat format, VkImageUsageFlags imageUsage, int* grallocUsage) {
-    return mImpl->on_vkGetSwapchainGrallocUsageANDROID(pool, apiCallHandle, device, format,
+    return mImpl->on_vkGetSwapchainGrallocUsageANDROID(pool, apiCallHandle, Boxed<VkDevice>(device), format,
                                                        imageUsage, grallocUsage);
 }
 
@@ -13294,7 +14878,7 @@ VkResult VkDecoderGlobalState::on_vkGetSwapchainGrallocUsage2ANDROID(
     VkFormat format, VkImageUsageFlags imageUsage,
     VkSwapchainImageUsageFlagsANDROID swapchainImageUsage, uint64_t* grallocConsumerUsage,
     uint64_t* grallocProducerUsage) {
-    return mImpl->on_vkGetSwapchainGrallocUsage2ANDROID(pool, apiCallHandle, device, format,
+    return mImpl->on_vkGetSwapchainGrallocUsage2ANDROID(pool, apiCallHandle, Boxed<VkDevice>(device), format,
                                                         imageUsage, swapchainImageUsage,
                                                         grallocConsumerUsage, grallocProducerUsage);
 }
@@ -13304,7 +14888,7 @@ VkResult VkDecoderGlobalState::on_vkAcquireImageANDROID(gfxstream::base::BumpPoo
                                                         VkDevice device, VkImage image,
                                                         int nativeFenceFd, VkSemaphore semaphore,
                                                         VkFence fence) {
-    return mImpl->on_vkAcquireImageANDROID(pool, apiCallHandle, device, image, nativeFenceFd,
+    return mImpl->on_vkAcquireImageANDROID(pool, apiCallHandle, Boxed<VkDevice>(device), image, nativeFenceFd,
                                            semaphore, fence);
 }
 
@@ -13312,7 +14896,7 @@ VkResult VkDecoderGlobalState::on_vkQueueSignalReleaseImageANDROID(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkQueue queue,
     uint32_t waitSemaphoreCount, const VkSemaphore* pWaitSemaphores, VkImage image,
     int* pNativeFenceFd) {
-    return mImpl->on_vkQueueSignalReleaseImageANDROID(pool, apiCallHandle, queue, waitSemaphoreCount,
+    return mImpl->on_vkQueueSignalReleaseImageANDROID(pool, apiCallHandle, Boxed<VkQueue>(queue), waitSemaphoreCount,
                                                       pWaitSemaphores, image, pNativeFenceFd);
 }
 
@@ -13320,34 +14904,34 @@ VkResult VkDecoderGlobalState::on_vkQueueSignalReleaseImageANDROID(
 VkResult VkDecoderGlobalState::on_vkMapMemoryIntoAddressSpaceGOOGLE(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     VkDeviceMemory memory, uint64_t* pAddress) {
-    return mImpl->on_vkMapMemoryIntoAddressSpaceGOOGLE(pool, apiCallHandle, device, memory,
+    return mImpl->on_vkMapMemoryIntoAddressSpaceGOOGLE(pool, apiCallHandle, Boxed<VkDevice>(device), memory,
                                                        pAddress);
 }
 
 VkResult VkDecoderGlobalState::on_vkGetMemoryHostAddressInfoGOOGLE(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     VkDeviceMemory memory, uint64_t* pAddress, uint64_t* pSize, uint64_t* pHostmemId) {
-    return mImpl->on_vkGetMemoryHostAddressInfoGOOGLE(pool, apiCallHandle, device, memory, pAddress,
+    return mImpl->on_vkGetMemoryHostAddressInfoGOOGLE(pool, apiCallHandle, Boxed<VkDevice>(device), memory, pAddress,
                                                       pSize, pHostmemId);
 }
 
 VkResult VkDecoderGlobalState::on_vkGetBlobGOOGLE(gfxstream::base::BumpPool* pool,
                                                   VkSnapshotApiCallHandle apiCallHandle,
                                                   VkDevice device, VkDeviceMemory memory) {
-    return mImpl->on_vkGetBlobGOOGLE(pool, apiCallHandle, device, memory);
+    return mImpl->on_vkGetBlobGOOGLE(pool, apiCallHandle, Boxed<VkDevice>(device), memory);
 }
 
 VkResult VkDecoderGlobalState::on_vkFreeMemorySyncGOOGLE(gfxstream::base::BumpPool* pool,
                                                          VkSnapshotApiCallHandle apiCallHandle,
                                                          VkDevice device, VkDeviceMemory memory,
                                                          const VkAllocationCallbacks*) {
-    return mImpl->on_vkFreeMemorySyncGOOGLE(pool, apiCallHandle, device, memory, nullptr);
+    return mImpl->on_vkFreeMemorySyncGOOGLE(pool, apiCallHandle, Boxed<VkDevice>(device), memory, nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkAllocateCommandBuffers(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkCommandBufferAllocateInfo* pAllocateInfo, VkCommandBuffer* pCommandBuffers) {
-    return mImpl->on_vkAllocateCommandBuffers(pool, apiCallHandle, device, pAllocateInfo,
+    return mImpl->on_vkAllocateCommandBuffers(pool, apiCallHandle, Boxed<VkDevice>(device), pAllocateInfo,
                                               pCommandBuffers);
 }
 
@@ -13357,7 +14941,7 @@ VkResult VkDecoderGlobalState::on_vkCreateCommandPool(gfxstream::base::BumpPool*
                                                       const VkCommandPoolCreateInfo* pCreateInfo,
                                                       const VkAllocationCallbacks*,
                                                       VkCommandPool* pCommandPool) {
-    return mImpl->on_vkCreateCommandPool(pool, apiCallHandle, device, pCreateInfo, nullptr,
+    return mImpl->on_vkCreateCommandPool(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo, nullptr,
                                          pCommandPool);
 }
 
@@ -13365,14 +14949,14 @@ void VkDecoderGlobalState::on_vkDestroyCommandPool(gfxstream::base::BumpPool* po
                                                    VkSnapshotApiCallHandle apiCallHandle,
                                                    VkDevice device, VkCommandPool commandPool,
                                                    const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyCommandPool(pool, apiCallHandle, device, commandPool, nullptr);
+    mImpl->on_vkDestroyCommandPool(pool, apiCallHandle, Boxed<VkDevice>(device), commandPool, nullptr);
 }
 
 VkResult VkDecoderGlobalState::on_vkResetCommandPool(gfxstream::base::BumpPool* pool,
                                                      VkSnapshotApiCallHandle apiCallHandle,
                                                      VkDevice device, VkCommandPool commandPool,
                                                      VkCommandPoolResetFlags flags) {
-    return mImpl->on_vkResetCommandPool(pool, apiCallHandle, device, commandPool, flags);
+    return mImpl->on_vkResetCommandPool(pool, apiCallHandle, Boxed<VkDevice>(device), commandPool, flags);
 }
 
 void VkDecoderGlobalState::on_vkCmdExecuteCommands(gfxstream::base::BumpPool* pool,
@@ -13380,7 +14964,7 @@ void VkDecoderGlobalState::on_vkCmdExecuteCommands(gfxstream::base::BumpPool* po
                                                    VkCommandBuffer commandBuffer,
                                                    uint32_t commandBufferCount,
                                                    const VkCommandBuffer* pCommandBuffers) {
-    return mImpl->on_vkCmdExecuteCommands(pool, apiCallHandle, commandBuffer, commandBufferCount,
+    return mImpl->on_vkCmdExecuteCommands(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), commandBufferCount,
                                           pCommandBuffers);
 }
 
@@ -13388,34 +14972,35 @@ VkResult VkDecoderGlobalState::on_vkQueueSubmit(gfxstream::base::BumpPool* pool,
                                                 VkSnapshotApiCallHandle apiCallHandle, VkQueue queue,
                                                 uint32_t submitCount, const VkSubmitInfo* pSubmits,
                                                 VkFence fence) {
-    return mImpl->on_vkQueueSubmit(pool, apiCallHandle, queue, submitCount, pSubmits, fence);
+    return mImpl->on_vkQueueSubmit(pool, apiCallHandle, Boxed<VkQueue>(queue), submitCount, pSubmits, fence);
 }
 
 VkResult VkDecoderGlobalState::on_vkQueueSubmit2(gfxstream::base::BumpPool* pool,
                                                  VkSnapshotApiCallHandle apiCallHandle, VkQueue queue,
                                                  uint32_t submitCount,
                                                  const VkSubmitInfo2* pSubmits, VkFence fence) {
-    return mImpl->on_vkQueueSubmit(pool, apiCallHandle, queue, submitCount, pSubmits, fence);
+    return mImpl->on_vkQueueSubmit(pool, apiCallHandle, Boxed<VkQueue>(queue), submitCount, pSubmits, fence);
 }
 
 VkResult VkDecoderGlobalState::on_vkQueueSubmit2KHR(gfxstream::base::BumpPool* pool,
                                                     VkSnapshotApiCallHandle apiCallHandle,
                                                     VkQueue queue, uint32_t submitCount,
                                                     const VkSubmitInfo2* pSubmits, VkFence fence) {
-    return mImpl->on_vkQueueSubmit(pool, apiCallHandle, queue, submitCount, pSubmits, fence);
+    return mImpl->on_vkQueueSubmit(pool, apiCallHandle, Boxed<VkQueue>(queue), submitCount,
+                                   pSubmits, fence);
 }
 
 VkResult VkDecoderGlobalState::on_vkQueueWaitIdle(gfxstream::base::BumpPool* pool,
                                                   VkSnapshotApiCallHandle apiCallHandle,
                                                   VkQueue queue) {
-    return mImpl->on_vkQueueWaitIdle(pool, apiCallHandle, queue);
+    return mImpl->on_vkQueueWaitIdle(pool, apiCallHandle, Boxed<VkQueue>(queue));
 }
 
 VkResult VkDecoderGlobalState::on_vkResetCommandBuffer(gfxstream::base::BumpPool* pool,
                                                        VkSnapshotApiCallHandle apiCallHandle,
                                                        VkCommandBuffer commandBuffer,
                                                        VkCommandBufferResetFlags flags) {
-    return mImpl->on_vkResetCommandBuffer(pool, apiCallHandle, commandBuffer, flags);
+    return mImpl->on_vkResetCommandBuffer(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), flags);
 }
 
 void VkDecoderGlobalState::on_vkFreeCommandBuffers(gfxstream::base::BumpPool* pool,
@@ -13423,7 +15008,7 @@ void VkDecoderGlobalState::on_vkFreeCommandBuffers(gfxstream::base::BumpPool* po
                                                    VkDevice device, VkCommandPool commandPool,
                                                    uint32_t commandBufferCount,
                                                    const VkCommandBuffer* pCommandBuffers) {
-    return mImpl->on_vkFreeCommandBuffers(pool, apiCallHandle, device, commandPool,
+    return mImpl->on_vkFreeCommandBuffers(pool, apiCallHandle, Boxed<VkDevice>(device), commandPool,
                                           commandBufferCount, pCommandBuffers);
 }
 
@@ -13433,7 +15018,7 @@ void VkDecoderGlobalState::on_vkGetPhysicalDeviceExternalSemaphoreProperties(
     const VkPhysicalDeviceExternalSemaphoreInfo* pExternalSemaphoreInfo,
     VkExternalSemaphoreProperties* pExternalSemaphoreProperties) {
     return mImpl->on_vkGetPhysicalDeviceExternalSemaphoreProperties(
-        pool, apiCallHandle, physicalDevice, pExternalSemaphoreInfo, pExternalSemaphoreProperties);
+        pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pExternalSemaphoreInfo, pExternalSemaphoreProperties);
 }
 
 void VkDecoderGlobalState::on_vkGetPhysicalDeviceExternalSemaphorePropertiesKHR(
@@ -13442,7 +15027,7 @@ void VkDecoderGlobalState::on_vkGetPhysicalDeviceExternalSemaphorePropertiesKHR(
     const VkPhysicalDeviceExternalSemaphoreInfo* pExternalSemaphoreInfo,
     VkExternalSemaphoreProperties* pExternalSemaphoreProperties) {
     return mImpl->on_vkGetPhysicalDeviceExternalSemaphoreProperties(
-        pool, apiCallHandle, physicalDevice, pExternalSemaphoreInfo, pExternalSemaphoreProperties);
+        pool, apiCallHandle, Boxed<VkPhysicalDevice>(physicalDevice), pExternalSemaphoreInfo, pExternalSemaphoreProperties);
 }
 
 // Descriptor update templates
@@ -13451,7 +15036,7 @@ VkResult VkDecoderGlobalState::on_vkCreateDescriptorUpdateTemplate(
     const VkDescriptorUpdateTemplateCreateInfo* pCreateInfo, const VkAllocationCallbacks*,
     VkDescriptorUpdateTemplate* pDescriptorUpdateTemplate) {
     return mImpl->on_vkCreateDescriptorUpdateTemplate(
-        pool, apiCallHandle, boxed_device, pCreateInfo, nullptr, pDescriptorUpdateTemplate);
+        pool, apiCallHandle, Boxed<VkDevice>(boxed_device), pCreateInfo, nullptr, pDescriptorUpdateTemplate);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreateDescriptorUpdateTemplateKHR(
@@ -13459,20 +15044,20 @@ VkResult VkDecoderGlobalState::on_vkCreateDescriptorUpdateTemplateKHR(
     const VkDescriptorUpdateTemplateCreateInfo* pCreateInfo, const VkAllocationCallbacks*,
     VkDescriptorUpdateTemplate* pDescriptorUpdateTemplate) {
     return mImpl->on_vkCreateDescriptorUpdateTemplateKHR(
-        pool, apiCallHandle, boxed_device, pCreateInfo, nullptr, pDescriptorUpdateTemplate);
+        pool, apiCallHandle, Boxed<VkDevice>(boxed_device), pCreateInfo, nullptr, pDescriptorUpdateTemplate);
 }
 
 void VkDecoderGlobalState::on_vkDestroyDescriptorUpdateTemplate(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice boxed_device,
     VkDescriptorUpdateTemplate descriptorUpdateTemplate, const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyDescriptorUpdateTemplate(pool, apiCallHandle, boxed_device,
+    mImpl->on_vkDestroyDescriptorUpdateTemplate(pool, apiCallHandle, Boxed<VkDevice>(boxed_device),
                                                 descriptorUpdateTemplate, nullptr);
 }
 
 void VkDecoderGlobalState::on_vkDestroyDescriptorUpdateTemplateKHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice boxed_device,
     VkDescriptorUpdateTemplate descriptorUpdateTemplate, const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyDescriptorUpdateTemplateKHR(pool, apiCallHandle, boxed_device,
+    mImpl->on_vkDestroyDescriptorUpdateTemplateKHR(pool, apiCallHandle, Boxed<VkDevice>(boxed_device),
                                                    descriptorUpdateTemplate, nullptr);
 }
 
@@ -13484,7 +15069,7 @@ void VkDecoderGlobalState::on_vkUpdateDescriptorSetWithTemplateSizedGOOGLE(
     const uint32_t* pBufferViewEntryIndices, const VkDescriptorImageInfo* pImageInfos,
     const VkDescriptorBufferInfo* pBufferInfos, const VkBufferView* pBufferViews) {
     mImpl->on_vkUpdateDescriptorSetWithTemplateSizedGOOGLE(
-        pool, apiCallHandle, boxed_device, descriptorSet, descriptorUpdateTemplate, imageInfoCount,
+        pool, apiCallHandle, Boxed<VkDevice>(boxed_device), descriptorSet, descriptorUpdateTemplate, imageInfoCount,
         bufferInfoCount, bufferViewCount, pImageInfoEntryIndices, pBufferInfoEntryIndices,
         pBufferViewEntryIndices, pImageInfos, pBufferInfos, pBufferViews);
 }
@@ -13498,7 +15083,7 @@ void VkDecoderGlobalState::on_vkUpdateDescriptorSetWithTemplateSized2GOOGLE(
     const VkDescriptorImageInfo* pImageInfos, const VkDescriptorBufferInfo* pBufferInfos,
     const VkBufferView* pBufferViews, const uint8_t* pInlineUniformBlockData) {
     mImpl->on_vkUpdateDescriptorSetWithTemplateSized2GOOGLE(
-        pool, apiCallHandle, boxed_device, descriptorSet, descriptorUpdateTemplate, imageInfoCount,
+        pool, apiCallHandle, Boxed<VkDevice>(boxed_device), descriptorSet, descriptorUpdateTemplate, imageInfoCount,
         bufferInfoCount, bufferViewCount, inlineUniformBlockCount, pImageInfoEntryIndices,
         pBufferInfoEntryIndices, pBufferViewEntryIndices, pImageInfos, pBufferInfos, pBufferViews,
         pInlineUniformBlockData);
@@ -13509,35 +15094,35 @@ VkResult VkDecoderGlobalState::on_vkBeginCommandBuffer(gfxstream::base::BumpPool
                                                        VkCommandBuffer commandBuffer,
                                                        const VkCommandBufferBeginInfo* pBeginInfo,
                                                        const VkDecoderContext& context) {
-    return mImpl->on_vkBeginCommandBuffer(pool, apiCallHandle, commandBuffer, pBeginInfo, context);
+    return mImpl->on_vkBeginCommandBuffer(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), pBeginInfo, context);
 }
 
 void VkDecoderGlobalState::on_vkBeginCommandBufferAsyncGOOGLE(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* pBeginInfo,
     const VkDecoderContext& context) {
-    mImpl->on_vkBeginCommandBuffer(pool, apiCallHandle, commandBuffer, pBeginInfo, context);
+    mImpl->on_vkBeginCommandBuffer(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), pBeginInfo, context);
 }
 
 VkResult VkDecoderGlobalState::on_vkEndCommandBuffer(gfxstream::base::BumpPool* pool,
                                                      VkSnapshotApiCallHandle apiCallHandle,
                                                      VkCommandBuffer commandBuffer,
                                                      const VkDecoderContext& context) {
-    return mImpl->on_vkEndCommandBuffer(pool, apiCallHandle, commandBuffer, context);
+    return mImpl->on_vkEndCommandBuffer(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), context);
 }
 
 void VkDecoderGlobalState::on_vkEndCommandBufferAsyncGOOGLE(gfxstream::base::BumpPool* pool,
                                                             VkSnapshotApiCallHandle apiCallHandle,
                                                             VkCommandBuffer commandBuffer,
                                                             const VkDecoderContext& context) {
-    mImpl->on_vkEndCommandBufferAsyncGOOGLE(pool, apiCallHandle, commandBuffer, context);
+    mImpl->on_vkEndCommandBufferAsyncGOOGLE(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), context);
 }
 
 void VkDecoderGlobalState::on_vkResetCommandBufferAsyncGOOGLE(gfxstream::base::BumpPool* pool,
                                                               VkSnapshotApiCallHandle apiCallHandle,
                                                               VkCommandBuffer commandBuffer,
                                                               VkCommandBufferResetFlags flags) {
-    mImpl->on_vkResetCommandBufferAsyncGOOGLE(pool, apiCallHandle, commandBuffer, flags);
+    mImpl->on_vkResetCommandBufferAsyncGOOGLE(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), flags);
 }
 
 void VkDecoderGlobalState::on_vkCommandBufferHostSyncGOOGLE(gfxstream::base::BumpPool* pool,
@@ -13545,14 +15130,14 @@ void VkDecoderGlobalState::on_vkCommandBufferHostSyncGOOGLE(gfxstream::base::Bum
                                                             VkCommandBuffer commandBuffer,
                                                             uint32_t needHostSync,
                                                             uint32_t sequenceNumber) {
-    mImpl->hostSyncCommandBuffer("hostSync", commandBuffer, needHostSync, sequenceNumber);
+    mImpl->hostSyncCommandBuffer("hostSync", Boxed<VkCommandBuffer>(commandBuffer), needHostSync, sequenceNumber);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreateImageWithRequirementsGOOGLE(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkImageCreateInfo* pCreateInfo, const VkAllocationCallbacks*, VkImage* pImage,
     VkMemoryRequirements* pMemoryRequirements) {
-    return mImpl->on_vkCreateImageWithRequirementsGOOGLE(pool, apiCallHandle, device, pCreateInfo,
+    return mImpl->on_vkCreateImageWithRequirementsGOOGLE(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo,
                                                          nullptr, pImage, pMemoryRequirements);
 }
 
@@ -13560,7 +15145,7 @@ VkResult VkDecoderGlobalState::on_vkCreateBufferWithRequirementsGOOGLE(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkBufferCreateInfo* pCreateInfo, const VkAllocationCallbacks*, VkBuffer* pBuffer,
     VkMemoryRequirements* pMemoryRequirements) {
-    return mImpl->on_vkCreateBufferWithRequirementsGOOGLE(pool, apiCallHandle, device, pCreateInfo,
+    return mImpl->on_vkCreateBufferWithRequirementsGOOGLE(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo,
                                                           nullptr, pBuffer, pMemoryRequirements);
 }
 
@@ -13568,14 +15153,14 @@ void VkDecoderGlobalState::on_vkCmdSetEvent(gfxstream::base::BumpPool* pool,
                                             VkSnapshotApiCallHandle apiCallHandle,
                                             VkCommandBuffer commandBuffer, VkEvent event,
                                             VkPipelineStageFlags stageMask) {
-    mImpl->on_vkCmdSetEvent(pool, apiCallHandle, commandBuffer, event, stageMask);
+    mImpl->on_vkCmdSetEvent(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), event, stageMask);
 }
 
 void VkDecoderGlobalState::on_vkCmdResetEvent(gfxstream::base::BumpPool* pool,
                                               VkSnapshotApiCallHandle apiCallHandle,
                                               VkCommandBuffer commandBuffer, VkEvent event,
                                               VkPipelineStageFlags stageMask) {
-    mImpl->on_vkCmdResetEvent(pool, apiCallHandle, commandBuffer, event, stageMask);
+    mImpl->on_vkCmdResetEvent(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), event, stageMask);
 }
 
 void VkDecoderGlobalState::on_vkCmdBindPipeline(gfxstream::base::BumpPool* pool,
@@ -13583,7 +15168,7 @@ void VkDecoderGlobalState::on_vkCmdBindPipeline(gfxstream::base::BumpPool* pool,
                                                 VkCommandBuffer commandBuffer,
                                                 VkPipelineBindPoint pipelineBindPoint,
                                                 VkPipeline pipeline) {
-    mImpl->on_vkCmdBindPipeline(pool, apiCallHandle, commandBuffer, pipelineBindPoint, pipeline);
+    mImpl->on_vkCmdBindPipeline(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), pipelineBindPoint, pipeline);
 }
 
 void VkDecoderGlobalState::on_vkCmdBindDescriptorSets(
@@ -13591,7 +15176,7 @@ void VkDecoderGlobalState::on_vkCmdBindDescriptorSets(
     VkCommandBuffer commandBuffer, VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout,
     uint32_t firstSet, uint32_t descriptorSetCount, const VkDescriptorSet* pDescriptorSets,
     uint32_t dynamicOffsetCount, const uint32_t* pDynamicOffsets) {
-    mImpl->on_vkCmdBindDescriptorSets(pool, apiCallHandle, commandBuffer, pipelineBindPoint, layout,
+    mImpl->on_vkCmdBindDescriptorSets(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), pipelineBindPoint, layout,
                                       firstSet, descriptorSetCount, pDescriptorSets,
                                       dynamicOffsetCount, pDynamicOffsets);
 }
@@ -13602,7 +15187,7 @@ VkResult VkDecoderGlobalState::on_vkCreateRenderPass(gfxstream::base::BumpPool* 
                                                      const VkRenderPassCreateInfo* pCreateInfo,
                                                      const VkAllocationCallbacks*,
                                                      VkRenderPass* pRenderPass) {
-    return mImpl->on_vkCreateRenderPass(pool, apiCallHandle, boxed_device, pCreateInfo, nullptr,
+    return mImpl->on_vkCreateRenderPass(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), pCreateInfo, nullptr,
                                         pRenderPass);
 }
 
@@ -13612,7 +15197,7 @@ VkResult VkDecoderGlobalState::on_vkCreateRenderPass2(gfxstream::base::BumpPool*
                                                       const VkRenderPassCreateInfo2* pCreateInfo,
                                                       const VkAllocationCallbacks*,
                                                       VkRenderPass* pRenderPass) {
-    return mImpl->on_vkCreateRenderPass2(pool, apiCallHandle, boxed_device, pCreateInfo, nullptr,
+    return mImpl->on_vkCreateRenderPass2(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), pCreateInfo, nullptr,
                                          pRenderPass);
 }
 
@@ -13620,7 +15205,7 @@ VkResult VkDecoderGlobalState::on_vkCreateRenderPass2KHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice boxed_device,
     const VkRenderPassCreateInfo2KHR* pCreateInfo, const VkAllocationCallbacks*,
     VkRenderPass* pRenderPass) {
-    return mImpl->on_vkCreateRenderPass2(pool, apiCallHandle, boxed_device, pCreateInfo, nullptr,
+    return mImpl->on_vkCreateRenderPass2(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), pCreateInfo, nullptr,
                                          pRenderPass);
 }
 
@@ -13628,7 +15213,7 @@ void VkDecoderGlobalState::on_vkDestroyRenderPass(gfxstream::base::BumpPool* poo
                                                   VkSnapshotApiCallHandle apiCallHandle,
                                                   VkDevice boxed_device, VkRenderPass renderPass,
                                                   const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyRenderPass(pool, apiCallHandle, boxed_device, renderPass, nullptr);
+    mImpl->on_vkDestroyRenderPass(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), renderPass, nullptr);
 }
 
 void VkDecoderGlobalState::on_vkCmdBeginRenderPass(gfxstream::base::BumpPool* pool,
@@ -13636,7 +15221,7 @@ void VkDecoderGlobalState::on_vkCmdBeginRenderPass(gfxstream::base::BumpPool* po
                                                    VkCommandBuffer commandBuffer,
                                                    const VkRenderPassBeginInfo* pRenderPassBegin,
                                                    VkSubpassContents contents) {
-    return mImpl->on_vkCmdBeginRenderPass(pool, apiCallHandle, commandBuffer, pRenderPassBegin,
+    return mImpl->on_vkCmdBeginRenderPass(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), pRenderPassBegin,
                                           contents);
 }
 
@@ -13645,7 +15230,7 @@ void VkDecoderGlobalState::on_vkCmdBeginRenderPass2(gfxstream::base::BumpPool* p
                                                     VkCommandBuffer commandBuffer,
                                                     const VkRenderPassBeginInfo* pRenderPassBegin,
                                                     const VkSubpassBeginInfo* pSubpassBeginInfo) {
-    return mImpl->on_vkCmdBeginRenderPass2(pool, apiCallHandle, commandBuffer, pRenderPassBegin,
+    return mImpl->on_vkCmdBeginRenderPass2(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), pRenderPassBegin,
                                            pSubpassBeginInfo);
 }
 
@@ -13653,8 +15238,24 @@ void VkDecoderGlobalState::on_vkCmdBeginRenderPass2KHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin,
     const VkSubpassBeginInfo* pSubpassBeginInfo) {
-    return mImpl->on_vkCmdBeginRenderPass2(pool, apiCallHandle, commandBuffer, pRenderPassBegin,
+    return mImpl->on_vkCmdBeginRenderPass2(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), pRenderPassBegin,
                                            pSubpassBeginInfo);
+}
+
+void VkDecoderGlobalState::on_vkCmdBeginRendering(gfxstream::base::BumpPool* pool,
+                                                  VkSnapshotApiCallHandle apiCallHandle,
+                                                  VkCommandBuffer commandBuffer,
+                                                  const VkRenderingInfo* pRenderingInfo) {
+    mImpl->on_vkCmdBeginRendering(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer),
+                                  pRenderingInfo);
+}
+
+void VkDecoderGlobalState::on_vkCmdBeginRenderingKHR(gfxstream::base::BumpPool* pool,
+                                                     VkSnapshotApiCallHandle apiCallHandle,
+                                                     VkCommandBuffer commandBuffer,
+                                                     const VkRenderingInfo* pRenderingInfo) {
+    mImpl->on_vkCmdBeginRenderingKHR(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer),
+                                     pRenderingInfo);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreateFramebuffer(gfxstream::base::BumpPool* pool,
@@ -13663,20 +15264,20 @@ VkResult VkDecoderGlobalState::on_vkCreateFramebuffer(gfxstream::base::BumpPool*
                                                       const VkFramebufferCreateInfo* pCreateInfo,
                                                       const VkAllocationCallbacks*,
                                                       VkFramebuffer* pFramebuffer) {
-    return mImpl->on_vkCreateFramebuffer(pool, apiCallHandle, boxed_device, pCreateInfo, nullptr,
+    return mImpl->on_vkCreateFramebuffer(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), pCreateInfo, nullptr,
                                          pFramebuffer);
 }
 
 VkResult VkDecoderGlobalState::on_vkSetEvent(gfxstream::base::BumpPool* pool,
                                              VkSnapshotApiCallHandle apiCallHandle,
                                              VkDevice boxed_device, VkEvent event) {
-    return mImpl->on_vkSetEvent(pool, apiCallHandle, boxed_device, event);
+    return mImpl->on_vkSetEvent(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), event);
 }
 
 VkResult VkDecoderGlobalState::on_vkResetEvent(gfxstream::base::BumpPool* pool,
                                                VkSnapshotApiCallHandle apiCallHandle,
                                                VkDevice boxed_device, VkEvent event) {
-    return mImpl->on_vkResetEvent(pool, apiCallHandle, boxed_device, event);
+    return mImpl->on_vkResetEvent(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), event);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreateEvent(gfxstream::base::BumpPool* pool,
@@ -13684,35 +15285,35 @@ VkResult VkDecoderGlobalState::on_vkCreateEvent(gfxstream::base::BumpPool* pool,
                                                 VkDevice boxed_device,
                                                 const VkEventCreateInfo* pCreateInfo,
                                                 const VkAllocationCallbacks*, VkEvent* pEvent) {
-    return mImpl->on_vkCreateEvent(pool, apiCallHandle, boxed_device, pCreateInfo, nullptr, pEvent);
+    return mImpl->on_vkCreateEvent(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), pCreateInfo, nullptr, pEvent);
 }
 
 void VkDecoderGlobalState::on_vkDestroyFramebuffer(gfxstream::base::BumpPool* pool,
                                                    VkSnapshotApiCallHandle apiCallHandle,
                                                    VkDevice boxed_device, VkFramebuffer framebuffer,
                                                    const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyFramebuffer(pool, apiCallHandle, boxed_device, framebuffer, nullptr);
+    mImpl->on_vkDestroyFramebuffer(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), framebuffer, nullptr);
 }
 
 void VkDecoderGlobalState::on_vkDestroyEvent(gfxstream::base::BumpPool* pool,
                                              VkSnapshotApiCallHandle apiCallHandle,
                                              VkDevice boxed_device, VkEvent event,
                                              const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroyEvent(pool, apiCallHandle, boxed_device, event, nullptr);
+    mImpl->on_vkDestroyEvent(pool, apiCallHandle, Boxed<VkDevice>(boxed_device), event, nullptr);
 }
 
 void VkDecoderGlobalState::on_vkQueueHostSyncGOOGLE(gfxstream::base::BumpPool* pool,
                                                     VkSnapshotApiCallHandle apiCallHandle,
                                                     VkQueue queue, uint32_t needHostSync,
                                                     uint32_t sequenceNumber) {
-    mImpl->hostSyncQueue("hostSyncQueue", queue, needHostSync, sequenceNumber);
+    mImpl->hostSyncQueue("hostSyncQueue", Boxed<VkQueue>(queue), needHostSync, sequenceNumber);
 }
 
 void VkDecoderGlobalState::on_vkCmdCopyQueryPoolResults(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle,
     VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount,
     VkBuffer dstBuffer, VkDeviceSize dstOffset, VkDeviceSize stride, VkQueryResultFlags flags) {
-    mImpl->on_vkCmdCopyQueryPoolResults(pool, apiCallHandle, commandBuffer, queryPool, firstQuery,
+    mImpl->on_vkCmdCopyQueryPoolResults(pool, apiCallHandle, Boxed<VkCommandBuffer>(commandBuffer), queryPool, firstQuery,
                                         queryCount, dstBuffer, dstOffset, stride, flags);
 }
 
@@ -13721,7 +15322,7 @@ void VkDecoderGlobalState::on_vkQueueSubmitAsyncGOOGLE(gfxstream::base::BumpPool
                                                        VkQueue queue, uint32_t submitCount,
                                                        const VkSubmitInfo* pSubmits,
                                                        VkFence fence) {
-    mImpl->on_vkQueueSubmit(pool, apiCallHandle, queue, submitCount, pSubmits, fence);
+    mImpl->on_vkQueueSubmit(pool, apiCallHandle, Boxed<VkQueue>(queue), submitCount, pSubmits, fence);
 }
 
 void VkDecoderGlobalState::on_vkQueueSubmitAsync2GOOGLE(gfxstream::base::BumpPool* pool,
@@ -13729,13 +15330,13 @@ void VkDecoderGlobalState::on_vkQueueSubmitAsync2GOOGLE(gfxstream::base::BumpPoo
                                                         VkQueue queue, uint32_t submitCount,
                                                         const VkSubmitInfo2* pSubmits,
                                                         VkFence fence) {
-    mImpl->on_vkQueueSubmit(pool, apiCallHandle, queue, submitCount, pSubmits, fence);
+    mImpl->on_vkQueueSubmit(pool, apiCallHandle, Boxed<VkQueue>(queue), submitCount, pSubmits, fence);
 }
 
 void VkDecoderGlobalState::on_vkQueueWaitIdleAsyncGOOGLE(gfxstream::base::BumpPool* pool,
                                                          VkSnapshotApiCallHandle apiCallHandle,
                                                          VkQueue queue) {
-    mImpl->on_vkQueueWaitIdle(pool, apiCallHandle, queue);
+    mImpl->on_vkQueueWaitIdle(pool, apiCallHandle, Boxed<VkQueue>(queue));
 }
 
 void VkDecoderGlobalState::on_vkQueueBindSparseAsyncGOOGLE(gfxstream::base::BumpPool* pool,
@@ -13744,7 +15345,7 @@ void VkDecoderGlobalState::on_vkQueueBindSparseAsyncGOOGLE(gfxstream::base::Bump
                                                            const VkBindSparseInfo* pBindInfo,
                                                            VkFence fence) {
     VkResult res =
-        mImpl->on_vkQueueBindSparse(pool, apiCallHandle, queue, bindInfoCount, pBindInfo, fence);
+        mImpl->on_vkQueueBindSparse(pool, apiCallHandle, Boxed<VkQueue>(queue), bindInfoCount, pBindInfo, fence);
     if (res != VK_SUCCESS) {
         // Report an error here as we don't use the result after this call
         GFXSTREAM_ERROR("vkQueueBindSparse failed with: %s [%d], bindInfoCount=%d, fence=%p",
@@ -13757,14 +15358,14 @@ void VkDecoderGlobalState::on_vkGetLinearImageLayoutGOOGLE(gfxstream::base::Bump
                                                            VkDevice device, VkFormat format,
                                                            VkDeviceSize* pOffset,
                                                            VkDeviceSize* pRowPitchAlignment) {
-    mImpl->on_vkGetLinearImageLayoutGOOGLE(pool, apiCallHandle, device, format, pOffset,
+    mImpl->on_vkGetLinearImageLayoutGOOGLE(pool, apiCallHandle, Boxed<VkDevice>(device), format, pOffset,
                                            pRowPitchAlignment);
 }
 
 void VkDecoderGlobalState::on_vkGetLinearImageLayout2GOOGLE(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkImageCreateInfo* pCreateInfo, VkDeviceSize* pOffset, VkDeviceSize* pRowPitchAlignment) {
-    mImpl->on_vkGetLinearImageLayout2GOOGLE(pool, apiCallHandle, device, pCreateInfo, pOffset,
+    mImpl->on_vkGetLinearImageLayout2GOOGLE(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo, pOffset,
                                             pRowPitchAlignment);
 }
 
@@ -13774,7 +15375,7 @@ void VkDecoderGlobalState::on_vkQueueFlushCommandsGOOGLE(gfxstream::base::BumpPo
                                                          VkCommandBuffer commandBuffer,
                                                          VkDeviceSize dataSize, const void* pData,
                                                          const VkDecoderContext& context) {
-    mImpl->on_vkQueueFlushCommandsGOOGLE(pool, apiCallHandle, queue, commandBuffer, dataSize, pData,
+    mImpl->on_vkQueueFlushCommandsGOOGLE(pool, apiCallHandle, Boxed<VkQueue>(queue), Boxed<VkCommandBuffer>(commandBuffer), dataSize, pData,
                                          context);
 }
 
@@ -13782,7 +15383,7 @@ void VkDecoderGlobalState::on_vkQueueFlushCommandsFromAuxMemoryGOOGLE(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkQueue queue,
     VkCommandBuffer commandBuffer, VkDeviceMemory deviceMemory, VkDeviceSize dataOffset,
     VkDeviceSize dataSize, const VkDecoderContext& context) {
-    mImpl->on_vkQueueFlushCommandsFromAuxMemoryGOOGLE(pool, apiCallHandle, queue, commandBuffer,
+    mImpl->on_vkQueueFlushCommandsFromAuxMemoryGOOGLE(pool, apiCallHandle, Boxed<VkQueue>(queue), commandBuffer,
                                                       deviceMemory, dataOffset, dataSize, context);
 }
 
@@ -13795,7 +15396,7 @@ void VkDecoderGlobalState::on_vkQueueCommitDescriptorSetUpdatesGOOGLE(
     const uint32_t* pDescriptorWriteStartingIndices, uint32_t pendingDescriptorWriteCount,
     const VkWriteDescriptorSet* pPendingDescriptorWrites) {
     mImpl->on_vkQueueCommitDescriptorSetUpdatesGOOGLE(
-        pool, apiCallHandle, queue, descriptorPoolCount, pDescriptorPools, descriptorSetCount,
+        pool, apiCallHandle, Boxed<VkQueue>(queue), descriptorPoolCount, pDescriptorPools, descriptorSetCount,
         pDescriptorSetLayouts, pDescriptorSetPoolIds, pDescriptorSetWhichPool,
         pDescriptorSetPendingAllocation, pDescriptorWriteStartingIndices,
         pendingDescriptorWriteCount, pPendingDescriptorWrites);
@@ -13804,7 +15405,7 @@ void VkDecoderGlobalState::on_vkQueueCommitDescriptorSetUpdatesGOOGLE(
 void VkDecoderGlobalState::on_vkCollectDescriptorPoolIdsGOOGLE(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     VkDescriptorPool descriptorPool, uint32_t* pPoolIdCount, uint64_t* pPoolIds) {
-    mImpl->on_vkCollectDescriptorPoolIdsGOOGLE(pool, apiCallHandle, device, descriptorPool,
+    mImpl->on_vkCollectDescriptorPoolIdsGOOGLE(pool, apiCallHandle, Boxed<VkDevice>(device), descriptorPool,
                                                pPoolIdCount, pPoolIds);
 }
 
@@ -13813,14 +15414,14 @@ VkResult VkDecoderGlobalState::on_vkQueueBindSparse(gfxstream::base::BumpPool* p
                                                     VkQueue queue, uint32_t bindInfoCount,
                                                     const VkBindSparseInfo* pBindInfo,
                                                     VkFence fence) {
-    return mImpl->on_vkQueueBindSparse(pool, apiCallHandle, queue, bindInfoCount, pBindInfo, fence);
+    return mImpl->on_vkQueueBindSparse(pool, apiCallHandle, Boxed<VkQueue>(queue), bindInfoCount, pBindInfo, fence);
 }
 
 void VkDecoderGlobalState::on_vkQueueSignalReleaseImageANDROIDAsyncGOOGLE(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkQueue queue,
     uint32_t waitSemaphoreCount, const VkSemaphore* pWaitSemaphores, VkImage image) {
     int fenceFd;
-    mImpl->on_vkQueueSignalReleaseImageANDROID(pool, apiCallHandle, queue, waitSemaphoreCount,
+    mImpl->on_vkQueueSignalReleaseImageANDROID(pool, apiCallHandle, Boxed<VkQueue>(queue), waitSemaphoreCount,
                                                pWaitSemaphores, image, &fenceFd);
 }
 
@@ -13839,7 +15440,7 @@ VkResult VkDecoderGlobalState::on_vkCreateSamplerYcbcrConversion(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkSamplerYcbcrConversionCreateInfo* pCreateInfo, const VkAllocationCallbacks*,
     VkSamplerYcbcrConversion* pYcbcrConversion) {
-    return mImpl->on_vkCreateSamplerYcbcrConversion(pool, apiCallHandle, device, pCreateInfo,
+    return mImpl->on_vkCreateSamplerYcbcrConversion(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo,
                                                     nullptr, pYcbcrConversion);
 }
 
@@ -13847,21 +15448,21 @@ VkResult VkDecoderGlobalState::on_vkCreateSamplerYcbcrConversionKHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkSamplerYcbcrConversionCreateInfo* pCreateInfo, const VkAllocationCallbacks*,
     VkSamplerYcbcrConversion* pYcbcrConversion) {
-    return mImpl->on_vkCreateSamplerYcbcrConversion(pool, apiCallHandle, device, pCreateInfo,
+    return mImpl->on_vkCreateSamplerYcbcrConversion(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo,
                                                     nullptr, pYcbcrConversion);
 }
 
 void VkDecoderGlobalState::on_vkDestroySamplerYcbcrConversion(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     VkSamplerYcbcrConversion ycbcrConversion, const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroySamplerYcbcrConversion(pool, apiCallHandle, device, ycbcrConversion,
+    mImpl->on_vkDestroySamplerYcbcrConversion(pool, apiCallHandle, Boxed<VkDevice>(device), ycbcrConversion,
                                               nullptr);
 }
 
 void VkDecoderGlobalState::on_vkDestroySamplerYcbcrConversionKHR(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     VkSamplerYcbcrConversion ycbcrConversion, const VkAllocationCallbacks*) {
-    mImpl->on_vkDestroySamplerYcbcrConversion(pool, apiCallHandle, device, ycbcrConversion,
+    mImpl->on_vkDestroySamplerYcbcrConversion(pool, apiCallHandle, Boxed<VkDevice>(device), ycbcrConversion,
                                               nullptr);
 }
 
@@ -13870,7 +15471,7 @@ VkResult VkDecoderGlobalState::on_vkEnumeratePhysicalDeviceGroups(
     uint32_t* pPhysicalDeviceGroupCount,
     VkPhysicalDeviceGroupProperties* pPhysicalDeviceGroupProperties) {
     return mImpl->on_vkEnumeratePhysicalDeviceGroups(
-        pool, apiCallHandle, instance, pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
+        pool, apiCallHandle, Boxed<VkInstance>(instance), pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
 }
 
 VkResult VkDecoderGlobalState::on_vkEnumeratePhysicalDeviceGroupsKHR(
@@ -13878,14 +15479,14 @@ VkResult VkDecoderGlobalState::on_vkEnumeratePhysicalDeviceGroupsKHR(
     uint32_t* pPhysicalDeviceGroupCount,
     VkPhysicalDeviceGroupProperties* pPhysicalDeviceGroupProperties) {
     return mImpl->on_vkEnumeratePhysicalDeviceGroups(
-        pool, apiCallHandle, instance, pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
+        pool, apiCallHandle, Boxed<VkInstance>(instance), pPhysicalDeviceGroupCount, pPhysicalDeviceGroupProperties);
 }
 
 VkResult VkDecoderGlobalState::on_vkCreatePrivateDataSlotEXT(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkPrivateDataSlotCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator,
     VkPrivateDataSlot* pPrivateDataSlot) {
-    return mImpl->on_vkCreatePrivateDataSlotEXT(pool, apiCallHandle, device, pCreateInfo,
+    return mImpl->on_vkCreatePrivateDataSlotEXT(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo,
                                                 pAllocator, pPrivateDataSlot);
 }
 
@@ -13894,7 +15495,7 @@ void VkDecoderGlobalState::on_vkDestroyPrivateDataSlotEXT(gfxstream::base::BumpP
                                                           VkDevice device,
                                                           VkPrivateDataSlot privateDataSlot,
                                                           const VkAllocationCallbacks* pAllocator) {
-    mImpl->on_vkDestroyPrivateDataSlotEXT(pool, apiCallHandle, device, privateDataSlot, pAllocator);
+    mImpl->on_vkDestroyPrivateDataSlotEXT(pool, apiCallHandle, Boxed<VkDevice>(device), privateDataSlot, pAllocator);
 }
 
 void VkDecoderGlobalState::on_vkGetPrivateDataEXT(gfxstream::base::BumpPool* pool,
@@ -13903,7 +15504,7 @@ void VkDecoderGlobalState::on_vkGetPrivateDataEXT(gfxstream::base::BumpPool* poo
                                                   uint64_t objectHandle,
                                                   VkPrivateDataSlot privateDataSlot,
                                                   uint64_t* pData) {
-    mImpl->on_vkGetPrivateDataEXT(pool, apiCallHandle, device, objectType, objectHandle,
+    mImpl->on_vkGetPrivateDataEXT(pool, apiCallHandle, Boxed<VkDevice>(device), objectType, objectHandle,
                                   privateDataSlot, pData);
 }
 
@@ -13913,7 +15514,7 @@ VkResult VkDecoderGlobalState::on_vkSetPrivateDataEXT(gfxstream::base::BumpPool*
                                                       uint64_t objectHandle,
                                                       VkPrivateDataSlot privateDataSlot,
                                                       uint64_t data) {
-    return mImpl->on_vkSetPrivateDataEXT(pool, apiCallHandle, device, objectType, objectHandle,
+    return mImpl->on_vkSetPrivateDataEXT(pool, apiCallHandle, Boxed<VkDevice>(device), objectType, objectHandle,
                                          privateDataSlot, data);
 }
 
@@ -13921,7 +15522,7 @@ VkResult VkDecoderGlobalState::on_vkCreatePrivateDataSlot(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkPrivateDataSlotCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator,
     VkPrivateDataSlot* pPrivateDataSlot) {
-    return mImpl->on_vkCreatePrivateDataSlot(pool, apiCallHandle, device, pCreateInfo, pAllocator,
+    return mImpl->on_vkCreatePrivateDataSlot(pool, apiCallHandle, Boxed<VkDevice>(device), pCreateInfo, pAllocator,
                                              pPrivateDataSlot);
 }
 
@@ -13930,7 +15531,7 @@ void VkDecoderGlobalState::on_vkDestroyPrivateDataSlot(gfxstream::base::BumpPool
                                                        VkDevice device,
                                                        VkPrivateDataSlot privateDataSlot,
                                                        const VkAllocationCallbacks* pAllocator) {
-    mImpl->on_vkDestroyPrivateDataSlot(pool, apiCallHandle, device, privateDataSlot, pAllocator);
+    mImpl->on_vkDestroyPrivateDataSlot(pool, apiCallHandle, Boxed<VkDevice>(device), privateDataSlot, pAllocator);
 }
 
 void VkDecoderGlobalState::on_vkGetPrivateData(gfxstream::base::BumpPool* pool,
@@ -13938,7 +15539,7 @@ void VkDecoderGlobalState::on_vkGetPrivateData(gfxstream::base::BumpPool* pool,
                                                VkDevice device, VkObjectType objectType,
                                                uint64_t objectHandle,
                                                VkPrivateDataSlot privateDataSlot, uint64_t* pData) {
-    mImpl->on_vkGetPrivateData(pool, apiCallHandle, device, objectType, objectHandle,
+    mImpl->on_vkGetPrivateData(pool, apiCallHandle, Boxed<VkDevice>(device), objectType, objectHandle,
                                privateDataSlot, pData);
 }
 
@@ -13948,26 +15549,26 @@ VkResult VkDecoderGlobalState::on_vkSetPrivateData(gfxstream::base::BumpPool* po
                                                    uint64_t objectHandle,
                                                    VkPrivateDataSlot privateDataSlot,
                                                    uint64_t data) {
-    return mImpl->on_vkSetPrivateData(pool, apiCallHandle, device, objectType, objectHandle,
+    return mImpl->on_vkSetPrivateData(pool, apiCallHandle, Boxed<VkDevice>(device), objectType, objectHandle,
                                       privateDataSlot, data);
 }
 
 VkResult VkDecoderGlobalState::on_vkSetDebugUtilsObjectNameEXT(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkDebugUtilsObjectNameInfoEXT* pNameInfo) {
-    return mImpl->on_vkSetDebugUtilsObjectNameEXT(pool, apiCallHandle, device, pNameInfo);
+    return mImpl->on_vkSetDebugUtilsObjectNameEXT(pool, apiCallHandle, Boxed<VkDevice>(device), pNameInfo);
 }
 
 VkResult VkDecoderGlobalState::on_vkSetDebugUtilsObjectTagEXT(
     gfxstream::base::BumpPool* pool, VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
     const VkDebugUtilsObjectTagInfoEXT* pTagInfo) {
-    return mImpl->on_vkSetDebugUtilsObjectTagEXT(pool, apiCallHandle, device, pTagInfo);
+    return mImpl->on_vkSetDebugUtilsObjectTagEXT(pool, apiCallHandle, Boxed<VkDevice>(device), pTagInfo);
 }
 
 void VkDecoderGlobalState::on_DeviceLost() { mImpl->on_DeviceLost(); }
 
 VkResult VkDecoderGlobalState::waitForFence(Boxed<VkFence> boxed_fence, uint64_t timeout) {
-    VkFence fence = unbox_VkFence(boxed_fence.value());
+    VkFence fence = unbox_VkFence(boxed_fence);
     return mImpl->waitForFence(fence, timeout);
 }
 

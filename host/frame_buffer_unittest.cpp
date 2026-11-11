@@ -41,11 +41,13 @@
 #include "gfxstream/host/graphics_driver_lock.h"
 #include "common/gles_pointer.h"
 #include "host/gl/gles2_dec/gles2_opcodes.h"
+#undef OP_last
 #include "host/gl/emulated_egl_fence_sync.h"
 #include "host/gl/emulation_gl.h"
 #include "host/gl/yuv_converter.h"
 #include "host/vulkan/trivial_stream.h"
 #include "host/renderControl_dec/renderControl_opcodes.h"
+#undef OP_last
 #include "render_channel_impl.h"
 #include "render_thread_info.h"
 
