@@ -506,6 +506,29 @@ struct VkDecoderGlobalStateTestPeer {
         }
         return count;
     }
+
+    void setGuestVulkanOnly(bool enabled) { impl.mGuestVulkanOnly = enabled; }
+
+    void registerCommandBuffer(VkCommandBuffer unboxedCmdBuf, Boxed<VkCommandBuffer> boxedCmdBuf) {
+        std::lock_guard<std::mutex> lock(impl.mMutex);
+        CommandBufferInfo& cmdInfo = impl.mCommandBufferInfo[unboxedCmdBuf];
+        cmdInfo.boxed = boxedCmdBuf;
+    }
+
+    void cmdBindDescriptorSets(Boxed<VkCommandBuffer> boxedCmdBuf,
+                               VkPipelineBindPoint pipelineBindPoint, VkPipelineLayout layout,
+                               uint32_t firstSet, uint32_t descriptorSetCount,
+                               const VkDescriptorSet* pDescriptorSets, uint32_t dynamicOffsetCount,
+                               const uint32_t* pDynamicOffsets) {
+        impl.on_vkCmdBindDescriptorSets(nullptr, kInvalidSnapshotApiCallHandle, boxedCmdBuf,
+                                        pipelineBindPoint, layout, firstSet, descriptorSetCount,
+                                        pDescriptorSets, dynamicOffsetCount, pDynamicOffsets);
+    }
+
+    CommandBufferInfo commandBufferInfo(VkCommandBuffer unboxedCmdBuf) {
+        std::lock_guard<std::mutex> lock(impl.mMutex);
+        return impl.mCommandBufferInfo.at(unboxedCmdBuf);
+    }
 };
 
 namespace {
@@ -2494,6 +2517,99 @@ TEST_F(VkDecoderGlobalStateSyncFdFenceTest, DeviceDestroyCancelsStepPollingDrive
     EXPECT_EQ(VK_SUCCESS, waitResult.get());
     EXPECT_THAT(destroyedFences(), ::testing::Contains(exportedFence));
     EXPECT_THAT(destroyedDevices(), ::testing::ElementsAre(mUnboxedDev));
+}
+
+TEST(VkDecoderGlobalStateCmdBindDescriptorSetsTest,
+     GuestVulkanOnlySkipsAllDescriptorSetsAndGraphicsTracking) {
+    VkDecoderGlobalStateTestPeer peer;
+    peer.setGuestVulkanOnly(true);
+
+    static int sBindCalls = 0;
+    sBindCalls = 0;
+    VulkanDispatch deviceVk = {};
+    deviceVk.vkCmdBindDescriptorSets = [](VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout,
+                                          uint32_t, uint32_t, const VkDescriptorSet*, uint32_t,
+                                          const uint32_t*) { ++sBindCalls; };
+
+    VkCommandBuffer unboxedCmdBuf = reinterpret_cast<VkCommandBuffer>(0xc001'0000ULL);
+    Boxed<VkCommandBuffer> boxedCmdBuf = new_boxed_VkCommandBuffer(unboxedCmdBuf, &deviceVk);
+    peer.registerCommandBuffer(unboxedCmdBuf, boxedCmdBuf);
+
+    VkPipelineLayout graphicsLayout = reinterpret_cast<VkPipelineLayout>(0xc002'0000ULL);
+    VkPipelineLayout computeLayout = reinterpret_cast<VkPipelineLayout>(0xc003'0000ULL);
+    VkDescriptorSet graphicsSet = reinterpret_cast<VkDescriptorSet>(0xc004'0000ULL);
+    VkDescriptorSet computeSet = reinterpret_cast<VkDescriptorSet>(0xc005'0000ULL);
+    uint32_t dynamicOffset = 64;
+
+    peer.cmdBindDescriptorSets(boxedCmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsLayout,
+                               /*firstSet=*/0, /*descriptorSetCount=*/1, &graphicsSet,
+                               /*dynamicOffsetCount=*/1, &dynamicOffset);
+    EXPECT_EQ(1, sBindCalls);
+    CommandBufferInfo info = peer.commandBufferInfo(unboxedCmdBuf);
+    EXPECT_TRUE(info.allDescriptorSets.empty());
+    EXPECT_EQ(VK_NULL_HANDLE, info.descriptorLayout);
+    EXPECT_TRUE(info.currentDescriptorSets.empty());
+    EXPECT_TRUE(info.dynamicOffsets.empty());
+
+    peer.cmdBindDescriptorSets(boxedCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, computeLayout,
+                               /*firstSet=*/2, /*descriptorSetCount=*/1, &computeSet,
+                               /*dynamicOffsetCount=*/1, &dynamicOffset);
+    EXPECT_EQ(2, sBindCalls);
+    info = peer.commandBufferInfo(unboxedCmdBuf);
+    EXPECT_TRUE(info.allDescriptorSets.empty());
+    EXPECT_EQ(computeLayout, info.descriptorLayout);
+    EXPECT_EQ(2u, info.firstSet);
+    EXPECT_THAT(info.currentDescriptorSets, ::testing::ElementsAre(computeSet));
+    EXPECT_THAT(info.dynamicOffsets, ::testing::ElementsAre(dynamicOffset));
+
+    delete_VkCommandBuffer(boxedCmdBuf);
+}
+
+TEST(VkDecoderGlobalStateCmdBindDescriptorSetsTest,
+     DefaultModeTracksAllDescriptorSetsForGraphicsAndCompute) {
+    VkDecoderGlobalStateTestPeer peer;
+    peer.setGuestVulkanOnly(false);
+
+    static int sBindCalls = 0;
+    sBindCalls = 0;
+    VulkanDispatch deviceVk = {};
+    deviceVk.vkCmdBindDescriptorSets = [](VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout,
+                                          uint32_t, uint32_t, const VkDescriptorSet*, uint32_t,
+                                          const uint32_t*) { ++sBindCalls; };
+
+    VkCommandBuffer unboxedCmdBuf = reinterpret_cast<VkCommandBuffer>(0xc011'0000ULL);
+    Boxed<VkCommandBuffer> boxedCmdBuf = new_boxed_VkCommandBuffer(unboxedCmdBuf, &deviceVk);
+    peer.registerCommandBuffer(unboxedCmdBuf, boxedCmdBuf);
+
+    VkPipelineLayout graphicsLayout = reinterpret_cast<VkPipelineLayout>(0xc012'0000ULL);
+    VkPipelineLayout computeLayout = reinterpret_cast<VkPipelineLayout>(0xc013'0000ULL);
+    VkDescriptorSet graphicsSet = reinterpret_cast<VkDescriptorSet>(0xc014'0000ULL);
+    VkDescriptorSet computeSet = reinterpret_cast<VkDescriptorSet>(0xc015'0000ULL);
+    uint32_t dynamicOffset = 128;
+
+    peer.cmdBindDescriptorSets(boxedCmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsLayout,
+                               /*firstSet=*/1, /*descriptorSetCount=*/1, &graphicsSet,
+                               /*dynamicOffsetCount=*/1, &dynamicOffset);
+    EXPECT_EQ(1, sBindCalls);
+    CommandBufferInfo info = peer.commandBufferInfo(unboxedCmdBuf);
+    EXPECT_THAT(info.allDescriptorSets, ::testing::UnorderedElementsAre(graphicsSet));
+    EXPECT_EQ(VK_NULL_HANDLE, info.descriptorLayout);
+    EXPECT_TRUE(info.currentDescriptorSets.empty());
+    EXPECT_TRUE(info.dynamicOffsets.empty());
+
+    peer.cmdBindDescriptorSets(boxedCmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, computeLayout,
+                               /*firstSet=*/3, /*descriptorSetCount=*/1, &computeSet,
+                               /*dynamicOffsetCount=*/1, &dynamicOffset);
+    EXPECT_EQ(2, sBindCalls);
+    info = peer.commandBufferInfo(unboxedCmdBuf);
+    EXPECT_THAT(info.allDescriptorSets,
+                ::testing::UnorderedElementsAre(graphicsSet, computeSet));
+    EXPECT_EQ(computeLayout, info.descriptorLayout);
+    EXPECT_EQ(3u, info.firstSet);
+    EXPECT_THAT(info.currentDescriptorSets, ::testing::ElementsAre(computeSet));
+    EXPECT_THAT(info.dynamicOffsets, ::testing::ElementsAre(dynamicOffset));
+
+    delete_VkCommandBuffer(boxedCmdBuf);
 }
 
 }  // namespace
