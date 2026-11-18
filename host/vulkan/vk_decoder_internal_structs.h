@@ -22,13 +22,17 @@
 
 #include <stdlib.h>
 
+#include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
+#include <variant>
 
 #include "vk_vvl_configuration.h"
 
@@ -77,11 +81,16 @@ class ExternalFencePool {
         }
     }
 
-    VkFence pop(const VkFenceCreateInfo* pCreateInfo) {
+    // Returns a signaled fence from the pool, skipping fences for which `canReuse` returns false.
+    VkFence pop(const VkFenceCreateInfo* pCreateInfo,
+                const std::function<bool(VkFence)>& canReuse = nullptr) {
         VkFence fence = VK_NULL_HANDLE;
         {
             gfxstream::base::AutoLock lock(mLock);
-            auto it = std::find_if(mPool.begin(), mPool.end(), [this](const VkFence& fence) {
+            auto it = std::find_if(mPool.begin(), mPool.end(), [&](const VkFence& fence) {
+                if (canReuse && !canReuse(fence)) {
+                    return false;
+                }
                 VkResult status = m_vk->vkGetFenceStatus(mDevice, fence);
                 if (status != VK_SUCCESS) {
                     if (status != VK_NOT_READY) {
@@ -149,7 +158,7 @@ struct MemoryInfo {
     uint64_t sizeToPage = 0;
     uint64_t hostmemId = 0;
     VkDevice device = VK_NULL_HANDLE;
-    VkDeviceMemory boxed = VK_NULL_HANDLE;
+    Boxed<VkDeviceMemory> boxed;
     uint32_t memoryIndex = 0;
     // Set if the memory is backed by shared memory.
     std::optional<gfxstream::base::SharedMemory> sharedMemory;
@@ -169,7 +178,7 @@ struct MemoryInfo {
 // to track VkEvent states
 struct EventInfo {
     VkDevice device = VK_NULL_HANDLE;
-    VkEvent boxed = VK_NULL_HANDLE;
+    Boxed<VkEvent> boxed;
     // Tracks the most recently used queue for signaling. From
     // https://registry.khronos.org/vulkan/specs/latest/man/html/VkEvent.html
     //
@@ -178,7 +187,7 @@ struct EventInfo {
     //
     // so snapshot loading must potentially use the same queue.
 
-    VkQueue boxed_queue = VK_NULL_HANDLE;
+    Boxed<VkQueue> boxed_queue;
     bool isSignaled{false};
     bool isFromHost{false};
     VkPipelineStageFlags flags{0};
@@ -187,7 +196,7 @@ struct EventInfo {
 struct InstanceInfo {
     std::vector<std::string> enabledExtensionNames;
     uint32_t apiVersion = VK_MAKE_VERSION(1, 0, 0);
-    VkInstance boxed = nullptr;
+    Boxed<VkInstance> boxed;
     bool isAngle = false;
     std::string applicationName;
     std::string engineName;
@@ -199,7 +208,7 @@ struct InstanceInfo {
     // instance, in enumeration order. Populated on the first
     // vkEnumeratePhysicalDevices call, returned as-is on later calls, and
     // released when the instance is destroyed.
-    std::vector<VkPhysicalDevice> boxedPhysicalDevices;
+    std::vector<Boxed<VkPhysicalDevice>> boxedPhysicalDevices;
 
     bool hasGuestCapability(VkGuestCapabilityFlagBitsGOOGLE capability) const {
         return (guestCapabilities & capability) != 0;
@@ -228,7 +237,7 @@ struct DeviceInfo {
 
     ExternalFenceInfo externalFenceInfo;
     VkPhysicalDevice physicalDevice;
-    VkDevice boxed = nullptr;
+    Boxed<VkDevice> boxed;
     DebugUtilsHelper debugUtilsHelper = DebugUtilsHelper::withUtilsDisabled();
     std::unique_ptr<ExternalFencePool<VulkanDispatch>> externalFencePool = nullptr;
     std::unique_ptr<GpuDecompressionPipelineManager> decompPipelines = nullptr;
@@ -312,7 +321,7 @@ struct QueueInfo {
     std::shared_ptr<PhysicalQueuePendingOps> pendingOps;  // Only used if virtually shared
     VkDevice device;
     uint32_t queueFamilyIndex;
-    VkQueue boxed = nullptr;
+    Boxed<VkQueue> boxed;
     bool usingSharedPhysicalQueue = false;
 
     // In order to create a virtual queue handle, we use an offset to the physical
@@ -327,7 +336,7 @@ struct QueueInfo {
 
 struct BufferInfo {
     VkDevice device;
-    VkBuffer boxed = VK_NULL_HANDLE;
+    Boxed<VkBuffer> boxed;
     VkBufferUsageFlags usage;
     VkDeviceMemory memory = 0;
     VkDeviceSize memoryOffset = 0;
@@ -337,13 +346,13 @@ struct BufferInfo {
 
 struct BufferViewInfo {
     VkDevice device;
-    VkBufferView boxed = VK_NULL_HANDLE;
+    Boxed<VkBufferView> boxed;
     std::shared_ptr<bool> alive{new bool(true)};
 };
 
 struct ImageInfo {
     VkDevice device;
-    VkImage boxed = VK_NULL_HANDLE;
+    Boxed<VkImage> boxed;
     VkImageCreateInfo imageCreateInfoShallow;
     std::unique_ptr<AndroidNativeBufferInfo> anbInfo;
     // Compression info, only valid if texture needs emulated decompression
@@ -352,16 +361,89 @@ struct ImageInfo {
     std::optional<HandleType> boundColorBuffer;
     // TODO: might need to use an array of layouts to represent each sub resource
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize memoryOffset = 0;
     VkDeviceSize memorySize = 0;
+
+    // Android guests allocate AHBs that combine GPU rendering/sampling with
+    // CPU access or scanout:
+    //
+    // * GRALLOC_USAGE_HW_COMPOSER
+    // * GRALLOC_USAGE_HW_RENDER
+    // * GRALLOC_USAGE_HW_TEXTURE
+    // * GRALLOC_USAGE_SW_READ_* / GRALLOC_USAGE_SW_WRITE_*
+    //
+    // In the guest Vulkan driver, these images are created with:
+    //
+    // * VK_IMAGE_TILING_OPTIMAL
+    // * VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
+    // * VK_IMAGE_USAGE_SAMPLED_BIT
+    //
+    // while the backing virtio-gpu resource / ColorBuffer memory is allocated
+    // for host/CPU or display access with:
+    //
+    // * VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+    // * VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+    // * VK_IMAGE_TILING_LINEAR
+    //
+    // Nvidia does not natively support the COLOR_ATTACHMENT usage for images
+    // with HOST_VISIBLE + TILING_LINEAR without VK_NV_linear_color_attachment,
+    // and does not allow binding a TILING_OPTIMAL image to HOST_VISIBLE memory.
+    //
+    // To support this flow, we bind the guest's VK_IMAGE_TILING_OPTIMAL image
+    // (`optimalImage`) to newly allocated device-local `optimalImageMemory`
+    // (VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT), introduce a `linearImage` with
+    // VK_IMAGE_TILING_LINEAR bound to `linearImageMemory` (the guest-supplied
+    // HOST_VISIBLE memory backing the ColorBuffer / virtio-gpu resource), and
+    // insert the appropriate `vkCmdCopyImage()`s during:
+    //
+    //  * vkCmdPipelineBarrier()
+    //  * vkCmdPipelineBarrier2() / vkCmdPipelineBarrier2KHR()
+    //  * vkEndCommandBuffer()
+    //
+    // to sync the contents between `linearImage` (backed by `linearImageMemory`)
+    // and `optimalImage` (backed by `optimalImageMemory`).
+    struct ShadowedImageMemory {
+        // The Gfxstream-created VkImage with VK_IMAGE_TILING_LINEAR for vkCmdCopyImage
+        // transfers which is bound to `linearImageMemory`.
+        VkImage linearImage = VK_NULL_HANDLE;
+
+        // The guest-supplied VkDeviceMemory bound to `linearImage` which is backed
+        // by the underlying ColorBuffer / virtio gpu resource memory.
+        VkDeviceMemory linearImageMemory = VK_NULL_HANDLE;
+
+        // Current layout of `linearImage` (starts as VK_IMAGE_LAYOUT_PREINITIALIZED,
+        // transitioned to VK_IMAGE_LAYOUT_GENERAL after transfer copies).
+        VkImageLayout linearImageLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
+
+        // The guest-created VkImage (VK_IMAGE_TILING_OPTIMAL, key of mImageInfo) used for
+        // rendering and sampling.
+        VkImage optimalImage = VK_NULL_HANDLE;
+
+        // The Gfxstream-created VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT memory bound to
+        // `optimalImage` used for rendering-to and sampling-from.
+        VkDeviceMemory optimalImageMemory = VK_NULL_HANDLE;
+    };
+    struct NormalImageMemory {
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+    };
+    std::variant<std::monostate, NormalImageMemory, ShadowedImageMemory> memoryState;
+
+    VkDeviceMemory getBoundMemory() const {
+        if (const auto* normal = std::get_if<NormalImageMemory>(&memoryState)) {
+            return normal->memory;
+        }
+        if (const auto* shadowed = std::get_if<ShadowedImageMemory>(&memoryState)) {
+            return shadowed->linearImageMemory;
+        }
+        return VK_NULL_HANDLE;
+    }
     // From VkExternalMemoryImageCreateInfo; imageCreateInfoShallow drops pNext.
     VkExternalMemoryHandleTypeFlags externalHandleTypes = 0;
 #ifdef __ANDROID__
     // Set when a driver defers an AHB-external image's layout to vkBindImageMemory and reports
-    // size=0 until then. The AHB is shared_ptr-held so every mImageInfo teardown path frees it.
+    // size=0 or memoryTypeBits=0 until then. Populated from VkEmulation's deferred-layout cache
+    // or a one-time probe AHB stashed in VkEmulation for ColorBuffer adoption.
     struct DeferredLayoutInfo {
-        std::shared_ptr<AHardwareBuffer> ahb;
         VkDeviceSize size = 0;
         VkDeviceSize alignment = 0;
         uint32_t memoryTypeBits = 0;
@@ -375,7 +457,7 @@ struct ImageViewInfo {
     VkDevice device;
     VkImage image = VK_NULL_HANDLE;
     bool needEmulatedAlpha = false;
-    VkImageView boxed = VK_NULL_HANDLE;
+    Boxed<VkImageView> boxed;
 
     // Color buffer, provided via vkAllocateMemory().
     std::optional<HandleType> boundColorBuffer;
@@ -385,7 +467,7 @@ struct ImageViewInfo {
 struct SamplerInfo {
     VkDevice device;
     bool needEmulatedAlpha = false;
-    VkSampler boxed = VK_NULL_HANDLE;
+    Boxed<VkSampler> boxed;
     VkSamplerCreateInfo createInfo = {};
     VkSampler emulatedborderSampler = VK_NULL_HANDLE;
     gfxstream::base::BumpPool pool = gfxstream::base::BumpPool(256);
@@ -410,15 +492,59 @@ struct FenceInfo {
     Boxed<VkFence> boxed;
     VulkanDispatch* vk = nullptr;
 
-    std::mutex mutex;
-    std::condition_variable cv;
-
     enum class State {
         kNotWaitable,   // Newly created or reset
         kWaitable,      // A submission is made, or created as signaled
         kWaiting,       // Fence waitable status is acknowledged
+        kDestroyed,     // Owning device is being destroyed
     };
-    State state = State::kNotWaitable;
+
+    // Shared with waiters, so that they can wait for the fence to become waitable without
+    // holding the global state lock, even if this FenceInfo is erased in the meantime.
+    struct WaitState {
+        mutable std::mutex mutex;
+        std::condition_variable cv;
+        State state = State::kNotWaitable;
+
+        bool isDestroyed() const {
+            std::lock_guard<std::mutex> lock(mutex);
+            return state == State::kDestroyed;
+        }
+
+        // Blocks until `state` leaves `kNotWaitable` (or `startTime + timeoutNs` elapses).
+        // Transitions `kWaitable` to `kWaiting` and returns the observed state, or `kNotWaitable`
+        // on timeout.
+        State waitUntilWaitable(std::chrono::steady_clock::time_point startTime,
+                                uint64_t timeoutNs) {
+            std::unique_lock<std::mutex> lock(mutex);
+            auto isReady = [this] { return state != State::kNotWaitable; };
+            const auto maxTimeout = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::time_point::max() - startTime);
+            if (timeoutNs >= static_cast<uint64_t>(maxTimeout.count())) {
+                cv.wait(lock, isReady);
+            } else if (!cv.wait_until(lock, startTime + std::chrono::nanoseconds(timeoutNs),
+                                      isReady)) {
+                return State::kNotWaitable;
+            }
+            if (state == State::kDestroyed) {
+                return State::kDestroyed;
+            }
+            state = State::kWaiting;
+            return State::kWaiting;
+        }
+    };
+    std::shared_ptr<WaitState> waitState = std::make_shared<WaitState>();
+
+    void setState(State state) {
+        {
+            std::lock_guard<std::mutex> lock(waitState->mutex);
+            if (waitState->state == State::kDestroyed) {
+                return;
+            }
+            waitState->state = state;
+        }
+        waitState->cv.notify_all();
+    }
 
     bool external = false;
 
@@ -430,7 +556,7 @@ struct FenceInfo {
 
 struct SemaphoreInfo {
     VkDevice device;
-    VkSemaphore boxed = VK_NULL_HANDLE;
+    Boxed<VkSemaphore> boxed;
     int externalHandleId = 0;
     VK_EXT_SYNC_HANDLE externalHandle = VK_EXT_SYNC_HANDLE_INVALID;
     // If this fence was used in an additional host operation that must be waited
@@ -476,14 +602,15 @@ struct SemaphoreInfo {
 
 struct DescriptorSetLayoutInfo {
     VkDevice device = 0;
-    VkDescriptorSetLayout boxed = 0;
+    Boxed<VkDescriptorSetLayout> boxed;
     VkDescriptorSetLayoutCreateInfo createInfo;
     std::vector<VkDescriptorSetLayoutBinding> bindings;
+    std::vector<VkDescriptorBindingFlags> bindingFlags;
 };
 
 struct DescriptorUpdateTemplateInfo {
     VkDevice device = VK_NULL_HANDLE;
-    VkDescriptorUpdateTemplate boxed = VK_NULL_HANDLE;
+    Boxed<VkDescriptorUpdateTemplate> boxed;
     VkDescriptorUpdateTemplateCreateInfo createInfo;
     std::vector<VkDescriptorUpdateTemplateEntry> linearizedTemplateEntries;
     // Preallocated pData
@@ -511,7 +638,7 @@ DescriptorUpdateTemplateInfo calcLinearizedDescriptorUpdateTemplateInfo(
 
 struct DescriptorPoolInfo {
     VkDevice device = 0;
-    VkDescriptorPool boxed = 0;
+    Boxed<VkDescriptorPool> boxed;
     struct PoolState {
         VkDescriptorType type;
         uint32_t descriptorCount;
@@ -525,7 +652,7 @@ struct DescriptorPoolInfo {
 
     // Unboxed VkDescriptorSet -> boxed VkDescriptorSet for every set currently
     // allocated from this pool.
-    std::unordered_map<VkDescriptorSet, VkDescriptorSet> allocatedSetsUnboxedToBoxed;
+    std::unordered_map<VkDescriptorSet, Boxed<VkDescriptorSet>> allocatedSetsUnboxedToBoxed;
     // Only used when VulkanBatchedDescriptorSetUpdate is enabled: boxed
     // VkDescriptorSet handles pre-minted at vkCreateDescriptorPool time (one per
     // maxSets slot) and handed to the guest through
@@ -534,6 +661,11 @@ struct DescriptorPoolInfo {
     // underlying host set is VK_NULL_HANDLE. The guest-facing API calls these
     // "pool ids"; they are descriptor set handles, not descriptor pool handles.
     std::vector<uint64_t> preallocatedBoxedSets;
+    // Boxed VkDescriptorSet handles allocated synchronously via
+    // vkAllocateDescriptorSets (e.g. variable descriptor count layouts) while
+    // VulkanBatchedDescriptorSetUpdate is enabled. Unlike preallocatedBoxedSets,
+    // these handles must be deleted when freed or when the pool is reset/destroyed.
+    std::unordered_set<Boxed<VkDescriptorSet>> nonPreallocatedBoxedSets;
 };
 
 struct DescriptorSetInfo {
@@ -568,44 +700,46 @@ struct DescriptorSetInfo {
     VkDevice device;
     VkDescriptorPool pool;
     VkDescriptorSetLayout unboxedLayout = 0;
-    std::vector<std::vector<DescriptorWrite>> allWrites;
+    std::vector<std::unordered_map<uint32_t, DescriptorWrite>> allWrites;
+    std::vector<uint32_t> bindingDescriptorCounts;
+    std::vector<VkDescriptorType> bindingDescriptorTypes;
     std::vector<VkDescriptorSetLayoutBinding> bindings;
 };
 
 struct ShaderModuleInfo {
     VkDevice device;
-    VkShaderModule boxed = VK_NULL_HANDLE;
+    Boxed<VkShaderModule> boxed;
 };
 
 struct SamplerYcbcrConversionInfo {
     VkDevice device;
-    VkSamplerYcbcrConversion boxed = VK_NULL_HANDLE;
+    Boxed<VkSamplerYcbcrConversion> boxed;
 };
 
 struct PipelineCacheInfo {
     VkDevice device;
-    VkPipelineCache boxed = VK_NULL_HANDLE;
+    Boxed<VkPipelineCache> boxed;
 };
 
 struct PipelineLayoutInfo {
     VkDevice device;
-    VkPipelineLayout boxed = VK_NULL_HANDLE;
+    Boxed<VkPipelineLayout> boxed;
 };
 
 struct PipelineInfo {
     VkDevice device;
-    VkPipeline boxed = VK_NULL_HANDLE;
+    Boxed<VkPipeline> boxed;
 };
 
 struct RenderPassInfo {
     VkDevice device;
-    VkRenderPass boxed = VK_NULL_HANDLE;
+    Boxed<VkRenderPass> boxed;
     std::vector<VkImageLayout> attachmentFinalLayouts;
 };
 
 struct FramebufferInfo {
     VkDevice device;
-    VkFramebuffer boxed = VK_NULL_HANDLE;
+    Boxed<VkFramebuffer> boxed;
     std::vector<HandleType> attachedColorBuffers;
     std::vector<VkImage> attachedImages;
 };
@@ -616,7 +750,7 @@ struct CommandBufferInfo {
     std::vector<VkCommandBuffer> subCmds = {};
     VkDevice device = VK_NULL_HANDLE;
     VkCommandPool cmdPool = VK_NULL_HANDLE;
-    VkCommandBuffer boxed = VK_NULL_HANDLE;
+    Boxed<VkCommandBuffer> boxed;
     DebugUtilsHelper debugUtilsHelper = DebugUtilsHelper::withUtilsDisabled();
 
     // Most recently bound compute pipeline and descriptor sets. We save it here so that we can
@@ -629,8 +763,10 @@ struct CommandBufferInfo {
     std::vector<uint32_t> dynamicOffsets;
     std::unordered_set<HandleType> acquiredColorBuffers;
     std::unordered_set<HandleType> releasedColorBuffers;
+    std::unordered_set<VkImage> renderedShadowImages;
     std::unordered_map<HandleType, VkImageLayout> cbLayouts;
     std::unordered_map<VkImage, VkImageLayout> imageLayouts;
+    std::unordered_map<VkImage, VkImageLayout> shadowLinearImageLayouts;
 
     std::unordered_set<VkEvent> eventsSet;
     std::unordered_set<VkEvent> eventsReset;
@@ -645,14 +781,16 @@ struct CommandBufferInfo {
         dynamicOffsets.clear();
         acquiredColorBuffers.clear();
         releasedColorBuffers.clear();
+        renderedShadowImages.clear();
         cbLayouts.clear();
         imageLayouts.clear();
+        shadowLinearImageLayouts.clear();
     }
 };
 
 struct CommandPoolInfo {
     VkDevice device = VK_NULL_HANDLE;
-    VkCommandPool boxed = VK_NULL_HANDLE;
+    Boxed<VkCommandPool> boxed;
     std::unordered_set<VkCommandBuffer> cmdBuffers = {};
 };
 

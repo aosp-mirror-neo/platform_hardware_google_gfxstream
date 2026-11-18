@@ -419,6 +419,11 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
 
     void closeBuffer(HandleType p_colorbuffer);
 
+    bool importBuffer(HandleType handle, const struct stream_renderer_handle* importHandle,
+                      const struct stream_renderer_import_data* importData);
+    bool importColorBuffer(HandleType handle, const struct stream_renderer_handle* importHandle,
+                           const struct stream_renderer_import_data* importData);
+
     void createGraphicsProcessResources(uint64_t puid);
 
     std::shared_ptr<ProcessResources> removeGraphicsProcessResources(uint64_t puid);
@@ -847,11 +852,19 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
     void performDelayedColorBufferCloseLocked(bool forced = false);
     void eraseDelayedCloseColorBufferLocked(HandleType cb, uint64_t ts);
 
-    AsyncResult postImpl(HandleType p_colorbuffer, Post::CompletionCallback callback,
-                         bool needLockAndBind = true, bool repaint = false,
-                         std::optional<uint32_t> postedDisplayId = std::nullopt);
-    bool postImplSync(HandleType p_colorbuffer, bool needLockAndBind = true, bool repaint = false,
-                      std::optional<uint32_t> postedDisplayId = std::nullopt);
+    struct PostResult {
+        AsyncResult asyncResult = AsyncResult::FAIL_AND_CALLBACK_NOT_SCHEDULED;
+        bool postedToMainDisplay = false;
+    };
+
+    std::optional<uint32_t> resolveColorBufferDisplayId(HandleType colorBufferHandle) const;
+    bool shouldPostColorBufferToMainDisplay(std::optional<uint32_t> displayId) const;
+    PostResult postImpl(HandleType p_colorbuffer, Post::CompletionCallback callback,
+                        bool needLockAndBind = true, bool repaint = false,
+                        std::optional<uint32_t> postedDisplayId = std::nullopt);
+    PostResult postImplSync(HandleType p_colorbuffer, bool needLockAndBind = true,
+                            bool repaint = false,
+                            std::optional<uint32_t> postedDisplayId = std::nullopt);
     void setGuestPostedAFrame() {
         m_guestPostedAFrameTime = std::chrono::steady_clock::now();
         m_framebuffer->fireEvent({FrameBufferChange::FrameReady, mFrameNumber++});
@@ -859,6 +872,7 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
     bool createColorBufferWithResourceHandleLocked(int p_width, int p_height,
                                                    GfxstreamFormat format, HandleType handle,
                                                    bool linear = false);
+    void registerColorBufferLocked(HandleType handle, ColorBufferPtr cb);
     bool createBufferWithResourceHandleLocked(uint64_t p_size, HandleType handle,
                                               uint32_t memoryProperty);
 
@@ -944,7 +958,7 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
         uint32_t displayId;
         uint32_t width;
         uint32_t height;
-        unsigned char* img = nullptr;
+        std::vector<uint8_t> img;
         bool readBgra;
         // True once a non-repaint frame was queued into the async PBO ring and
         // has not yet been delivered by flushReadPipeline().
@@ -954,15 +968,24 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
         bool readbackPrimed = false;
         // Rate-limits the size-mismatch warning to once per callback entry.
         bool warnedSizeMismatch = false;
-        ~onPost() {
-            if (img) {
-                delete[] img;
-                img = nullptr;
-            }
+
+        void imageChanged() {
+            hasUnflushedFrame = false;
+            readbackPrimed = false;
+            warnedSizeMismatch = false;
         }
     };
     std::map<uint32_t, onPost> m_onPost;
 
+    // Returns true when (width, height) matches one of display 0's modes
+    // preconfigured via setDisplayConfigs().
+    bool isPreconfiguredDisplay0Size(uint32_t width, uint32_t height) const;
+    // Returns the (width, height) with the most pixels among display 0's
+    // current size and the modes preconfigured via setDisplayConfigs(): the
+    // size m_onPost[0]'s buffers are allocated at so that a mode switch never
+    // needs to reallocate them.
+    std::pair<uint32_t, uint32_t> largestDisplay0ModeSize(uint32_t currentWidth,
+                                                           uint32_t currentHeight) const;
     // Decides which display a posted ColorBuffer belongs to when the caller did
     // not say (e.g. repost() after rotation or snapshot load). Returns nullopt
     // for the default behaviour (display 0 / every non-foldable callback).
@@ -1843,15 +1866,20 @@ void FrameBuffer::Impl::setPostCallback(Renderer::OnPostCallback onPost, void* o
             m_readbackThread.enqueue({ ReadbackCmd::Init });
             m_readbackThreadStarted.store(true, std::memory_order_release);
         }
+        uint32_t allocW = w;
+        uint32_t allocH = h;
+        if (displayId == 0) {
+            std::tie(allocW, allocH) = largestDisplay0ModeSize(w, h);
+        }
         m_onPost[displayId].cb = onPost;
         m_onPost[displayId].context = onPostContext;
         m_onPost[displayId].displayId = displayId;
         m_onPost[displayId].width = w;
         m_onPost[displayId].height = h;
-        m_onPost[displayId].img = new unsigned char[4 * w * h];
+        m_onPost[displayId].img.resize(4ULL * allocW * allocH);
         m_onPost[displayId].readBgra = useBgraReadback;
         std::future<void> completeFuture = m_readbackThread.enqueue(
-            {ReadbackCmd::AddRecordDisplay, displayId, nullptr, 0, w, h});
+            {ReadbackCmd::AddRecordDisplay, displayId, nullptr, 0, allocW, allocH});
         completeFuture.wait();
     } else {
         std::future<void> completeFuture = m_readbackThread.enqueue(
@@ -2217,18 +2245,7 @@ bool FrameBuffer::Impl::createColorBufferWithResourceHandleDeprecated(
     return createColorBufferWithResourceHandle(width, height, format, handle);
 }
 
-bool FrameBuffer::Impl::createColorBufferWithResourceHandleLocked(int p_width, int p_height,
-                                                                  GfxstreamFormat format,
-                                                                  HandleType handle,
-                                                                  bool linear) {
-    ColorBufferPtr cb = ColorBuffer::create(m_emulationGl.get(), m_emulationVk.get(), p_width,
-                                            p_height, format, handle, nullptr /*stream*/, linear);
-    if (cb.get() == nullptr) {
-        GFXSTREAM_ERROR("Failed to create ColorBuffer:%d format:%d with:%d height:%d", handle,
-                        format, p_width, p_height);
-        return false;
-    }
-
+void FrameBuffer::Impl::registerColorBufferLocked(HandleType handle, ColorBufferPtr cb) {
     assert(m_colorbuffers.count(handle) == 0);
     // When guest feature flag RefCountPipe is on, no reference counting is
     // needed. We only memoize the mapping from handle to ColorBuffer.
@@ -2245,17 +2262,30 @@ bool FrameBuffer::Impl::createColorBufferWithResourceHandleLocked(int p_width, i
                                        ReferenceCountedColorBuffer{std::move(cb), 1, false, 0});
 
             RenderThreadInfo* tInfo = RenderThreadInfo::get();
-            uint64_t puid = tInfo->m_puid;
+            uint64_t puid = tInfo ? tInfo->m_puid : 0;
             if (puid) {
                 m_procOwnedColorBuffers[puid].insert(handle);
             }
-
         } else {
             m_colorbuffers.try_emplace(handle,
                                        ReferenceCountedColorBuffer{std::move(cb), 0, false, 0});
         }
     }
+}
 
+bool FrameBuffer::Impl::createColorBufferWithResourceHandleLocked(int p_width, int p_height,
+                                                                  GfxstreamFormat format,
+                                                                  HandleType handle,
+                                                                  bool linear) {
+    ColorBufferPtr cb = ColorBuffer::create(m_emulationGl.get(), m_emulationVk.get(), p_width,
+                                            p_height, format, handle, nullptr /*stream*/, linear);
+    if (cb.get() == nullptr) {
+        GFXSTREAM_ERROR("Failed to create ColorBuffer:%d format:%d with:%d height:%d", handle,
+                        format, p_width, p_height);
+        return false;
+    }
+
+    registerColorBufferLocked(handle, std::move(cb));
     return true;
 }
 
@@ -2364,6 +2394,53 @@ void FrameBuffer::Impl::closeBuffer(HandleType p_buffer) {
     }
 
     m_buffers.erase(it);
+}
+
+bool FrameBuffer::Impl::importBuffer(
+    HandleType handle, const struct stream_renderer_handle* importHandle,
+    const struct stream_renderer_import_data* importData) {
+    AutoLock mutex(m_lock);
+    AutoLock colorBufferMapLock(m_colorBufferMapLock);
+
+    if (m_buffers.count(handle) != 0) {
+        GFXSTREAM_ERROR("Buffer already exists with handle %d", handle);
+        return false;
+    }
+
+    BufferPtr buffer(
+        Buffer::import(m_emulationGl.get(), m_emulationVk.get(), handle, importHandle, importData));
+    if (!buffer) {
+        GFXSTREAM_ERROR("Import buffer %d failed.", handle);
+        return false;
+    }
+
+    m_buffers[handle] = {std::move(buffer)};
+
+    return true;
+}
+
+bool FrameBuffer::Impl::importColorBuffer(
+    HandleType handle, const struct stream_renderer_handle* importHandle,
+    const struct stream_renderer_import_data* importData) {
+    AutoLock mutex(m_lock);
+    sweepColorBuffersLocked();
+
+    AutoLock colorBufferMapLock(m_colorBufferMapLock);
+
+    if (m_colorbuffers.count(handle) != 0) {
+        GFXSTREAM_ERROR("ColorBuffer:%d already exists!", handle);
+        return false;
+    }
+
+    ColorBufferPtr cb = ColorBuffer::import(m_emulationGl.get(), m_emulationVk.get(), handle,
+                                            importHandle, importData);
+    if (cb.get() == nullptr) {
+        GFXSTREAM_ERROR("Failed to import ColorBuffer:%d", handle);
+        return false;
+    }
+
+    registerColorBufferLocked(handle, std::move(cb));
+    return true;
 }
 
 bool FrameBuffer::Impl::closeColorBufferLocked(HandleType p_colorbuffer, bool forced) {
@@ -2726,48 +2803,75 @@ bool FrameBuffer::Impl::updateColorBufferDeprecated(HandleType colorbuffer, int 
     return updateColorBuffer(colorbuffer, x, y, width, height, format, pixels);
 }
 
+std::optional<uint32_t> FrameBuffer::Impl::resolveColorBufferDisplayId(
+    HandleType colorBufferHandle) const {
+    if (colorBufferHandle == 0) {
+        return std::nullopt;
+    }
+    const auto& multiDisplay = get_gfxstream_multi_display_operations();
+    uint32_t displayId = 0;
+    if (multiDisplay.get_color_buffer_display != nullptr &&
+        multiDisplay.get_color_buffer_display(colorBufferHandle, &displayId) == 0) {
+        return displayId;
+    }
+    return std::nullopt;
+}
+
+bool FrameBuffer::Impl::shouldPostColorBufferToMainDisplay(
+    std::optional<uint32_t> displayId) const {
+    if (!displayId.has_value() || *displayId == 0) {
+        return true;
+    }
+    const auto& multiDisplay = get_gfxstream_multi_display_operations();
+    const bool isPixelFold = multiDisplay.is_pixel_fold != nullptr && multiDisplay.is_pixel_fold();
+    return isPixelFold && *displayId == kExternalFoldableDisplayId;
+}
+
 bool FrameBuffer::Impl::post(HandleType p_colorbuffer, bool needLockAndBind) {
-    auto res = postImplSync(p_colorbuffer, needLockAndBind);
-    if (res) setGuestPostedAFrame();
-    return res;
+    PostResult res = postImplSync(p_colorbuffer, needLockAndBind);
+    if (res.postedToMainDisplay) {
+        setGuestPostedAFrame();
+    }
+    return res.asyncResult.Succeeded();
 }
 
 void FrameBuffer::Impl::postWithCallback(HandleType p_colorbuffer,
                                          Post::CompletionCallback callback, bool needLockAndBind) {
-    AsyncResult res = postImpl(p_colorbuffer, callback, needLockAndBind);
-    if (res.Succeeded()) {
+    PostResult res = postImpl(p_colorbuffer, callback, needLockAndBind);
+    if (res.postedToMainDisplay) {
         setGuestPostedAFrame();
     }
 
-    if (!res.CallbackScheduledOrFired()) {
-        // If postImpl fails, we have not fired the callback. postWithCallback
-        // should always ensure the callback fires.
+    if (!res.asyncResult.CallbackScheduledOrFired()) {
+        // Ensure the completion callback always fires when PostCmd::Post is not scheduled.
         std::shared_future<void> callbackRes = std::async(std::launch::deferred, [] {});
         callback(callbackRes);
     }
 }
 
-bool FrameBuffer::Impl::postImplSync(HandleType p_colorbuffer, bool needLockAndBind, bool repaint,
-                                     std::optional<uint32_t> postedDisplayId) {
+FrameBuffer::Impl::PostResult FrameBuffer::Impl::postImplSync(
+    HandleType p_colorbuffer, bool needLockAndBind, bool repaint,
+    std::optional<uint32_t> postedDisplayId) {
     std::promise<void> promise;
     std::future<void> completeFuture = promise.get_future();
-    auto posted = postImpl(
+    PostResult posted = postImpl(
         p_colorbuffer,
         [&](std::shared_future<void> waitForGpu) {
             waitForGpu.wait();
             promise.set_value();
         },
         needLockAndBind, repaint, postedDisplayId);
-    if (posted.CallbackScheduledOrFired()) {
+    if (posted.asyncResult.CallbackScheduledOrFired()) {
         completeFuture.wait();
     }
 
-    return posted.Succeeded();
+    return posted;
 }
 
-AsyncResult FrameBuffer::Impl::postImpl(HandleType p_colorbuffer, Post::CompletionCallback callback,
-                                        bool needLockAndBind, bool repaint,
-                                        std::optional<uint32_t> postedDisplayId) {
+FrameBuffer::Impl::PostResult FrameBuffer::Impl::postImpl(HandleType p_colorbuffer,
+                                                          Post::CompletionCallback callback,
+                                                          bool needLockAndBind, bool repaint,
+                                                          std::optional<uint32_t> postedDisplayId) {
     ColorBufferPtr colorBuffer = nullptr;
     {
         AutoLock colorBufferMapLock(m_colorBufferMapLock);
@@ -2779,7 +2883,19 @@ AsyncResult FrameBuffer::Impl::postImpl(HandleType p_colorbuffer, Post::Completi
         }
     }
     if (!colorBuffer) {
-        return AsyncResult::FAIL_AND_CALLBACK_NOT_SCHEDULED;
+        return {AsyncResult::FAIL_AND_CALLBACK_NOT_SCHEDULED, /*postedToMainDisplay=*/false};
+    }
+
+    // rcFBPost carries no display ID; consult MultiDisplay so secondary-display
+    // CLIENT compositions (rcSetDisplayColorBuffer + rcFBPost) do not overwrite
+    // display 0's m_lastPostedColorBuffer or main host window, while allowing
+    // display 0 and Pixel Fold's outer display 6 to post.
+    const std::optional<uint32_t> effectiveDisplayId =
+        postedDisplayId.has_value() ? postedDisplayId : resolveColorBufferDisplayId(p_colorbuffer);
+    if (!shouldPostColorBufferToMainDisplay(effectiveDisplayId)) {
+        colorBuffer->touch();
+        decColorBufferRefCountLocked(p_colorbuffer);
+        return {AsyncResult::OK_AND_CALLBACK_NOT_SCHEDULED, /*postedToMainDisplay=*/false};
     }
 
     std::optional<AutoLock> lock;
@@ -2804,7 +2920,7 @@ AsyncResult FrameBuffer::Impl::postImpl(HandleType p_colorbuffer, Post::Completi
         postCmd.cmd = PostCmd::Post;
         postCmd.cb = colorBuffer.get();
         postCmd.cbHandle = p_colorbuffer;
-        postCmd.colorTransform = GetColorTransformForColorBuffer(p_colorbuffer);
+        postCmd.colorTransform = GetColorTransform(effectiveDisplayId.value_or(0));
         postCmd.completionCallback = std::make_unique<Post::CompletionCallback>(callback);
         sendPostWorkerCmd(std::move(postCmd));
         ret = AsyncResult::OK_AND_CALLBACK_SCHEDULED;
@@ -2841,14 +2957,42 @@ AsyncResult FrameBuffer::Impl::postImpl(HandleType p_colorbuffer, Post::Completi
     // unless screen recording or legacy shared-memory forwarding is active.
     //
     if (!m_onPost.empty()) {
-        dispatchPostCallbacks(p_colorbuffer, colorBuffer, repaint, postedDisplayId);
+        dispatchPostCallbacks(p_colorbuffer, colorBuffer, repaint, effectiveDisplayId);
     }
 
     if (!m_subWin) {  // m_subWin is supposed to be false
         decColorBufferRefCountLocked(p_colorbuffer);
     }
 
-    return ret;
+    return {ret, /*postedToMainDisplay=*/true};
+}
+
+bool FrameBuffer::Impl::isPreconfiguredDisplay0Size(uint32_t width, uint32_t height) const {
+    for (const auto& [configId, config] : mDisplayConfigs) {
+        if (config.w > 0 && config.h > 0 && static_cast<uint32_t>(config.w) == width &&
+            static_cast<uint32_t>(config.h) == height) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::pair<uint32_t, uint32_t> FrameBuffer::Impl::largestDisplay0ModeSize(
+    uint32_t currentWidth, uint32_t currentHeight) const {
+    uint32_t largestWidth = currentWidth;
+    uint32_t largestHeight = currentHeight;
+    for (const auto& [configId, config] : mDisplayConfigs) {
+        if (config.w <= 0 || config.h <= 0) {
+            continue;
+        }
+        const auto cfgW = static_cast<uint32_t>(config.w);
+        const auto cfgH = static_cast<uint32_t>(config.h);
+        if (uint64_t{cfgW} * uint64_t{cfgH} > uint64_t{largestWidth} * uint64_t{largestHeight}) {
+            largestWidth = cfgW;
+            largestHeight = cfgH;
+        }
+    }
+    return {largestWidth, largestHeight};
 }
 
 // Figures out which display a posted ColorBuffer belongs to.
@@ -2892,9 +3036,13 @@ std::optional<uint32_t> FrameBuffer::Impl::resolvePostedDisplayId(
         return std::nullopt;
     }
     auto innerCallback = m_onPost.find(0);
-    const bool matchesInnerDisplay = innerCallback != m_onPost.end() &&
-                                     postedWidth == innerCallback->second.width &&
-                                     postedHeight == innerCallback->second.height;
+    // Without a display 0 callback nothing can claim the frame as display 0's,
+    // so a preconfigured display 0 mode size must not swallow an outer-display post.
+    const bool matchesInnerDisplay =
+        innerCallback != m_onPost.end() &&
+        ((postedWidth == innerCallback->second.width &&
+          postedHeight == innerCallback->second.height) ||
+         isPreconfiguredDisplay0Size(postedWidth, postedHeight));
     // Same size on both screens is ambiguous; keep the display 0 default.
     return matchesInnerDisplay ? std::nullopt : std::optional<uint32_t>(kExternalFoldableDisplayId);
 }
@@ -2903,11 +3051,11 @@ std::optional<uint32_t> FrameBuffer::Impl::resolvePostedDisplayId(
 // callback and invokes that callback once pixels are available.
 //
 // Each callback entry owns a fixed-size pixel buffer (and GL PBO ring when
-// async readback is enabled) sized at setPostCallback() time, so a ColorBuffer
-// of a different size is skipped rather than read out of bounds. With async
-// readback the first frame is read synchronously ("primed") so a static screen
-// shows up right away; later frames are pipelined and surface either on the
-// next post or via flushReadPipeline().
+// async readback is enabled) sized at setPostCallback() time. For display 0,
+// that buffer and PBO ring are pre-allocated once to the largest mode in
+// mDisplayConfigs so switching between preconfigured display 0 modes updates
+// (width, height) and re-primes the PBO ring without reallocating buffers.
+// Any unconfigured size is skipped rather than read out of bounds.
 //
 // Classic emulator note: recording display 0 while folded means outer-screen
 // frames hit the size check and are skipped instead of corrupting m_onPost[0].
@@ -2917,33 +3065,43 @@ void FrameBuffer::Impl::deliverToPostCallback(uint32_t displayId, onPost& callba
     const uint32_t sourceWidth = sourceColorBuffer->getWidth();
     const uint32_t sourceHeight = sourceColorBuffer->getHeight();
     if (sourceWidth != callbackEntry.width || sourceHeight != callbackEntry.height) {
-        if (!callbackEntry.warnedSizeMismatch) {
-            callbackEntry.warnedSizeMismatch = true;
-            GFXSTREAM_WARNING("Skipping onPost for display %u: ColorBuffer %ux%u != callback %ux%u",
-                              displayId, sourceWidth, sourceHeight, callbackEntry.width,
-                              callbackEntry.height);
+        const size_t requiredBytes = 4ULL * sourceWidth * sourceHeight;
+        if (displayId == 0 && isPreconfiguredDisplay0Size(sourceWidth, sourceHeight) &&
+            requiredBytes <= callbackEntry.img.size()) {
+            callbackEntry.width = sourceWidth;
+            callbackEntry.height = sourceHeight;
+            callbackEntry.imageChanged();
+        } else {
+            if (!callbackEntry.warnedSizeMismatch) {
+                callbackEntry.warnedSizeMismatch = true;
+                GFXSTREAM_WARNING(
+                    "Skipping onPost for display %u: ColorBuffer %ux%u != callback %ux%u",
+                    displayId, sourceWidth, sourceHeight, callbackEntry.width,
+                    callbackEntry.height);
+            }
+            return;
         }
-        return;
     }
 
     ensureReadbackWorker();
     if (!asyncReadbackSupported()) {
         if (m_readbackWorker) {
-            m_readbackWorker->doNextReadbackSync(sourceColorBuffer.get(), callbackEntry.img,
+            m_readbackWorker->doNextReadbackSync(sourceColorBuffer.get(), callbackEntry.img.data(),
                                                  callbackEntry.readBgra);
         }
-        doPostCallback(callbackEntry.img, displayId);
+        doPostCallback(callbackEntry.img.data(), displayId);
         return;
     }
 
     const bool readSynchronously = repaint || !callbackEntry.readbackPrimed;
     callbackEntry.readbackPrimed = true;
     const auto readbackResult =
-        m_readbackWorker->doNextReadback(displayId, sourceColorBuffer.get(), callbackEntry.img,
-                                         readSynchronously, callbackEntry.readBgra);
+        m_readbackWorker->doNextReadback(displayId, sourceColorBuffer.get(),
+                                         callbackEntry.img.data(), readSynchronously,
+                                         callbackEntry.readBgra);
     callbackEntry.hasUnflushedFrame = !readSynchronously;
     if (readbackResult == ReadbackWorker::DoNextReadbackResult::OK_READY_FOR_READ) {
-        doPostCallback(callbackEntry.img, displayId);
+        doPostCallback(callbackEntry.img.data(), displayId);
     }
 }
 
@@ -3099,9 +3257,11 @@ bool FrameBuffer::Impl::repost(bool needLockAndBind) {
     GFXSTREAM_DEBUG("Reposting framebuffer.");
     if (m_lastPostedColorBuffer && sInitialized.load(std::memory_order_relaxed)) {
         GFXSTREAM_DEBUG("Has last posted colorbuffer and is initialized; post.");
-        auto res = postImplSync(m_lastPostedColorBuffer, needLockAndBind, true);
-        if (res) setGuestPostedAFrame();
-        return res;
+        PostResult res = postImplSync(m_lastPostedColorBuffer, needLockAndBind, true);
+        if (res.postedToMainDisplay) {
+            setGuestPostedAFrame();
+        }
+        return res.asyncResult.Succeeded();
     }
     if (m_displayVk) {
         setGuestPostedAFrame();
@@ -3396,9 +3556,6 @@ bool FrameBuffer::Impl::compose(uint32_t bufferSize, void* buffer, bool needPost
 #endif
     }
     if (shouldPost) {
-        const auto& multiDisplay = get_gfxstream_multi_display_operations();
-        const bool is_pixel_fold =
-            multiDisplay.is_pixel_fold != nullptr && multiDisplay.is_pixel_fold();
         ComposeDevice* composeDevice = (ComposeDevice*)buffer;
 
         switch (composeDevice->version) {
@@ -3411,12 +3568,12 @@ bool FrameBuffer::Impl::compose(uint32_t bufferSize, void* buffer, bool needPost
                 // Only primary display 0 and the outer foldable display 6 drive
                 // host window/console posts. Classic emulator subwindow rendering
                 // (m_subWin), m_lastPostedColorBuffer, and FrameReady events are
-                // unchanged for both displays while avoiding virtual displays 1..5
-                // overwriting a foldable's main window.
-                if (composeDeviceV2->displayId == 0 ||
-                    (is_pixel_fold && composeDeviceV2->displayId == kExternalFoldableDisplayId)) {
-                    if (postImplSync(composeDeviceV2->targetHandle, true, /*repaint=*/false,
-                                     composeDeviceV2->displayId)) {
+                // unchanged for both displays while avoiding non-main displays
+                // overwriting the primary or foldable main window.
+                if (shouldPostColorBufferToMainDisplay(composeDeviceV2->displayId)) {
+                    PostResult res = postImplSync(composeDeviceV2->targetHandle, true,
+                                                  /*repaint=*/false, composeDeviceV2->displayId);
+                    if (res.postedToMainDisplay) {
                         setGuestPostedAFrame();
                     }
                 }
@@ -4233,6 +4390,24 @@ void FrameBuffer::Impl::scheduleVsyncTask(VsyncThread::VsyncTask task) {
 void FrameBuffer::Impl::setDisplayConfigs(int configId, int w, int h, int dpiX, int dpiY) {
     AutoLock mutex(m_lock);
     mDisplayConfigs[configId] = {w, h, dpiX, dpiY};
+    if (w > 0 && h > 0) {
+        auto it = m_onPost.find(0);
+        const auto cfgW = static_cast<uint32_t>(w);
+        const auto cfgH = static_cast<uint32_t>(h);
+        const size_t requiredBytes = 4ULL * cfgW * cfgH;
+        if (it != m_onPost.end() && requiredBytes > it->second.img.size()) {
+            // Only the backing buffer grows: the record keeps its current (active)
+            // width and height until the first frame of the new mode switches it in place.
+            it->second.img.resize(requiredBytes);
+            it->second.imageChanged();
+            std::future<void> delFuture =
+                m_readbackThread.enqueue({ReadbackCmd::DelRecordDisplay, 0});
+            delFuture.wait();
+            std::future<void> addFuture = m_readbackThread.enqueue(
+                {ReadbackCmd::AddRecordDisplay, 0, nullptr, 0, cfgW, cfgH});
+            addFuture.wait();
+        }
+    }
     GFXSTREAM_INFO("Setting display: %d configuration to: %dx%d, dpi: %dx%d ", configId, w, h, dpiX,
                    dpiY);
 }
@@ -5030,6 +5205,17 @@ void FrameBuffer::closeColorBuffer(HandleType p_colorbuffer) {
 }
 
 void FrameBuffer::closeBuffer(HandleType p_buffer) { mImpl->closeBuffer(p_buffer); }
+
+bool FrameBuffer::importBuffer(HandleType handle, const struct stream_renderer_handle* importHandle,
+                               const struct stream_renderer_import_data* importData) {
+    return mImpl->importBuffer(handle, importHandle, importData);
+}
+
+bool FrameBuffer::importColorBuffer(HandleType handle,
+                                    const struct stream_renderer_handle* importHandle,
+                                    const struct stream_renderer_import_data* importData) {
+    return mImpl->importColorBuffer(handle, importHandle, importData);
+}
 
 void FrameBuffer::createGraphicsProcessResources(uint64_t puid) {
     mImpl->createGraphicsProcessResources(puid);

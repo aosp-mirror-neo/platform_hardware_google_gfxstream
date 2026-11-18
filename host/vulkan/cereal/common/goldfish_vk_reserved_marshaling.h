@@ -40,6 +40,62 @@ namespace gfxstream {
 namespace host {
 namespace vk {
 
+inline void readStreamBytes(uint8_t** ptr, void* buffer, size_t size) {
+    memcpy(buffer, *ptr, size);
+    *ptr += size;
+}
+
+template <typename T>
+inline T readStreamVal(uint8_t** ptr) {
+    T val;
+    memcpy(&val, *ptr, sizeof(T));
+    *ptr += sizeof(T);
+    return val;
+}
+
+inline uint8_t getByteWithStreamPtr(uint8_t** ptr) { return readStreamVal<uint8_t>(ptr); }
+
+inline uint16_t getBe16WithStreamPtr(uint8_t** ptr) {
+    uint16_t val = readStreamVal<uint16_t>(ptr);
+    gfxstream::Stream::fromBe16((uint8_t*)&val);
+    return val;
+}
+
+inline uint32_t getBe32WithStreamPtr(uint8_t** ptr) {
+    uint32_t val = readStreamVal<uint32_t>(ptr);
+    gfxstream::Stream::fromBe32((uint8_t*)&val);
+    return val;
+}
+
+inline uint64_t getBe64WithStreamPtr(uint8_t** ptr) {
+    uint64_t val = readStreamVal<uint64_t>(ptr);
+    gfxstream::Stream::fromBe64((uint8_t*)&val);
+    return val;
+}
+
+// Handles are streamed as 64-bit values in host byte order.
+template <typename T>
+inline T readStreamHandle(uint8_t** ptr) {
+    return (T)readStreamVal<uint64_t>(ptr);
+}
+
+// Reads |count| handles into |handles|.
+template <typename T>
+inline void readStreamHandles(uint8_t** ptr, T* handles, uint32_t count) {
+    for (uint32_t i = 0; i < count; ++i) {
+        handles[i] = readStreamHandle<T>(ptr);
+    }
+}
+
+// Reads |count| handles into |handles|. Non-null handles are mapped by
+// |unbox|, which receives the raw 64-bit stream value.
+template <typename T, typename UnboxFn>
+inline void readStreamHandles(uint8_t** ptr, T* handles, uint32_t count, UnboxFn unbox) {
+    for (uint32_t i = 0; i < count; ++i) {
+        uint64_t handle = readStreamVal<uint64_t>(ptr);
+        handles[i] = handle ? (T)unbox(handle) : VK_NULL_HANDLE;
+    }
+}
 #ifdef VK_BASE_VERSION_1_0
 void reservedunmarshal_VkExtent2D(VulkanStream* vkStream, VkStructureType rootType,
                                   VkExtent2D* forUnmarshaling, uint8_t** ptr);
@@ -2416,6 +2472,44 @@ void reservedunmarshal_VkPhysicalDeviceExtendedDynamicStateFeaturesEXT(
     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT* forUnmarshaling, uint8_t** ptr);
 
 #endif
+#ifdef VK_EXT_host_image_copy
+DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkPhysicalDeviceHostImageCopyFeatures,
+                      reservedunmarshal_VkPhysicalDeviceHostImageCopyFeaturesEXT)
+
+DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkPhysicalDeviceHostImageCopyProperties,
+                      reservedunmarshal_VkPhysicalDeviceHostImageCopyPropertiesEXT)
+
+DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkMemoryToImageCopy,
+                      reservedunmarshal_VkMemoryToImageCopyEXT)
+
+DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkImageToMemoryCopy,
+                      reservedunmarshal_VkImageToMemoryCopyEXT)
+
+DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkCopyMemoryToImageInfo,
+                      reservedunmarshal_VkCopyMemoryToImageInfoEXT)
+
+DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkCopyImageToMemoryInfo,
+                      reservedunmarshal_VkCopyImageToMemoryInfoEXT)
+
+DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkCopyImageToImageInfo,
+                      reservedunmarshal_VkCopyImageToImageInfoEXT)
+
+DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkHostImageLayoutTransitionInfo,
+                      reservedunmarshal_VkHostImageLayoutTransitionInfoEXT)
+
+DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkSubresourceHostMemcpySize,
+                      reservedunmarshal_VkSubresourceHostMemcpySizeEXT)
+
+DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkHostImageCopyDevicePerformanceQuery,
+                      reservedunmarshal_VkHostImageCopyDevicePerformanceQueryEXT)
+
+DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkSubresourceLayout2,
+                      reservedunmarshal_VkSubresourceLayout2EXT)
+
+DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkImageSubresource2,
+                      reservedunmarshal_VkImageSubresource2EXT)
+
+#endif
 #ifdef VK_EXT_swapchain_maintenance1
 DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR,
                       reservedunmarshal_VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT)
@@ -2545,12 +2639,6 @@ void reservedunmarshal_VkImageCompressionControlEXT(VulkanStream* vkStream,
                                                     VkImageCompressionControlEXT* forUnmarshaling,
                                                     uint8_t** ptr);
 
-DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkSubresourceLayout2,
-                      reservedunmarshal_VkSubresourceLayout2EXT)
-
-DEFINE_ALIAS_FUNCTION(reservedunmarshal_VkImageSubresource2,
-                      reservedunmarshal_VkImageSubresource2EXT)
-
 void reservedunmarshal_VkImageCompressionPropertiesEXT(
     VulkanStream* vkStream, VkStructureType rootType,
     VkImageCompressionPropertiesEXT* forUnmarshaling, uint8_t** ptr);
@@ -2629,6 +2717,10 @@ void reservedunmarshal_VkDebugMetadataGuestThreadIdGOOGLE(
 void reservedunmarshal_VkGuestCapabilitiesGOOGLE(VulkanStream* vkStream, VkStructureType rootType,
                                                  VkGuestCapabilitiesGOOGLE* forUnmarshaling,
                                                  uint8_t** ptr);
+
+void reservedunmarshal_VkHostPointerResolveGOOGLE(VulkanStream* vkStream, VkStructureType rootType,
+                                                  VkHostPointerResolveGOOGLE* forUnmarshaling,
+                                                  uint8_t** ptr);
 
 void reservedunmarshal_VkDebugMetadataGOOGLE(VulkanStream* vkStream, VkStructureType rootType,
                                              VkDebugMetadataGOOGLE* forUnmarshaling, uint8_t** ptr);

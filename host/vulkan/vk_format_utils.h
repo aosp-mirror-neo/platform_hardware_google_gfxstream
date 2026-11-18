@@ -15,6 +15,7 @@
 
 #include <vulkan/vulkan_core.h>
 
+#include <optional>
 #include <vector>
 
 #include "gfxstream/common/logging.h"
@@ -543,6 +544,19 @@ struct TransferInfo {
 };
 
 bool getFormatTransferInfo(VkFormat format, VkExtent3D extent, TransferInfo* outTransferInfo);
+
+// The extent, in texels, and the size, in bytes, of a texel block.
+struct TexelBlockInfo {
+    uint32_t width = 1;
+    uint32_t height = 1;
+    uint32_t depth = 1;
+    uint32_t sizeBytes = 0;
+};
+
+// Returns the texel blocks that buffer and host memory copies of the `aspectMask` aspect of an
+// image with `format` read or write. Returns std::nullopt if `aspectMask` is not a single aspect
+// of `format`, or if `format` is unknown.
+std::optional<TexelBlockInfo> getCopyTexelBlockInfo(VkFormat format, VkImageAspectFlags aspectMask);
 
 }  // namespace vk
 }  // namespace host
