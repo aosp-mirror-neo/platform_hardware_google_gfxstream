@@ -479,6 +479,49 @@ class VkDecoderGlobalState {
                                         VkImage image, const VkImageSubresource* pSubresource,
                                         VkSubresourceLayout* pLayout);
 
+    void on_vkGetImageSubresourceLayout2(gfxstream::base::BumpPool* pool,
+                                         VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                         VkImage image, const VkImageSubresource2* pSubresource,
+                                         VkSubresourceLayout2* pLayout);
+    void on_vkGetImageSubresourceLayout2KHR(gfxstream::base::BumpPool* pool,
+                                            VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                            VkImage image, const VkImageSubresource2* pSubresource,
+                                            VkSubresourceLayout2* pLayout);
+    void on_vkGetImageSubresourceLayout2EXT(gfxstream::base::BumpPool* pool,
+                                            VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                            VkImage image, const VkImageSubresource2* pSubresource,
+                                            VkSubresourceLayout2* pLayout);
+
+    VkResult on_vkCopyMemoryToImage(gfxstream::base::BumpPool* pool,
+                                    VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                    const VkCopyMemoryToImageInfo* pCopyMemoryToImageInfo);
+    VkResult on_vkCopyMemoryToImageEXT(gfxstream::base::BumpPool* pool,
+                                       VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                       const VkCopyMemoryToImageInfo* pCopyMemoryToImageInfo);
+
+    VkResult on_vkCopyImageToMemory(gfxstream::base::BumpPool* pool,
+                                    VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                    const VkCopyImageToMemoryInfo* pCopyImageToMemoryInfo);
+    VkResult on_vkCopyImageToMemoryEXT(gfxstream::base::BumpPool* pool,
+                                       VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                       const VkCopyImageToMemoryInfo* pCopyImageToMemoryInfo);
+
+    VkResult on_vkCopyImageToImage(gfxstream::base::BumpPool* pool,
+                                   VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                   const VkCopyImageToImageInfo* pCopyImageToImageInfo);
+    VkResult on_vkCopyImageToImageEXT(gfxstream::base::BumpPool* pool,
+                                      VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                      const VkCopyImageToImageInfo* pCopyImageToImageInfo);
+
+    VkResult on_vkTransitionImageLayout(gfxstream::base::BumpPool* pool,
+                                        VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                        uint32_t transitionCount,
+                                        const VkHostImageLayoutTransitionInfo* pTransitions);
+    VkResult on_vkTransitionImageLayoutEXT(gfxstream::base::BumpPool* pool,
+                                           VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
+                                           uint32_t transitionCount,
+                                           const VkHostImageLayoutTransitionInfo* pTransitions);
+
     void on_vkGetImageMemoryRequirements2(gfxstream::base::BumpPool* pool,
                                           VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
                                           const VkImageMemoryRequirementsInfo2* pInfo,
@@ -861,6 +904,14 @@ class VkDecoderGlobalState {
                                      VkCommandBuffer commandBuffer,
                                      const VkRenderPassBeginInfo* pRenderPassBegin,
                                      const VkSubpassBeginInfo* pSubpassBeginInfo);
+    void on_vkCmdBeginRendering(gfxstream::base::BumpPool* pool,
+                                VkSnapshotApiCallHandle apiCallHandle,
+                                VkCommandBuffer commandBuffer,
+                                const VkRenderingInfo* pRenderingInfo);
+    void on_vkCmdBeginRenderingKHR(gfxstream::base::BumpPool* pool,
+                                   VkSnapshotApiCallHandle apiCallHandle,
+                                   VkCommandBuffer commandBuffer,
+                                   const VkRenderingInfo* pRenderingInfo);
 
     VkResult on_vkCreateEvent(gfxstream::base::BumpPool* pool,
                               VkSnapshotApiCallHandle apiCallHandle, VkDevice device,
@@ -1037,8 +1088,21 @@ class VkDecoderGlobalState {
 
     void on_DeviceLost();
 
-    // Fence waits
-    VkResult waitForFence(Boxed<VkFence> boxed_fence, uint64_t timeout);
+    // Fence waits for sync fds exported from VkFences.
+    //
+    // A sync fd captures the payload of the fence at the time of the export, and the guest may
+    // reset, destroy or recycle the VkFence right after exporting it. acquireSyncFdFence()
+    // resolves the boxed fence when the export is processed, and keeps the host fence from being
+    // recycled until the matching waitForSyncFdFence() returns. It does not block and does not
+    // take the global state lock, so it can be called from the VMM thread.
+    struct SyncFdFence {
+        VkFence fence = VK_NULL_HANDLE;
+        uint64_t id = 0;
+    };
+    SyncFdFence acquireSyncFdFence(Boxed<VkFence> boxed_fence);
+    // Must be called exactly once for each acquired fence. Returns VK_SUCCESS without waiting if
+    // the fence could not be resolved, or if its device has been destroyed since.
+    VkResult waitForSyncFdFence(const SyncFdFence& fence, uint64_t timeout);
 
     // Wait for present (vkQueueSignalReleaseImageANDROID). This explicitly
     // requires the image to be presented again versus how many times it's been

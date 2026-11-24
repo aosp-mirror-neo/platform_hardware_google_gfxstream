@@ -119,7 +119,7 @@ static void initIcdPaths(bool forTesting) {
     }
 
     // In high integrity mode (e.g. admin mode on windows), loader won't be able to read the
-    // environment variables. TODO(b/446119531) Load the driver dlls directly in this case.
+    // environment variables.
     // Note: in testing mode the loader allows env vars in high integrity mode
     const bool highIntegrityMode = processInHighIntegrityMode();
 
